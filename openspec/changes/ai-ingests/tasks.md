@@ -38,5 +38,5 @@
 ## 6. Verification
 
 - [x] 6.1 cargo + vitest green; fake-claude end-to-end: recipe → run → staging → threshold hold → approve → output file updated and indexed
-- [ ] 6.2 Live run-through with real `claude` on the fixture project (People template): create from template, run, inspect output, verify incremental second run; fix gaps
-- [ ] 6.3 Update README status; commit
+- [x] 6.2 Live run-through with real `claude` on the fixture project (People template): create from template, run, inspect output, verify incremental second run; fix gaps
+- [x] 6.3 Update README status; commit

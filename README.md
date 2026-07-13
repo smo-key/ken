@@ -9,9 +9,13 @@ agents, and Git/shared-drive conflict review arrive in upcoming releases
 
 ## Status
 
-Walking skeleton: project create/open, live indexing (md/txt/code, docx,
-xlsx, pptx, pdf, images), ⌘K full-text search, WYSIWYG markdown editing,
-and in-app preview of PDF/Word/Excel/images.
+- **Walking skeleton** — project create/open, live indexing (md/txt/code,
+  docx, xlsx, pptx, pdf, images), ⌘K full-text search, WYSIWYG markdown
+  editing, in-app preview of PDF/Word/Excel/images.
+- **AI ingests** — recipes that keep structured documents (People,
+  Decisions, Requirements…) fresh as files change, run through your local
+  Claude Code CLI with review rules: human edits win, big refreshes wait
+  for approval. Template library included.
 
 ## Development
 

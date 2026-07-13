@@ -526,6 +526,102 @@ mod tests {
         assert_eq!(db.get_run(held.run_id).unwrap().unwrap().status, "fresh");
     }
 
+    /// Live test against the real Claude CLI — run explicitly with
+    /// `cargo test -p ken-core real_claude -- --ignored --nocapture`.
+    /// Uses the user's local auth; headless mode (no trust dialog).
+    #[test]
+    #[ignore]
+    fn real_claude_end_to_end() {
+        let Some(binary) = crate::runner::discover_claude() else {
+            panic!("claude CLI not found");
+        };
+        let project_dir = tempfile::tempdir().unwrap();
+        let app_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project_dir.path().join("notes")).unwrap();
+        fs::write(
+            project_dir.path().join("notes/standup.md"),
+            "# Standup July 11\nPriya Natarajan confirmed vendor sign-off; she owns the billing cutover.\nMarcus Chen is her backup and runs the rollback rehearsal.\n",
+        )
+        .unwrap();
+        let project = Project::create(project_dir.path(), "Live").unwrap();
+        let mut headless = project.clone();
+        headless
+            .config
+            .extra
+            .insert("ingestRunner".into(), serde_json::json!("headless"));
+        headless.save().unwrap();
+
+        let recipe = Recipe::build(
+            "people".into(),
+            "People".into(),
+            String::new(),
+            vec!["notes".into()],
+            "knowledge/People.md".into(),
+            Mode::Single,
+            Refresh::Manual,
+            None,
+            "Extract every person mentioned. For each: name, role, what they own.".into(),
+        );
+        recipe::save(&project, &recipe).unwrap();
+
+        let db_path = app_dir.path().join("live.db");
+        let mut db = Db::open_at(&db_path).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        drop(db);
+
+        let hooks = Arc::new(HookListener::start().unwrap());
+        let (etx, events) = channel();
+        let engine = IngestEngine::start(
+            project.root.clone(),
+            db_path.clone(),
+            hooks,
+            EngineConfig {
+                binary: Some(binary),
+                timeout: Duration::from_secs(300),
+                debounce: Duration::from_millis(100),
+            },
+            move |ev| {
+                eprintln!("[event] {} -> {} {:?}", ev.slug, ev.status, ev.detail);
+                let _ = etx.send(ev);
+            },
+        )
+        .unwrap();
+
+        engine.trigger("people", true);
+        let done = wait_status(&events, "fresh", 300);
+        eprintln!("first run: {:?}", done.detail);
+        let output = fs::read_to_string(project.root.join("knowledge/People.md")).unwrap();
+        eprintln!("--- People.md ---\n{output}\n-----------------");
+        assert!(output.to_lowercase().contains("priya"), "{output}");
+        assert!(output.to_lowercase().contains("marcus"), "{output}");
+
+        // Incremental second run: new person appears in a new note.
+        std::thread::sleep(Duration::from_secs(1));
+        fs::write(
+            project.root.join("notes/vendor.md"),
+            "# Vendor call\nDana Whitfield from LangdonSoft handles the contract renewal.\n",
+        )
+        .unwrap();
+        let future = std::time::SystemTime::now() + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(project.root.join("notes/vendor.md"))
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        {
+            let mut db = Db::open_at(&db_path).unwrap();
+            scan::scan(&project, &mut db).unwrap();
+        }
+        engine.trigger("people", false);
+        let done2 = wait_status(&events, "fresh", 300);
+        eprintln!("second run: {:?}", done2.detail);
+        let output2 = fs::read_to_string(project.root.join("knowledge/People.md")).unwrap();
+        eprintln!("--- People.md v2 ---\n{output2}\n--------------------");
+        assert!(output2.to_lowercase().contains("dana"), "{output2}");
+        assert!(output2.to_lowercase().contains("priya"), "second run must preserve existing entries: {output2}");
+    }
+
     #[test]
     fn failed_run_reports_detail() {
         let r = rig("fail");
