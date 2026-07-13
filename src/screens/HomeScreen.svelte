@@ -194,14 +194,6 @@
       {/each}
     {/if}
 
-    <div class="card muted">
-      <span class="overline">Coming to Ken</span>
-      <p>
-        A living Map of your knowledge and a Timeline of how it changed —
-        arriving in upcoming releases. The digest, chats, ingests, and the
-        Review inbox are live now.
-      </p>
-    </div>
   </div>
 </div>
 

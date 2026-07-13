@@ -292,13 +292,6 @@
       {/if}
     </div>
 
-    <div class="card muted">
-      <div class="card-title">Coming to Ken</div>
-      <p class="note">
-        Knowledge Map and Timeline views — each arrives in an upcoming
-        release.
-      </p>
-    </div>
   </div>
 </div>
 

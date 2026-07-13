@@ -2,10 +2,12 @@
 
 A desktop app that turns an ordinary folder into a team knowledge base.
 Point Ken at your folder — notes, Word docs, spreadsheets, PDFs — and it
-indexes everything, watches for changes, and makes every fact searchable.
-AI-maintained structured documents, Claude chats, an MCP server for your
-agents, and Git/shared-drive conflict review arrive in upcoming releases
-(see `openspec/` and `docs/superpowers/specs/` for the roadmap).
+indexes everything, watches for changes, and makes every fact findable:
+full-text search with AI quick answers, AI-maintained structured documents,
+Claude chats, a daily digest, deep web research, a knowledge map and
+timeline, an MCP server for your agents, and Git/shared-drive sync with
+conflict review. Specs live in `openspec/` and
+`docs/superpowers/specs/`.
 
 ## Install
 
