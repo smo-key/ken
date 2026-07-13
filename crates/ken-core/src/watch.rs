@@ -134,9 +134,9 @@ fn is_relevant(event: &notify::Event) -> bool {
 fn relevant_path(roots: &[PathBuf], abs: &std::path::Path) -> bool {
     roots.iter().any(|root| match abs.strip_prefix(root) {
         Ok(rel) => !rel.components().any(|c| {
-            c.as_os_str()
-                .to_str()
-                .is_some_and(|s| s.starts_with('.'))
+            c.as_os_str().to_str().is_some_and(|s| {
+                s.starts_with('.') || crate::scan::is_junk_dir_name(s)
+            })
         }),
         Err(_) => false,
     })

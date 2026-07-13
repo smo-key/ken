@@ -66,7 +66,7 @@ impl ProjectInfo {
                 .extra
                 .get("ingestRunner")
                 .and_then(|v| v.as_str())
-                .unwrap_or("hidden-tui")
+                .unwrap_or("headless")
                 .to_string(),
         }
     }
@@ -315,7 +315,10 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
-        .filter_entry(|e| e.file_name() != ".ken")
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".ken" && !(e.path().is_dir() && ken_core::scan::is_junk_dir_name(&name))
+        })
         .build();
     for entry in walker.flatten() {
         if entry.path().is_dir() && entry.path() != active.project.root {

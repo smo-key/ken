@@ -220,12 +220,21 @@ STAGING_DIR={staging}
     )
 }
 
+const MAX_LISTED_FILES: usize = 200;
+
 fn bullet_list(items: &[String]) -> String {
-    items
+    let mut out: Vec<String> = items
         .iter()
+        .take(MAX_LISTED_FILES)
         .map(|i| format!("- {i}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if items.len() > MAX_LISTED_FILES {
+        out.push(format!(
+            "- …and {} more files — explore the source folders with your own tools",
+            items.len() - MAX_LISTED_FILES
+        ));
+    }
+    out.join("\n")
 }
 
 fn with_trailing_slash(s: &str) -> String {

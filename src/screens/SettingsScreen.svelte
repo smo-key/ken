@@ -6,7 +6,7 @@
   let busy = $state(false);
   let toggling = $state(false);
   let runnerMode = $state<"hidden-tui" | "headless">(
-    app.project?.ingestRunner ?? "hidden-tui",
+    app.project?.ingestRunner ?? "headless",
   );
 
   async function setRunnerMode(mode: "hidden-tui" | "headless") {
@@ -126,10 +126,10 @@
           <input
             type="radio"
             name="runner"
-            checked={runnerMode === "hidden-tui"}
-            onchange={() => setRunnerMode("hidden-tui")}
+            checked={runnerMode === "headless"}
+            onchange={() => setRunnerMode("headless")}
           />
-          Interactive session <span class="soft">(recommended — you can watch or step in)</span>
+          Background <span class="soft">(recommended — can't get stuck on setup prompts)</span>
         </label>
       </div>
       <div class="row">
@@ -138,10 +138,10 @@
           <input
             type="radio"
             name="runner"
-            checked={runnerMode === "headless"}
-            onchange={() => setRunnerMode("headless")}
+            checked={runnerMode === "hidden-tui"}
+            onchange={() => setRunnerMode("hidden-tui")}
           />
-          Headless <span class="soft">(runs invisibly, no mid-run questions)</span>
+          Interactive <span class="soft">(watch or step in via Chats; Claude's one-time prompts need answering there)</span>
         </label>
       </div>
     </div>

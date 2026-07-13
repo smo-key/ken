@@ -24,6 +24,14 @@ pub struct ScanStats {
     pub changed_paths: Vec<String>,
 }
 
+/// Machine-generated folders no knowledge project wants indexed. (Hidden
+/// folders are already skipped.)
+pub const JUNK_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "__pycache__", "venv"];
+
+pub fn is_junk_dir_name(name: &str) -> bool {
+    JUNK_DIRS.contains(&name)
+}
+
 /// File status values stored in the index.
 pub const STATUS_INDEXED: &str = "indexed";
 pub const STATUS_METADATA_ONLY: &str = "metadata_only";
@@ -40,7 +48,10 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         .git_ignore(false) // knowledge folders aren't code repos
         .git_global(false)
         .git_exclude(false)
-        .filter_entry(|e| e.file_name() != ".ken")
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".ken" && !(e.path().is_dir() && is_junk_dir_name(&name))
+        })
         .build();
     for entry in walker.flatten() {
         let path = entry.path();

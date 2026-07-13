@@ -33,7 +33,8 @@ pub struct RunnerConfig {
 pub enum RunOutcome {
     Completed,
     Cancelled,
-    TimedOut,
+    /// Hit the run timeout; carries the tail of the session's output.
+    TimedOut(String),
     /// Process died before completing; carries diagnostic detail.
     Failed(String),
 }
@@ -92,6 +93,23 @@ fn is_executable(path: &Path) -> bool {
     {
         path.is_file()
     }
+}
+
+/// Claude Code stores sessions under `~/.claude/projects/<path-with-slashes-
+/// as-dashes>/<session-id>.jsonl`; existence means the session got past its
+/// startup gates.
+pub fn session_file_exists(project_root: &Path, session_id: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return true; // can't check — assume fine rather than false-alarm
+    };
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let encoded = canonical.to_string_lossy().replace(['/', '\\'], "-");
+    home.join(".claude/projects")
+        .join(encoded)
+        .join(format!("{session_id}.jsonl"))
+        .is_file()
 }
 
 pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with:  npm install -g @anthropic-ai/claude-code  — then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
@@ -187,10 +205,21 @@ fn run_hidden_tui(
         });
 
         let deadline = Instant::now() + cfg.timeout;
+        // If the session hasn't materialized on disk shortly after spawn,
+        // the TUI is almost certainly parked at an interactive startup gate
+        // (trust dialog, hooks approval) that a hidden PTY can't answer.
+        let gate_check_at = Instant::now() + Duration::from_secs(60);
+        let mut gate_checked = false;
         loop {
             if cancel.is_cancelled() {
                 let _ = child.kill();
                 return Ok(RunOutcome::Cancelled);
+            }
+            if !gate_checked && Instant::now() > gate_check_at {
+                gate_checked = true;
+                if !session_file_exists(project_root, session_id) {
+                    on_blocked();
+                }
             }
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(ev) if ev.event == "Stop" => {
@@ -223,7 +252,7 @@ fn run_hidden_tui(
                     }
                     if Instant::now() > deadline {
                         let _ = child.kill();
-                        return Ok(RunOutcome::TimedOut);
+                        return Ok(RunOutcome::TimedOut(ring_tail(&ring)));
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -330,7 +359,8 @@ fn run_headless(
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = reader_thread.join();
-                    return Ok(RunOutcome::TimedOut);
+                    let tail = out_buf.lock().unwrap().clone();
+                    return Ok(RunOutcome::TimedOut(truncate(&tail, 2000).to_string()));
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -537,7 +567,7 @@ mod tests {
             || {},
         )
         .unwrap();
-        assert_eq!(outcome, RunOutcome::TimedOut);
+        assert!(matches!(outcome, RunOutcome::TimedOut(_)));
     }
 
     #[test]

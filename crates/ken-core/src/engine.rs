@@ -230,19 +230,22 @@ fn execute(
         }
     };
 
+    // Headless is the default: interactive TUI sessions can stall on
+    // Claude's one-time startup prompts (trust, hooks approval) with no one
+    // to answer them. hidden-tui is an explicit opt-in for watchable runs.
     let mode = project
         .config
         .extra
         .get("ingestRunner")
         .and_then(|v| v.as_str())
         .map(|s| {
-            if s == "headless" {
-                RunnerMode::Headless
-            } else {
+            if s == "hidden-tui" {
                 RunnerMode::HiddenTui
+            } else {
+                RunnerMode::Headless
             }
         })
-        .unwrap_or(RunnerMode::HiddenTui);
+        .unwrap_or(RunnerMode::Headless);
 
     let binary = cfg
         .binary
@@ -292,7 +295,7 @@ fn execute(
                 session_id: Some(sid.clone()),
                 status: "blocked".into(),
                 detail: Some(
-                    "The agent is waiting on input — open its session in Chats to answer, or cancel the run.".into(),
+                    "The session is waiting on something — open it in Chats to answer (it may be a one-time setup prompt), or cancel the run.".into(),
                 ),
             });
         }
@@ -335,18 +338,16 @@ fn execute(
             let _ = refresh::discard_staged(&project, slug);
             finish(db, "cancelled", Some("Cancelled."), None, None);
         }
-        Ok(RunOutcome::TimedOut) => {
+        Ok(RunOutcome::TimedOut(tail)) => {
             let _ = refresh::discard_staged(&project, slug);
-            finish(
-                db,
-                "failed",
-                None,
-                Some(&format!(
-                    "The run didn't finish within {} minutes and was stopped.",
-                    cfg.timeout.as_secs() / 60
-                )),
-                None,
+            let mut msg = format!(
+                "The run didn't finish within {} minutes and was stopped.",
+                cfg.timeout.as_secs() / 60
             );
+            if !tail.is_empty() {
+                msg.push_str(&format!(" The session's last output:\n{tail}"));
+            }
+            finish(db, "failed", None, Some(&msg), None);
         }
         Ok(RunOutcome::Failed(detail)) => {
             let _ = refresh::discard_staged(&project, slug);
