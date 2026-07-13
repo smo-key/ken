@@ -1,5 +1,6 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
+  import { chats } from "../lib/chats.svelte";
   import { timeAgo } from "../lib/format";
   import ProjectSwitcher from "./ProjectSwitcher.svelte";
 
@@ -37,8 +38,16 @@
     <span class="kbd">⌘K</span>
   </button>
 
-  <button class="chats" title="Chats arrive in an upcoming Ken release" disabled>
+  <button
+    class="chats"
+    class:open={chats.open}
+    onclick={() => (chats.open = !chats.open)}
+    title={chats.open ? "Close chats" : "Open chats"}
+  >
     ◈ Chats
+    {#if chats.needsInput}
+      <span class="need-dot"></span>
+    {/if}
   </button>
 
   {#if switcherOpen}
@@ -167,7 +176,16 @@
     color: var(--accent-deep);
     font-size: 12.5px;
     font-weight: 600;
-    opacity: 0.55;
-    cursor: default;
+    cursor: pointer;
+  }
+  .chats:hover,
+  .chats.open {
+    background: rgba(138, 90, 68, 0.16);
+  }
+  .need-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--needs-input);
   }
 </style>

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -158,6 +158,31 @@ impl Db {
                 );
                 CREATE INDEX IF NOT EXISTS ingest_runs_slug
                     ON ingest_runs(slug, started_at DESC);
+                "#,
+            )?;
+        }
+        if version < 3 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS chats (
+                    id             TEXT PRIMARY KEY,
+                    title          TEXT NOT NULL,
+                    kind           TEXT NOT NULL DEFAULT 'user',
+                    pinned         INTEGER NOT NULL DEFAULT 0,
+                    status         TEXT NOT NULL DEFAULT 'done',
+                    created_at     INTEGER NOT NULL,
+                    last_active_at INTEGER NOT NULL,
+                    archived       INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id         INTEGER PRIMARY KEY,
+                    chat_id    TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    role       TEXT NOT NULL,
+                    content    TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS chat_messages_chat
+                    ON chat_messages(chat_id, id);
                 "#,
             )?;
         }
@@ -435,6 +460,166 @@ impl Db {
             |r| r.get(0),
         )?)
     }
+
+    // --- chats ---
+
+    pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               ON CONFLICT(id) DO UPDATE SET
+                 title = ?2, kind = ?3, pinned = ?4, status = ?5,
+                 last_active_at = ?7, archived = ?8"#,
+            params![
+                chat.id,
+                chat.title,
+                chat.kind,
+                chat.pinned as i64,
+                chat.status,
+                chat.created_at,
+                chat.last_active_at,
+                chat.archived as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn map_chat(r: &rusqlite::Row) -> rusqlite::Result<ChatRow> {
+        Ok(ChatRow {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            kind: r.get(2)?,
+            pinned: r.get::<_, i64>(3)? != 0,
+            status: r.get(4)?,
+            created_at: r.get(5)?,
+            last_active_at: r.get(6)?,
+            archived: r.get::<_, i64>(7)? != 0,
+        })
+    }
+
+    const CHAT_COLS: &'static str =
+        "id, title, kind, pinned, status, created_at, last_active_at, archived";
+
+    pub fn get_chat(&self, id: &str) -> Result<Option<ChatRow>> {
+        let sql = format!("SELECT {} FROM chats WHERE id = ?1", Self::CHAT_COLS);
+        match self.conn.query_row(&sql, params![id], Self::map_chat) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Non-archived chats, pinned first, most recently active first.
+    pub fn list_chats(&self) -> Result<Vec<ChatRow>> {
+        let sql = format!(
+            "SELECT {} FROM chats WHERE archived = 0
+             ORDER BY pinned DESC, last_active_at DESC",
+            Self::CHAT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], Self::map_chat)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_chat_field(&mut self, id: &str, field: ChatField, value: &str) -> Result<()> {
+        let sql = match field {
+            ChatField::Title => "UPDATE chats SET title = ?2 WHERE id = ?1",
+            ChatField::Status => "UPDATE chats SET status = ?2 WHERE id = ?1",
+        };
+        self.conn.execute(sql, params![id, value])?;
+        Ok(())
+    }
+
+    pub fn set_chat_flag(&mut self, id: &str, field: ChatFlag, value: bool) -> Result<()> {
+        let sql = match field {
+            ChatFlag::Pinned => "UPDATE chats SET pinned = ?2 WHERE id = ?1",
+            ChatFlag::Archived => "UPDATE chats SET archived = ?2 WHERE id = ?1",
+        };
+        self.conn.execute(sql, params![id, value as i64])?;
+        Ok(())
+    }
+
+    pub fn touch_chat(&mut self, id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chats SET last_active_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_chat_message(
+        &mut self,
+        chat_id: &str,
+        role: &str,
+        content: &str,
+        at: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO chat_messages (chat_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![chat_id, role, content, at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn chat_messages(&self, chat_id: &str) -> Result<Vec<ChatMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, chat_id, role, content, created_at
+             FROM chat_messages WHERE chat_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id], |r| {
+                Ok(ChatMessage {
+                    id: r.get(0)?,
+                    chat_id: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ChatField {
+    Title,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ChatFlag {
+    Pinned,
+    Archived,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRow {
+    pub id: String,
+    pub title: String,
+    /// `user` | `ingest`
+    pub kind: String,
+    pub pinned: bool,
+    /// `working` | `needs_input` | `done` | `error`
+    pub status: String,
+    pub created_at: i64,
+    pub last_active_at: i64,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    pub id: i64,
+    pub chat_id: String,
+    /// `user` | `assistant` | `activity` | `divider`
+    pub role: String,
+    pub content: String,
+    pub created_at: i64,
 }
 
 /// Filename tokens for the `name` FTS column: stem + extension with
@@ -577,6 +762,41 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn chat_crud_roundtrip() {
+        let mut db = Db::open_in_memory().unwrap();
+        let chat = ChatRow {
+            id: "sess-1".into(),
+            title: "Draft the FAQ".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 100,
+            last_active_at: 100,
+            archived: false,
+        };
+        db.upsert_chat(&chat).unwrap();
+        db.upsert_chat(&ChatRow { id: "sess-2".into(), title: "Second".into(), last_active_at: 200, created_at: 200, ..chat.clone() }).unwrap();
+
+        // Pinned floats first even though it's older.
+        db.set_chat_flag("sess-1", ChatFlag::Pinned, true).unwrap();
+        let list = db.list_chats().unwrap();
+        assert_eq!(list[0].id, "sess-1");
+        assert!(list[0].pinned);
+
+        db.set_chat_field("sess-1", ChatField::Status, "needs_input").unwrap();
+        assert_eq!(db.get_chat("sess-1").unwrap().unwrap().status, "needs_input");
+
+        db.append_chat_message("sess-1", "user", "hello", 101).unwrap();
+        db.append_chat_message("sess-1", "assistant", "**hi**", 102).unwrap();
+        let msgs = db.chat_messages("sess-1").unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+
+        db.set_chat_flag("sess-1", ChatFlag::Archived, true).unwrap();
+        assert_eq!(db.list_chats().unwrap().len(), 1);
     }
 
     #[test]

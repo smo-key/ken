@@ -23,6 +23,7 @@ use crate::{Error, Result};
 pub struct IngestEvent {
     pub slug: String,
     pub run_id: i64,
+    pub session_id: Option<String>,
     /// `running` | `blocked` | `fresh` | `pending_approval` | `failed` |
     /// `cancelled`
     pub status: String,
@@ -198,6 +199,7 @@ fn execute(
         on_event(IngestEvent {
             slug: slug.to_string(),
             run_id,
+            session_id: None,
             status: "failed".into(),
             detail: Some(detail),
         });
@@ -259,6 +261,7 @@ fn execute(
     on_event(IngestEvent {
         slug: slug.to_string(),
         run_id,
+        session_id: Some(session_id.clone()),
         status: "running".into(),
         detail: None,
     });
@@ -281,12 +284,16 @@ fn execute(
     };
     let blocked_event = {
         let slug = slug.to_string();
+        let sid = session_id.clone();
         move || {
             on_event(IngestEvent {
                 slug: slug.clone(),
                 run_id,
+                session_id: Some(sid.clone()),
                 status: "blocked".into(),
-                detail: Some("The agent is waiting on input. You can cancel the run.".into()),
+                detail: Some(
+                    "The agent is waiting on input — open its session in Chats to answer, or cancel the run.".into(),
+                ),
             });
         }
     };
@@ -306,6 +313,7 @@ fn execute(
         on_event(IngestEvent {
             slug: slug.to_string(),
             run_id,
+            session_id: Some(session_id.clone()),
             status: status.into(),
             detail: summary.or(error).map(String::from),
         });

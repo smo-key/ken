@@ -3,6 +3,8 @@
   import TitleBar from "./TitleBar.svelte";
   import NavRail from "./NavRail.svelte";
   import SearchOverlay from "../search/SearchOverlay.svelte";
+  import ChatDrawer from "../chat/ChatDrawer.svelte";
+  import { chats } from "../lib/chats.svelte";
   import HomeScreen from "../screens/HomeScreen.svelte";
   import FilesScreen from "../screens/FilesScreen.svelte";
   import ReviewScreen from "../screens/ReviewScreen.svelte";
@@ -37,6 +39,9 @@
       <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
       <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
     </main>
+    {#if chats.open}
+      <ChatDrawer />
+    {/if}
   </div>
   {#if app.searchOpen}
     <SearchOverlay />

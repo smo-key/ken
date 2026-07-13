@@ -155,19 +155,29 @@ fn run_hidden_tui(
             .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
         drop(pair.slave);
 
-        // Drain output into a capped ring buffer for diagnostics.
+        // Drain output into a capped ring buffer for diagnostics, and
+        // broadcast it through the PTY registry so the chat drawer can
+        // watch (and type into) this session live.
         let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut reader = pair
             .master
             .try_clone_reader()
             .map_err(|e| Error::Other(format!("pty reader: {e}")))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .map_err(|e| Error::Other(format!("pty writer: {e}")))?,
+        ));
+        let registration = Arc::new(crate::pty_registry::register(session_id, writer.clone()));
         let ring_w = ring.clone();
+        let reg_reader = registration.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
+                reg_reader.broadcast(&buf[..n]);
                 let mut r = ring_w.lock().unwrap();
                 r.extend(&buf[..n]);
                 while r.len() > 64 * 1024 {
@@ -175,10 +185,6 @@ fn run_hidden_tui(
                 }
             }
         });
-        let mut writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| Error::Other(format!("pty writer: {e}")))?;
 
         let deadline = Instant::now() + cfg.timeout;
         loop {
@@ -189,8 +195,11 @@ fn run_hidden_tui(
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(ev) if ev.event == "Stop" => {
                     // Ask the TUI to exit; force if it lingers.
-                    let _ = writer.write_all(b"/exit\r");
-                    let _ = writer.flush();
+                    {
+                        let mut w = writer.lock().unwrap();
+                        let _ = w.write_all(b"/exit\r");
+                        let _ = w.flush();
+                    }
                     let grace = Instant::now() + Duration::from_secs(5);
                     while Instant::now() < grace {
                         if child.try_wait().ok().flatten().is_some() {
@@ -362,15 +371,40 @@ BEHAVIOR=$(cat "$(dirname "$0")/behavior" 2>/dev/null || echo complete)
 SESSION=""
 PROMPT=""
 HEADLESS=0
+STREAM_INPUT=0
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   case "${args[$i]}" in
-    --session-id) SESSION="${args[$((i+1))]}"; i=$((i+1));;
-    -p) HEADLESS=1; PROMPT="${args[$((i+1))]}"; i=$((i+1));;
+    --session-id|--resume) SESSION="${args[$((i+1))]}"; i=$((i+1));;
+    -p) HEADLESS=1
+        next="${args[$((i+1))]}"
+        case "$next" in --*|"") ;; *) PROMPT="$next"; i=$((i+1));; esac;;
+    --input-format)
+        [ "${args[$((i+1))]}" = "stream-json" ] && STREAM_INPUT=1; i=$((i+1));;
     --permission-mode|--output-format) i=$((i+1));;
+    --verbose) ;;
     *) if [ -z "$PROMPT" ]; then PROMPT="${args[$i]}"; fi;;
   esac
 done
+
+# Conversation mode: JSONL in, events out. One assistant reply per user line.
+if [ "$STREAM_INPUT" = "1" ]; then
+  echo '{"type":"system","subtype":"init","session_id":"'"$SESSION"'"}'
+  TURN=0
+  while read -r line; do
+    TURN=$((TURN+1))
+    TEXT=$(printf '%s' "$line" | grep -o '"text":"[^"]*"' | head -1 | sed 's/^"text":"//;s/"$//')
+    if printf '%s' "$TEXT" | grep -q usetool; then
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes/meeting.md"}}]},"session_id":"'"$SESSION"'"}'
+    fi
+    echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$TEXT"'"}]},"session_id":"'"$SESSION"'"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION"'"}'
+    if [ "$BEHAVIOR" = "stream-die" ] && [ "$TURN" -ge 1 ]; then
+      exit 7
+    fi
+  done
+  exit 0
+fi
 
 # Staging dir is announced in the prompt as: STAGING_DIR=<path>
 STAGING=$(echo "$PROMPT" | grep -o 'STAGING_DIR=[^ ]*' | head -1 | cut -d= -f2)

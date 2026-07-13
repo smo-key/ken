@@ -2163,6 +2163,7 @@ dependencies = [
 name = "ken-app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "ignore",
  "ken-core",
  "serde",
@@ -2171,6 +2172,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "uuid",
 ]
 
 [[package]]

@@ -18,3 +18,5 @@ tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
 ignore = "0.4"
+base64 = "0.22"
+uuid.workspace = true

@@ -134,6 +134,32 @@ export interface IngestForm {
   rules?: RulesOverride | null;
 }
 
+export type ChatStatus = "working" | "needs_input" | "done" | "error";
+
+export interface ChatRow {
+  id: string;
+  title: string;
+  kind: "user" | "ingest";
+  pinned: boolean;
+  status: ChatStatus;
+  createdAt: number;
+  lastActiveAt: number;
+  archived: boolean;
+}
+
+export interface ChatMessage {
+  id: number;
+  chatId: string;
+  role: "user" | "assistant" | "activity" | "divider";
+  content: string;
+  createdAt: number;
+}
+
+export interface PtyChunk {
+  chatId: string;
+  data: string; // base64
+}
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -178,6 +204,33 @@ export const api = {
   setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
     invoke<void>("set_ingest_runner_mode", { mode }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
+
+  listChats: () => invoke<ChatRow[]>("list_chats"),
+  chatTranscript: (chatId: string) =>
+    invoke<ChatMessage[]>("chat_transcript", { chatId }),
+  createChat: () => invoke<ChatRow>("create_chat"),
+  sendChatMessage: (chatId: string, text: string) =>
+    invoke<void>("send_chat_message", { chatId, text }),
+  renameChat: (chatId: string, title: string) =>
+    invoke<void>("rename_chat", { chatId, title }),
+  setChatPinned: (chatId: string, pinned: boolean) =>
+    invoke<void>("set_chat_pinned", { chatId, pinned }),
+  archiveChat: (chatId: string) => invoke<void>("archive_chat", { chatId }),
+  enterTerminalMode: (chatId: string) =>
+    invoke<void>("enter_terminal_mode", { chatId }),
+  leaveTerminalMode: (chatId: string) =>
+    invoke<void>("leave_terminal_mode", { chatId }),
+  chatPtyInput: (chatId: string, data: string) =>
+    invoke<void>("chat_pty_input", { chatId, data }),
+  chatPtyResize: (chatId: string, rows: number, cols: number) =>
+    invoke<void>("chat_pty_resize", { chatId, rows, cols }),
+
+  onChatUpdated: (fn: (row: ChatRow) => void): Promise<UnlistenFn> =>
+    listen<ChatRow>("chat-updated", (e) => fn(e.payload)),
+  onChatMessage: (fn: (msg: ChatMessage) => void): Promise<UnlistenFn> =>
+    listen<ChatMessage>("chat-message", (e) => fn(e.payload)),
+  onChatPtyData: (fn: (chunk: PtyChunk) => void): Promise<UnlistenFn> =>
+    listen<PtyChunk>("chat-pty-data", (e) => fn(e.payload)),
 
   onIngestRunChanged: (fn: (ev: IngestEvent) => void): Promise<UnlistenFn> =>
     listen<IngestEvent>("ingest-run-changed", (e) => fn(e.payload)),
