@@ -7,13 +7,17 @@
   let switcherOpen = $state(false);
 
   const initial = $derived(app.project?.name?.charAt(0).toUpperCase() ?? "?");
-  const syncTitle = $derived(
-    app.scanning
-      ? "Indexing…"
-      : app.lastScanAt
-        ? `Watching · updated ${timeAgo(Math.floor(app.lastScanAt / 1000))}`
-        : "Watching",
-  );
+  const syncTitle = $derived.by(() => {
+    if (app.scanError) return app.scanError;
+    if (app.syncState === "attention")
+      return app.syncDetail ?? "Something needs your attention — open Review.";
+    if (app.scanning) return "Indexing…";
+    if (app.syncState === "syncing") return "Syncing with your team…";
+    if (app.syncState === "synced") return "Synced with your team";
+    return app.lastScanAt
+      ? `Watching · updated ${timeAgo(Math.floor(app.lastScanAt / 1000))}`
+      : "Watching";
+  });
 </script>
 
 <header data-tauri-drag-region>
@@ -25,9 +29,9 @@
     {app.project?.name}
     <span
       class="dot"
-      class:busy={app.scanning}
-      class:error={app.scanError !== null}
-      title={app.scanError ?? syncTitle}
+      class:busy={app.scanning || app.syncState === "syncing"}
+      class:error={app.scanError !== null || app.syncState === "attention"}
+      title={syncTitle}
     ></span>
     <span class="chev">▾</span>
   </button>

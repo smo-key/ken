@@ -14,7 +14,7 @@
   // (approvals and blocked runs above, failed files below).
   const otherReviewCount = $derived(
     review.items.filter(
-      (i) => i.kind === "stale" || i.kind === "broken-recipe" || i.kind === "stored",
+      (i) => i.kind !== "approval" && i.kind !== "failed-file",
     ).length,
   );
 

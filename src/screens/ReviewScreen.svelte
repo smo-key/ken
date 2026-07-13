@@ -5,12 +5,14 @@
   import {
     review,
     actionsFor,
+    conflictCopyPayload,
     dotFor,
     sourceLabel,
     type InboxAction,
   } from "../lib/review.svelte";
   import { timeAgo } from "../lib/format";
   import type { InboxItem } from "../lib/api";
+  import ConflictDetail from "../review/ConflictDetail.svelte";
 
   onMount(() => void review.init());
 
@@ -24,6 +26,13 @@
     "open-files": "Open in Files",
     "open-ingests": "Open in Ingests",
     "mark-done": "Mark as done",
+    "accept-draft": "Accept Ken's merge",
+    "keep-mine": "Keep mine",
+    "take-theirs": "Use theirs",
+    "edit-manually": "Edit manually",
+    "keep-copy": "Keep this copy",
+    "keep-original": "Keep the original",
+    "open-both": "Open in Files",
   };
 
   function act(action: InboxAction, it: InboxItem) {
@@ -47,6 +56,25 @@
       case "mark-done":
         void review.markDone(it);
         break;
+      case "accept-draft":
+      case "keep-mine":
+      case "take-theirs":
+        void review.resolveConflict(it, action);
+        break;
+      case "edit-manually":
+        void review
+          .resolveConflict(it, "accept-draft")
+          .then((path) => app.openInFiles(path));
+        break;
+      case "keep-copy":
+      case "keep-original":
+        void review.resolveConflictCopy(it, action);
+        break;
+      case "open-both": {
+        const p = conflictCopyPayload(it);
+        app.openInFiles(p?.originalPath ?? p?.copyPath ?? it.sourceRef);
+        break;
+      }
     }
   }
 </script>
@@ -99,24 +127,29 @@
           <h1>{item.title}</h1>
           <span class="meta mono">{sourceLabel(item)} · {timeAgo(item.when)}</span>
         </div>
-        <div class="card">
-          <div class="body">{item.body}</div>
-          {#if itemIsDone}
-            <div class="resolved-note">Resolved {timeAgo(item.when)}.</div>
-          {:else}
-            <div class="actions">
-              {#each actionsFor(item.kind) as action, i (action)}
-                <button
-                  class="btn"
-                  class:btn-primary={i === 0}
-                  onclick={() => act(action, item)}
-                >
-                  {LABELS[action]}
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
+        {#if item.kind === "conflict" && !itemIsDone}
+          <div class="body-note">{item.body}</div>
+          <ConflictDetail {item} />
+        {:else}
+          <div class="card">
+            <div class="body">{item.body}</div>
+            {#if itemIsDone}
+              <div class="resolved-note">Resolved {timeAgo(item.when)}.</div>
+            {:else}
+              <div class="actions">
+                {#each actionsFor(item.kind) as action, i (action)}
+                  <button
+                    class="btn"
+                    class:btn-primary={i === 0}
+                    onclick={() => act(action, item)}
+                  >
+                    {LABELS[action]}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
       </div>
     {:else if review.items.length === 0}
       <div class="empty">
@@ -259,6 +292,11 @@
     font-size: 13.5px;
     line-height: 1.7;
     white-space: pre-wrap;
+  }
+  .body-note {
+    font-size: 13px;
+    line-height: 1.65;
+    color: var(--ink-secondary);
   }
   .actions {
     display: flex;

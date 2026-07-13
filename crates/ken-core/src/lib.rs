@@ -15,6 +15,7 @@ pub mod refresh;
 pub mod runner;
 pub mod registry;
 pub mod scan;
+pub mod sync;
 pub mod watch;
 
 pub use error::{Error, Result};

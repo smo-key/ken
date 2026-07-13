@@ -16,6 +16,7 @@ use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, 
 use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::scan::{self, ScanStats};
+use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
 use ken_core::watch::{self, WatchHandle};
 
 enum TerminalHandle {
@@ -33,6 +34,7 @@ struct ActiveProject {
     chat_engine: Option<Arc<ChatEngine>>,
     /// Shared connection for chat persistence from event threads.
     chat_db: Arc<Mutex<Db>>,
+    sync: Arc<SyncEngine>,
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
 }
 
@@ -70,6 +72,14 @@ impl ProjectInfo {
                 .to_string(),
         }
     }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SyncStateEvent {
+    /// `off` | `synced` | `syncing` | `attention`
+    state: String,
+    detail: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -202,8 +212,33 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         ))
     });
 
+    // Sync engine: active git sync when the folder is a repo with a
+    // remote; passive conflicted-copy detection otherwise. Notices become
+    // the title-bar dot (`sync-state`) and inbox refreshes (`review-changed`).
+    let sync_app = app.clone();
+    let sync_engine = Arc::new(
+        SyncEngine::start(
+            project.root.clone(),
+            watch_db_path.clone(),
+            SyncConfig::default(),
+            move |notice| match notice {
+                SyncNotice::State { state, detail } => {
+                    let _ = sync_app.emit("sync-state", SyncStateEvent {
+                        state: state.as_str().into(),
+                        detail,
+                    });
+                }
+                SyncNotice::ReviewChanged => {
+                    let _ = sync_app.emit("review-changed", ());
+                }
+            },
+        )
+        .map_err(err)?,
+    );
+
     let emit_app = app.clone();
     let watch_engine = engine.clone();
+    let watch_sync = sync_engine.clone();
     let watch = watch::start(
         project.clone(),
         watch_db_path,
@@ -211,6 +246,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         move |stats: &ScanStats| {
             if !stats.changed_paths.is_empty() {
                 watch_engine.sources_changed(stats.changed_paths.clone());
+                watch_sync.changed(stats.changed_paths.clone());
             }
             let _ = emit_app.emit("index-updated", stats.clone());
         },
@@ -225,18 +261,26 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         engine,
         chat_engine,
         chat_db,
+        sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
     drop(guard);
 
+    // Fetch teammates' updates right after opening.
+    sync_engine.pull_now();
+
     // Initial scan in the background so opening stays instant.
     let scan_app = app.clone();
+    let scan_sync = sync_engine.clone();
     let base = { state.lock().unwrap().base_dir.clone() };
     std::thread::spawn(move || {
         if let Ok(mut db) = Db::open(&base, project.config.id) {
             let _ = scan_app.emit("scan-started", ());
             match scan::scan(&project, &mut db) {
                 Ok(stats) => {
+                    if !stats.changed_paths.is_empty() {
+                        scan_sync.changed(stats.changed_paths.clone());
+                    }
                     let _ = scan_app.emit("index-updated", stats);
                 }
                 Err(e) => {
@@ -640,11 +684,14 @@ struct InboxItem {
     /// "file-notes/x.pdf", "broken-people", "item-3".
     id: String,
     /// `approval` | `stale` | `failed-file` | `broken-recipe` | `stored`
+    /// | `conflict` | `conflict-copy`
     kind: String,
     title: String,
     body: String,
     when: i64,
     source_ref: String,
+    /// Kind-specific JSON for stored items (conflict versions, copy paths).
+    payload: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -658,10 +705,20 @@ struct ReviewInbox {
 fn inbox_rank(kind: &str) -> u8 {
     match kind {
         "approval" => 0,
-        "stored" => 1,
-        "broken-recipe" => 2,
-        "failed-file" => 3,
-        _ => 4, // stale
+        "conflict" | "conflict-copy" => 1,
+        "stored" => 2,
+        "broken-recipe" => 3,
+        "failed-file" => 4,
+        _ => 5, // stale
+    }
+}
+
+/// Stored items carry their real kind when the frontend knows it
+/// (conflicts render their own detail); anything else stays generic.
+fn stored_kind(kind: &str) -> String {
+    match kind {
+        "conflict" | "conflict-copy" => kind.to_string(),
+        _ => "stored".to_string(),
     }
 }
 
@@ -700,6 +757,7 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
                             ),
                             when: last.started_at,
                             source_ref: r.slug.clone(),
+                            payload: None,
                         });
                     }
                 }
@@ -722,6 +780,7 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
                     ),
                     when,
                     source_ref: error.slug,
+                    payload: None,
                 });
             }
         }
@@ -742,6 +801,7 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
             ),
             when: run.finished_at.unwrap_or(run.started_at),
             source_ref: run.slug,
+            payload: None,
         });
     }
 
@@ -760,17 +820,19 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
             ),
             when: f.mtime,
             source_ref: f.rel_path,
+            payload: None,
         });
     }
 
     for it in active.db.list_open_review_items().map_err(err)? {
         items.push(InboxItem {
             id: format!("item-{}", it.id),
-            kind: "stored".into(),
+            kind: stored_kind(&it.kind),
             title: it.title,
             body: it.body,
             when: it.created_at,
             source_ref: it.source_ref,
+            payload: it.payload,
         });
     }
 
@@ -802,16 +864,18 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
             body: run.summary.clone().unwrap_or_default(),
             when: run.finished_at.unwrap_or(run.started_at),
             source_ref: run.slug,
+            payload: None,
         });
     }
     for it in active.db.list_recent_resolved_review_items(since).map_err(err)? {
         done.push(InboxItem {
             id: format!("item-{}", it.id),
-            kind: "stored".into(),
+            kind: stored_kind(&it.kind),
             title: it.title,
             body: it.body,
             when: it.resolved_at.unwrap_or(it.created_at),
             source_ref: it.source_ref,
+            payload: None,
         });
     }
     done.sort_by(|a, b| b.when.cmp(&a.when));
@@ -827,6 +891,217 @@ fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
         .db
         .resolve_review_item(id, engine::now_epoch())
         .map_err(err)
+}
+
+// ---------- sync ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncStatus {
+    /// `git` | `drive`
+    mode: String,
+    auto: bool,
+    /// Whether automatic pull/push is actually running (git + remote + auto).
+    active: bool,
+    remote: Option<String>,
+    branch: Option<String>,
+}
+
+fn sync_status_of(project: &Project) -> SyncStatus {
+    let is_git = sync::is_git_repo(&project.root);
+    let (remote, branch) = if is_git {
+        sync::remote_and_branch(&project.root)
+    } else {
+        (None, None)
+    };
+    let auto = sync::sync_auto(project);
+    SyncStatus {
+        mode: if is_git { "git" } else { "drive" }.into(),
+        auto,
+        active: is_git && auto && remote.is_some(),
+        remote,
+        branch,
+    }
+}
+
+#[tauri::command]
+fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    Ok(sync_status_of(&active.project))
+}
+
+#[tauri::command]
+fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdResult<SyncStatus> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let mut obj = active
+        .project
+        .config
+        .extra
+        .get("sync")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert("auto".into(), serde_json::Value::Bool(auto));
+    active
+        .project
+        .config
+        .extra
+        .insert("sync".into(), serde_json::Value::Object(obj));
+    active.project.save().map_err(err)?;
+
+    let status = sync_status_of(&active.project);
+    // Reflect the toggle in the dot immediately; a fresh pull confirms.
+    let _ = app.emit("sync-state", SyncStateEvent {
+        state: if status.active { "synced" } else { "off" }.into(),
+        detail: None,
+    });
+    if status.active {
+        active.sync.pull_now();
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+fn sync_now(state: State<SharedState>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    active.sync.sync_now();
+    Ok(())
+}
+
+/// Payload of a `conflict` review item, parsed for command use.
+fn conflict_payload(item: &ken_core::db::ReviewItemRow) -> CmdResult<serde_json::Value> {
+    item.payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str(p).ok())
+        .ok_or_else(|| "this item has no conflict details".to_string())
+}
+
+/// Resolve a merge-conflict review item: write the chosen content to the
+/// project file, resolve the item, reindex — the normal sync path pushes
+/// it out. Returns the project-relative path that was written.
+#[tauri::command]
+fn resolve_conflict(
+    app: AppHandle,
+    state: State<SharedState>,
+    item_id: i64,
+    resolution: String,
+    content: Option<String>,
+) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let item = active
+        .db
+        .get_review_item(item_id)
+        .map_err(err)?
+        .ok_or("item not found")?;
+    if item.kind != "conflict" || item.status != "open" {
+        return Err("this item isn't an open conflict".into());
+    }
+    let payload = conflict_payload(&item)?;
+    let path = payload["path"]
+        .as_str()
+        .ok_or("conflict details are missing the file path")?
+        .to_string();
+    let ours = payload["ours"].as_str().unwrap_or_default();
+    let theirs = payload["theirs"].as_str().unwrap_or_default();
+    let draft = payload["draft"].as_str();
+    let chosen: String = match resolution.as_str() {
+        // Accept Ken's merge; fall back to the user's version when no
+        // draft exists (also the "edit manually" starting point).
+        "accept-draft" => draft.unwrap_or(ours).to_string(),
+        "keep-mine" => ours.to_string(),
+        "take-theirs" => theirs.to_string(),
+        "manual" => content.ok_or("manual resolution needs content")?,
+        _ => return Err("unknown resolution".into()),
+    };
+
+    let abs = active.project.resolve(&path).map_err(err)?;
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(&abs, &chosen).map_err(err)?;
+    scan::refresh_path(&active.project, &mut active.db, &path).map_err(err)?;
+    active
+        .db
+        .resolve_review_item(item_id, engine::now_epoch())
+        .map_err(err)?;
+    active.sync.changed(vec![path.clone()]);
+    let _ = app.emit("file-saved", &path);
+    let _ = app.emit("review-changed", ());
+    Ok(path)
+}
+
+/// Resolve a shared-drive conflicted-copy item: `keep-copy` promotes the
+/// copy's content to the original name, `keep-original` deletes the copy.
+/// Returns the path of the surviving file.
+#[tauri::command]
+fn resolve_conflict_copy(
+    app: AppHandle,
+    state: State<SharedState>,
+    item_id: i64,
+    resolution: String,
+) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let item = active
+        .db
+        .get_review_item(item_id)
+        .map_err(err)?
+        .ok_or("item not found")?;
+    if item.kind != "conflict-copy" || item.status != "open" {
+        return Err("this item isn't an open conflicting copy".into());
+    }
+    let payload = conflict_payload(&item)?;
+    let copy_rel = payload["copyPath"]
+        .as_str()
+        .ok_or("details are missing the copy's path")?
+        .to_string();
+    let orig_rel = payload["originalPath"].as_str().map(String::from);
+    let copy_abs = active.project.resolve(&copy_rel).map_err(err)?;
+
+    let survivor = match resolution.as_str() {
+        "keep-copy" => {
+            // Promote the copy to the original name (derive it when the
+            // original no longer exists).
+            let target_rel = match orig_rel {
+                Some(o) => o,
+                None => {
+                    let file_name = copy_rel.rsplit('/').next().unwrap_or(&copy_rel);
+                    let original = sync::conflicted_copy_original(file_name)
+                        .ok_or("couldn't work out the original name")?;
+                    match copy_rel.rsplit_once('/') {
+                        Some((dir, _)) => format!("{dir}/{original}"),
+                        None => original,
+                    }
+                }
+            };
+            let target_abs = active.project.resolve(&target_rel).map_err(err)?;
+            std::fs::rename(&copy_abs, &target_abs).or_else(|_| {
+                std::fs::copy(&copy_abs, &target_abs)
+                    .and_then(|_| std::fs::remove_file(&copy_abs))
+            })
+            .map_err(err)?;
+            scan::refresh_path(&active.project, &mut active.db, &target_rel).map_err(err)?;
+            target_rel
+        }
+        "keep-original" => {
+            if copy_abs.is_file() {
+                std::fs::remove_file(&copy_abs).map_err(err)?;
+            }
+            orig_rel.unwrap_or_else(|| copy_rel.clone())
+        }
+        _ => return Err("unknown resolution".into()),
+    };
+    scan::refresh_path(&active.project, &mut active.db, &copy_rel).map_err(err)?;
+    active
+        .db
+        .resolve_review_item(item_id, engine::now_epoch())
+        .map_err(err)?;
+    active.sync.changed(vec![survivor.clone(), copy_rel]);
+    let _ = app.emit("review-changed", ());
+    Ok(survivor)
 }
 
 #[tauri::command]
@@ -1159,6 +1434,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(state)
+        // Focus = "the user is back" — the moment to fetch teammates' work.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                use tauri::Manager;
+                let state = window.state::<SharedState>();
+                let sync = {
+                    let guard = state.lock().unwrap();
+                    guard.active.as_ref().map(|a| a.sync.clone())
+                };
+                if let Some(sync) = sync {
+                    sync.pull_now();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_projects,
             create_project,
@@ -1187,6 +1476,11 @@ pub fn run() {
             pending_approvals,
             review_inbox,
             resolve_review_item,
+            sync_status,
+            set_sync_auto,
+            sync_now,
+            resolve_conflict,
+            resolve_conflict_copy,
             set_ingest_runner_mode,
             claude_doctor,
             list_chats,

@@ -139,7 +139,9 @@ export type InboxKind =
   | "stale"
   | "failed-file"
   | "broken-recipe"
-  | "stored";
+  | "stored"
+  | "conflict"
+  | "conflict-copy";
 
 export interface InboxItem {
   /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
@@ -149,11 +151,52 @@ export interface InboxItem {
   body: string;
   when: number;
   sourceRef: string;
+  /** Kind-specific JSON for stored items (conflict versions, copy paths). */
+  payload: string | null;
 }
 
 export interface ReviewInbox {
   items: InboxItem[];
   done: InboxItem[];
+}
+
+/** Parsed payload of a `conflict` inbox item. */
+export interface ConflictPayload {
+  path: string;
+  ours: string;
+  theirs: string;
+  draft: string | null;
+  draftStatus: "pending" | "ready" | "failed";
+}
+
+/** Parsed payload of a `conflict-copy` inbox item. */
+export interface ConflictCopyPayload {
+  copyPath: string;
+  originalPath: string | null;
+}
+
+export type ConflictResolution =
+  | "accept-draft"
+  | "keep-mine"
+  | "take-theirs"
+  | "manual";
+
+export type ConflictCopyResolution = "keep-copy" | "keep-original";
+
+export type SyncStateName = "off" | "synced" | "syncing" | "attention";
+
+export interface SyncStateEvent {
+  state: SyncStateName;
+  detail: string | null;
+}
+
+export interface SyncStatus {
+  mode: "git" | "drive";
+  auto: boolean;
+  /** Whether automatic updates are actually running. */
+  active: boolean;
+  remote: string | null;
+  branch: string | null;
 }
 
 export type ChatStatus = "working" | "needs_input" | "done" | "error";
@@ -226,6 +269,17 @@ export const api = {
   reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
   resolveReviewItem: (id: number) =>
     invoke<void>("resolve_review_item", { id }),
+  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  setSyncAuto: (auto: boolean) =>
+    invoke<SyncStatus>("set_sync_auto", { auto }),
+  syncNow: () => invoke<void>("sync_now"),
+  resolveConflict: (
+    itemId: number,
+    resolution: ConflictResolution,
+    content?: string,
+  ) => invoke<string>("resolve_conflict", { itemId, resolution, content }),
+  resolveConflictCopy: (itemId: number, resolution: ConflictCopyResolution) =>
+    invoke<string>("resolve_conflict_copy", { itemId, resolution }),
   setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
     invoke<void>("set_ingest_runner_mode", { mode }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
@@ -263,6 +317,10 @@ export const api = {
     listen<ScanStats>("index-updated", (e) => fn(e.payload)),
   onFileSaved: (fn: (relPath: string) => void): Promise<UnlistenFn> =>
     listen<string>("file-saved", (e) => fn(e.payload)),
+  onSyncState: (fn: (ev: SyncStateEvent) => void): Promise<UnlistenFn> =>
+    listen<SyncStateEvent>("sync-state", (e) => fn(e.payload)),
+  onReviewChanged: (fn: () => void): Promise<UnlistenFn> =>
+    listen<null>("review-changed", () => fn()),
   onScanError: (fn: (message: string) => void): Promise<UnlistenFn> =>
     listen<string>("scan-error", (e) => fn(e.payload)),
 };

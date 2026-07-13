@@ -516,6 +516,28 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn get_review_item(&self, id: i64) -> Result<Option<ReviewItemRow>> {
+        let sql = format!(
+            "SELECT {} FROM review_items WHERE id = ?1",
+            Self::REVIEW_ITEM_COLS
+        );
+        match self.conn.query_row(&sql, params![id], Self::map_review_item) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace a stored item's kind-specific payload (e.g. when an AI merge
+    /// draft lands after the item was filed).
+    pub fn set_review_item_payload(&mut self, id: i64, payload: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE review_items SET payload = ?2 WHERE id = ?1",
+            params![id, payload],
+        )?;
+        Ok(())
+    }
+
     pub fn resolve_review_item(&mut self, id: i64, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE review_items SET status = 'resolved', resolved_at = ?2
@@ -988,6 +1010,15 @@ mod tests {
         assert_eq!(open[0].id, b);
         assert_eq!(open[1].status, "open");
         assert_eq!(open[1].payload.as_deref(), Some(r#"{"options":["yes","no"]}"#));
+
+        // Payload can be replaced in place (AI draft landing later).
+        db.set_review_item_payload(b, r#"{"path":"Decisions.md","draft":"x"}"#)
+            .unwrap();
+        assert_eq!(
+            db.get_review_item(b).unwrap().unwrap().payload.as_deref(),
+            Some(r#"{"path":"Decisions.md","draft":"x"}"#)
+        );
+        assert!(db.get_review_item(9999).unwrap().is_none());
 
         db.resolve_review_item(a, 300).unwrap();
         assert_eq!(db.list_open_review_items().unwrap().len(), 1);

@@ -6,6 +6,7 @@ import {
   type ProjectInfo,
   type RegistryEntryStatus,
   type ScanStats,
+  type SyncStateName,
 } from "./api";
 
 export type Screen =
@@ -33,6 +34,10 @@ class AppStore {
 
   searchOpen = $state(false);
 
+  /** Team-sync state for the title-bar dot ("off" = not a synced project). */
+  syncState = $state<SyncStateName>("off");
+  syncDetail = $state<string | null>(null);
+
   get failedFiles(): FileRow[] {
     return this.files.filter((f) => f.status === "failed");
   }
@@ -49,6 +54,10 @@ class AppStore {
     await api.onScanError((message) => {
       this.scanning = false;
       this.scanError = message;
+    });
+    await api.onSyncState((ev) => {
+      this.syncState = ev.state;
+      this.syncDetail = ev.detail;
     });
     if (this.project) await this.refreshTree();
   }
@@ -68,6 +77,8 @@ class AppStore {
     this.project = info;
     this.scanning = true;
     this.scanError = null;
+    this.syncState = "off";
+    this.syncDetail = null;
     this.openFile = null;
     this.screen = "home";
     await this.refreshRegistry();

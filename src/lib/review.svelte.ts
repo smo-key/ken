@@ -1,7 +1,15 @@
 // Review inbox state: the unified list of everything Ken needs a human
 // for, plus recently resolved items. Assembled by the review_inbox
-// command; refreshed on run and index events.
-import { api, type InboxItem, type InboxKind } from "./api";
+// command; refreshed on run, index, and sync events.
+import {
+  api,
+  type ConflictCopyPayload,
+  type ConflictCopyResolution,
+  type ConflictPayload,
+  type ConflictResolution,
+  type InboxItem,
+  type InboxKind,
+} from "./api";
 
 /** Actions the detail pane offers, derived from item kind. */
 export type InboxAction =
@@ -10,7 +18,14 @@ export type InboxAction =
   | "run-now"
   | "open-files"
   | "open-ingests"
-  | "mark-done";
+  | "mark-done"
+  | "accept-draft"
+  | "keep-mine"
+  | "take-theirs"
+  | "edit-manually"
+  | "keep-copy"
+  | "keep-original"
+  | "open-both";
 
 export function actionsFor(kind: InboxKind): InboxAction[] {
   switch (kind) {
@@ -24,6 +39,32 @@ export function actionsFor(kind: InboxKind): InboxAction[] {
       return ["open-ingests"];
     case "stored":
       return ["mark-done"];
+    case "conflict":
+      return ["accept-draft", "keep-mine", "take-theirs", "edit-manually"];
+    case "conflict-copy":
+      return ["keep-copy", "keep-original", "open-both"];
+  }
+}
+
+/** Parsed conflict payload, or null when absent/malformed. */
+export function conflictPayload(item: InboxItem): ConflictPayload | null {
+  if (item.kind !== "conflict" || !item.payload) return null;
+  try {
+    return JSON.parse(item.payload) as ConflictPayload;
+  } catch {
+    return null;
+  }
+}
+
+/** Parsed conflicted-copy payload, or null when absent/malformed. */
+export function conflictCopyPayload(
+  item: InboxItem,
+): ConflictCopyPayload | null {
+  if (item.kind !== "conflict-copy" || !item.payload) return null;
+  try {
+    return JSON.parse(item.payload) as ConflictCopyPayload;
+  } catch {
+    return null;
   }
 }
 
@@ -39,6 +80,8 @@ export function dotFor(kind: InboxKind): string {
       return "var(--accent)";
     case "stored":
       return "var(--needs-input)";
+    case "conflict":
+    case "conflict-copy":
     case "failed-file":
     case "broken-recipe":
       return "var(--danger)";
@@ -78,6 +121,7 @@ class ReviewStore {
   async init() {
     await api.onIngestRunChanged(() => void this.refresh());
     await api.onIndexUpdated(() => void this.refresh());
+    await api.onReviewChanged(() => void this.refresh());
     await this.refresh();
   }
 
@@ -114,6 +158,27 @@ class ReviewStore {
   async markDone(item: InboxItem) {
     await api.resolveReviewItem(numericId(item));
     await this.refresh();
+  }
+
+  /** Resolve a merge conflict; returns the project-relative path written. */
+  async resolveConflict(
+    item: InboxItem,
+    resolution: ConflictResolution,
+    content?: string,
+  ): Promise<string> {
+    const path = await api.resolveConflict(numericId(item), resolution, content);
+    await this.refresh();
+    return path;
+  }
+
+  /** Resolve a conflicted copy; returns the surviving file's path. */
+  async resolveConflictCopy(
+    item: InboxItem,
+    resolution: ConflictCopyResolution,
+  ): Promise<string> {
+    const path = await api.resolveConflictCopy(numericId(item), resolution);
+    await this.refresh();
+    return path;
   }
 }
 

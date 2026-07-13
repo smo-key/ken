@@ -1,13 +1,35 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
-  import { api } from "../lib/api";
+  import { api, type SyncStatus } from "../lib/api";
 
   let busy = $state(false);
   let toggling = $state(false);
   let runnerMode = $state<"hidden-tui" | "headless">(
     app.project?.ingestRunner ?? "headless",
   );
+  let sync = $state<SyncStatus | null>(null);
+  let syncingNow = $state(false);
+
+  onMount(() => {
+    void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
+  });
+
+  async function toggleSyncAuto() {
+    if (!sync) return;
+    sync = await api.setSyncAuto(!sync.auto);
+  }
+
+  async function syncNow() {
+    syncingNow = true;
+    try {
+      await api.syncNow();
+    } finally {
+      // Brief acknowledgement; live progress shows on the title-bar dot.
+      setTimeout(() => (syncingNow = false), 1200);
+    }
+  }
 
   async function setRunnerMode(mode: "hidden-tui" | "headless") {
     runnerMode = mode;
@@ -146,12 +168,68 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-title">Sync &amp; collaboration</div>
+      {#if sync?.mode === "git"}
+        <div class="row">
+          <span class="chip mono">git</span>
+          {#if sync.remote}
+            <span class="mono small">{sync.remote} {sync.branch ?? ""}</span>
+            <span class="soft">
+              {sync.active
+                ? "updates flow automatically · conflicts go to Review"
+                : "automatic updates are off"}
+            </span>
+          {:else}
+            <span class="soft">
+              no shared location set up yet — Ken keeps everything local
+            </span>
+          {/if}
+        </div>
+        {#if sync.remote}
+          <div class="row">
+            <label class="radio">
+              <input
+                type="checkbox"
+                checked={sync.auto}
+                onchange={() => void toggleSyncAuto()}
+              />
+              Keep this project in sync automatically
+            </label>
+            <button
+              class="btn btn-small sync-now"
+              onclick={() => void syncNow()}
+              disabled={!sync.active || syncingNow}
+            >
+              {syncingNow ? "Syncing…" : "Sync now"}
+            </button>
+          </div>
+          <p class="note">
+            Ken fetches your team's updates when you return to the app and
+            shares your saves shortly after you make them. When two people
+            change the same document, both versions land in Review.
+          </p>
+        {/if}
+      {:else}
+        <div class="row">
+          <span class="chip mono">shared drive</span>
+          <span class="soft">
+            Ken watches for conflicting copies — they land in Review.
+          </span>
+        </div>
+        <p class="note">
+          If this folder lives in Dropbox, OneDrive, or Google Drive, the
+          drive does the syncing; Ken keeps an eye out for the damage
+          conflicting edits leave behind.
+        </p>
+      {/if}
+    </div>
+
     <div class="card muted">
       <div class="card-title">Coming to Ken</div>
       <p class="note">
-        MCP server for your agents, Git &amp; shared-drive sync with conflict
-        review, chats with Claude, and a unified Review inbox — each arrives in
-        an upcoming release.
+        MCP server for your agents, plus knowledge Map and Timeline views —
+        each arrives in an upcoming release.
       </p>
     </div>
   </div>
@@ -254,6 +332,17 @@
   .soft {
     color: var(--ink-tertiary);
     font-size: 12px;
+  }
+  .chip {
+    font-size: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 9px;
+    background: var(--sunken);
+    flex: none;
+  }
+  .sync-now {
+    margin-left: auto;
   }
   .ok-dot {
     display: inline-block;
