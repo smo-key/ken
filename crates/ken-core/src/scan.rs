@@ -32,6 +32,14 @@ pub fn is_junk_dir_name(name: &str) -> bool {
     JUNK_DIRS.contains(&name)
 }
 
+/// Microsoft Office writes transient lock files named `~$<document>` beside
+/// any open document. They carry no content and churn constantly — ignore
+/// them everywhere (initial scan, refresh, watcher) so they never enter the
+/// index or trigger rescans.
+pub fn is_office_lock_name(name: &str) -> bool {
+    name.starts_with("~$")
+}
+
 /// File status values stored in the index.
 pub const STATUS_INDEXED: &str = "indexed";
 pub const STATUS_METADATA_ONLY: &str = "metadata_only";
@@ -50,7 +58,9 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         .git_exclude(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            name != ".ken" && !(e.path().is_dir() && is_junk_dir_name(&name))
+            name != ".ken"
+                && !is_office_lock_name(&name)
+                && !(e.path().is_dir() && is_junk_dir_name(&name))
         })
         .build();
     for entry in walker.flatten() {
@@ -135,7 +145,9 @@ fn index_one(
 /// is included, remove otherwise. Returns true if the index changed.
 pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     let abs = project.root.join(rel);
-    let excluded = project.is_excluded(rel) || is_hidden_rel(rel);
+    let excluded = project.is_excluded(rel)
+        || is_hidden_rel(rel)
+        || rel.rsplit('/').next().is_some_and(is_office_lock_name);
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -295,6 +307,26 @@ mod tests {
         scan(&project, &mut db).unwrap();
         assert!(db.get_file(".DS_Store").unwrap().is_none());
         assert!(db.get_file(".ken/project.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn office_lock_files_not_indexed() {
+        let (dir, project) = temp_project();
+        // Word/Excel drop these beside an open document.
+        fs::write(dir.path().join("notes/~$meeting.docx"), "office lock junk").unwrap();
+        fs::write(dir.path().join("~$budget.xlsx"), "office lock junk").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let stats = scan(&project, &mut db).unwrap();
+
+        // Same fixture count as a clean scan: the lock files add nothing.
+        assert_eq!(stats.added, 11, "stats: {stats:?}");
+        assert!(db.get_file("notes/~$meeting.docx").unwrap().is_none());
+        assert!(db.get_file("~$budget.xlsx").unwrap().is_none());
+
+        // A watcher event for a lock file must be a no-op through refresh_path.
+        assert!(!refresh_path(&project, &mut db, "notes/~$meeting.docx").unwrap());
+        assert!(db.get_file("notes/~$meeting.docx").unwrap().is_none());
         drop(dir);
     }
 

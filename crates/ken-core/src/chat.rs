@@ -91,7 +91,11 @@ fn summarize_tool(block: &Value) -> String {
 
 struct Conversation {
     child: Child,
-    stdin: ChildStdin,
+    /// Behind its own lock so a turn's (potentially blocking) stdin write can
+    /// happen off the `live` map lock: we clone this handle out under a short
+    /// map lock, release it, then write. Otherwise a busy turn that stops
+    /// draining its stdin pipe would wedge the whole engine.
+    stdin: Arc<Mutex<ChildStdin>>,
     started: Instant,
 }
 
@@ -129,14 +133,24 @@ impl ChatEngine {
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
         });
-        let mut live = self.live.lock().unwrap();
-        let conv = live
-            .get_mut(chat_id)
-            .ok_or_else(|| Error::Other("chat process vanished".into()))?;
-        writeln!(conv.stdin, "{payload}")
-            .and_then(|_| conv.stdin.flush())
-            .map_err(|e| Error::Other(format!("chat send failed: {e}")))?;
-        drop(live);
+        // Take the stdin handle under a short map lock, then drop the map lock
+        // before writing: the write can block for as long as the turn keeps
+        // the pipe full (e.g. Claude busy searching/running tools), and holding
+        // `live` across it would freeze every other engine call — is_live,
+        // stop, other chats' sends, and the death pump.
+        let stdin = {
+            let live = self.live.lock().unwrap();
+            live.get(chat_id)
+                .ok_or_else(|| Error::Other("chat process vanished".into()))?
+                .stdin
+                .clone()
+        };
+        {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| Error::Other(format!("chat send failed: {e}")))?;
+        }
         (self.on_update)(ChatUpdate::Status {
             chat_id: chat_id.to_string(),
             status: "working".into(),
@@ -274,7 +288,7 @@ impl ChatEngine {
             chat_id.to_string(),
             Conversation {
                 child,
-                stdin,
+                stdin: Arc::new(Mutex::new(stdin)),
                 started: Instant::now(),
             },
         );
@@ -482,6 +496,37 @@ mod tests {
         let second = collect_until_done(&rx, 15);
         assert!(second.iter().any(|u| matches!(u,
             ChatUpdate::Message { content, .. } if content.contains("two"))));
+    }
+
+    #[test]
+    fn blocked_stdin_does_not_freeze_the_engine() {
+        // A fake that stops draining stdin mid-session: a large send() will
+        // wedge on the pipe write. The engine must not hold its `live` map
+        // lock across that write, or every other engine call would freeze too.
+        let (_d, engine, _rx) = engine("stream-stall");
+        let engine = Arc::new(engine);
+
+        let sender = engine.clone();
+        std::thread::spawn(move || {
+            // Well past any OS pipe buffer (64 KiB) so write_all blocks.
+            let big = "x".repeat(2 * 1024 * 1024);
+            let _ = sender.send("chat-stall", &big, false);
+        });
+        // Let the sender spawn the process and wedge on the write.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // A concurrent engine call must answer promptly rather than block on
+        // the map lock the wedged send would otherwise still hold.
+        let probe = engine.clone();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe.is_live("chat-stall"));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "is_live() blocked behind a wedged stdin write — the engine froze"
+        );
+        // Dropping the engine kills the stalled child and unblocks the sender.
     }
 
     /// Live test against the real Claude CLI — run explicitly with

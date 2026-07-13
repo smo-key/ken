@@ -135,7 +135,9 @@ fn relevant_path(roots: &[PathBuf], abs: &std::path::Path) -> bool {
     roots.iter().any(|root| match abs.strip_prefix(root) {
         Ok(rel) => !rel.components().any(|c| {
             c.as_os_str().to_str().is_some_and(|s| {
-                s.starts_with('.') || crate::scan::is_junk_dir_name(s)
+                s.starts_with('.')
+                    || crate::scan::is_junk_dir_name(s)
+                    || crate::scan::is_office_lock_name(s)
             })
         }),
         Err(_) => false,
@@ -199,6 +201,20 @@ mod tests {
         );
         assert!(updates.load(Ordering::SeqCst) >= 2);
         drop(handle);
+    }
+
+    #[test]
+    fn office_lock_and_hidden_paths_are_irrelevant() {
+        let root = PathBuf::from("/proj");
+        let roots = vec![root.clone()];
+        // Real content is relevant.
+        assert!(relevant_path(&roots, &root.join("notes/meeting.md")));
+        // Office lock files (Word/Excel) are ignored, nested or at the root.
+        assert!(!relevant_path(&roots, &root.join("notes/~$meeting.docx")));
+        assert!(!relevant_path(&roots, &root.join("~$budget.xlsx")));
+        // Existing exclusions still hold.
+        assert!(!relevant_path(&roots, &root.join(".git/index")));
+        assert!(!relevant_path(&roots, &root.join("node_modules/pkg/x.js")));
     }
 
     #[test]

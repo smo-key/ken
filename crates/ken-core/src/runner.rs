@@ -388,9 +388,9 @@ pub mod test_support {
 
     use std::path::{Path, PathBuf};
 
-    /// Behaviours: complete | fail | hang | block | headless-fail —
-    /// selected via a `behavior` file next to the script (per-tempdir, so
-    /// parallel tests never race).
+    /// Behaviours: complete | fail | hang | block | headless-fail |
+    /// stream-die | stream-stall — selected via a `behavior` file next to the
+    /// script (per-tempdir, so parallel tests never race).
     pub fn write_fake_claude(dir: &Path, behavior: &str) -> PathBuf {
         std::fs::write(dir.join("behavior"), behavior).unwrap();
         let path = dir.join("claude");
@@ -420,6 +420,13 @@ done
 # Conversation mode: JSONL in, events out. One assistant reply per user line.
 if [ "$STREAM_INPUT" = "1" ]; then
   echo '{"type":"system","subtype":"init","session_id":"'"$SESSION"'"}'
+  # Simulate a turn that stops draining stdin: never read, just stay alive so
+  # the writer's pipe fills and its write blocks. Proves the engine doesn't
+  # hold its map lock across a blocking send.
+  if [ "$BEHAVIOR" = "stream-stall" ]; then
+    sleep 300
+    exit 0
+  fi
   TURN=0
   while read -r line; do
     TURN=$((TURN+1))

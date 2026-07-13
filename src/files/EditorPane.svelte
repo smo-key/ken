@@ -2,11 +2,18 @@
   import { onDestroy, onMount } from "svelte";
   import { api, type FileRow } from "../lib/api";
   import { isEditable, timeAgo } from "../lib/format";
+  import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
   import PlainEditor from "./PlainEditor.svelte";
+  import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
 
   let { relPath }: { relPath: string } = $props();
+
+  // .csv/.tsv get the grid editor even though the backend kind is "code"
+  // (csv) or "binary" (tsv). Routed by extension, ahead of the plain editor.
+  const ext = $derived(relPath.split(".").pop()?.toLowerCase() ?? "");
+  const isCsv = $derived(ext === "csv" || ext === "tsv");
 
   let meta = $state<FileRow | null>(null);
   let content = $state<string | null>(null);
@@ -23,13 +30,13 @@
   let latest = "";
   let unlisten: (() => void) | undefined;
 
-  const editable = $derived(meta !== null && isEditable(meta.kind));
+  const editable = $derived(meta !== null && (isEditable(meta.kind) || isCsv));
   const kind = $derived(meta?.kind ?? "binary");
 
   onMount(async () => {
     try {
       meta = await api.fileMeta(relPath);
-      if (meta && isEditable(meta.kind)) {
+      if (meta && (isEditable(meta.kind) || isCsv)) {
         content = await api.readFile(relPath);
         latest = content;
         if (meta.kind !== "md") mode = "plain";
@@ -138,7 +145,13 @@
     <div class="error">{loadError}</div>
   {:else if editable && content !== null}
     {#key reloadKey}
-      {#if mode === "wysiwyg" && meta?.kind === "md"}
+      {#if isCsv}
+        <CsvEditor
+          initial={content}
+          delimiter={delimiterForPath(relPath)}
+          onchange={onEdit}
+        />
+      {:else if mode === "wysiwyg" && meta?.kind === "md"}
         <MarkdownEditor initial={content} onchange={onEdit} />
       {:else}
         <PlainEditor initial={content} onchange={onEdit} />

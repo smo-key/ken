@@ -7,10 +7,30 @@
   let url = $state<string | null>(null);
   let error = $state<string | null>(null);
 
+  const MIME: Record<string, string> = {
+    svg: "image/svg+xml",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    bmp: "image/bmp",
+    avif: "image/avif",
+    ico: "image/x-icon",
+  };
+
+  function mimeFor(path: string): string | undefined {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    return MIME[ext];
+  }
+
   onMount(async () => {
     try {
       const bytes = await api.readFileBytes(relPath);
-      url = URL.createObjectURL(new Blob([bytes]));
+      const type = mimeFor(relPath);
+      url = URL.createObjectURL(
+        type ? new Blob([bytes], { type }) : new Blob([bytes]),
+      );
     } catch (e) {
       error = `Couldn't load this image — ${e}.`;
     }

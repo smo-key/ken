@@ -8,6 +8,7 @@ use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
+use serde_json::Value;
 
 use crate::{Error, Result};
 
@@ -24,6 +25,7 @@ pub enum FileKind {
     Xlsx,
     Pptx,
     Pdf,
+    Ipynb,
     Image,
     Binary,
 }
@@ -38,6 +40,7 @@ impl FileKind {
             FileKind::Xlsx => "xlsx",
             FileKind::Pptx => "pptx",
             FileKind::Pdf => "pdf",
+            FileKind::Ipynb => "ipynb",
             FileKind::Image => "image",
             FileKind::Binary => "binary",
         }
@@ -60,6 +63,7 @@ impl FileKind {
             "xlsx" | "xlsm" => FileKind::Xlsx,
             "pptx" => FileKind::Pptx,
             "pdf" => FileKind::Pdf,
+            "ipynb" => FileKind::Ipynb,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" | "tif"
             | "svg" => FileKind::Image,
             _ => FileKind::Binary,
@@ -93,6 +97,7 @@ pub fn extract(path: &Path) -> Result<Extracted> {
         FileKind::Xlsx => extract_xlsx(path),
         FileKind::Pptx => extract_pptx(path),
         FileKind::Pdf => extract_pdf(path),
+        FileKind::Ipynb => extract_ipynb(path),
         FileKind::Image => extract_image(path),
         FileKind::Binary => Ok(Extracted::default()),
     }
@@ -215,6 +220,33 @@ fn extract_pdf(path: &Path) -> Result<Extracted> {
     Ok(Extracted { text, title: None })
 }
 
+/// Jupyter notebook: concatenate the `source` of markdown and code cells,
+/// skipping cell outputs (execution results, images, stderr). `source` is
+/// either a single string or an array of line strings per nbformat.
+fn extract_ipynb(path: &Path) -> Result<Extracted> {
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    let nb: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Extraction(format!("notebook JSON: {e}")))?;
+    let mut text = String::new();
+    for cell in nb.get("cells").and_then(Value::as_array).into_iter().flatten() {
+        match cell.get("cell_type").and_then(Value::as_str) {
+            Some("markdown") | Some("code") => {}
+            _ => continue, // skip raw/unknown cells; never read outputs
+        }
+        match cell.get("source") {
+            Some(Value::String(s)) => text.push_str(s),
+            Some(Value::Array(lines)) => {
+                for line in lines.iter().filter_map(Value::as_str) {
+                    text.push_str(line);
+                }
+            }
+            _ => {}
+        }
+        text.push('\n');
+    }
+    Ok(Extracted { text, title: None })
+}
+
 fn extract_image(path: &Path) -> Result<Extracted> {
     // Filename is indexed separately; here we add EXIF text if present.
     let file = match fs::File::open(path) {
@@ -258,6 +290,8 @@ mod tests {
         assert_eq!(FileKind::from_path(Path::new("a/b.md")), FileKind::Md);
         assert_eq!(FileKind::from_path(Path::new("b.RS")), FileKind::Code);
         assert_eq!(FileKind::from_path(Path::new("x.docx")), FileKind::Docx);
+        assert_eq!(FileKind::from_path(Path::new("nb.ipynb")), FileKind::Ipynb);
+        assert!(FileKind::Ipynb.has_content());
         assert_eq!(FileKind::from_path(Path::new("x.unknown")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("noext")), FileKind::Binary);
     }
@@ -324,6 +358,44 @@ mod tests {
     fn image_without_exif_is_empty_not_error() {
         let out = extract(&fixture("images/team-photo.png")).unwrap();
         assert_eq!(out.text, "");
+    }
+
+    #[test]
+    fn ipynb_concatenates_markdown_and_code_skipping_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis.ipynb");
+        // `source` as both an array of lines and a plain string; an output
+        // block and a raw cell that must not leak into the index.
+        let nb = r##"{
+          "cells": [
+            {"cell_type": "markdown",
+             "source": ["# Revenue analysis\n", "Quarterly ", "numbers."]},
+            {"cell_type": "code",
+             "source": "import pandas as pd\nrevenue = 12500\n",
+             "outputs": [{"output_type": "stream", "text": "SECRET_OUTPUT_LEAK"}]},
+            {"cell_type": "raw", "source": ["ignored raw cell"]}
+          ],
+          "metadata": {},
+          "nbformat": 4,
+          "nbformat_minor": 5
+        }"##;
+        std::fs::write(&path, nb).unwrap();
+        let out = extract(&path).unwrap();
+        assert!(out.text.contains("Revenue analysis"), "got: {}", out.text);
+        assert!(out.text.contains("Quarterly numbers."), "got: {}", out.text);
+        assert!(out.text.contains("import pandas as pd"));
+        assert!(out.text.contains("12500"));
+        assert!(!out.text.contains("SECRET_OUTPUT_LEAK"), "outputs must be skipped");
+        assert!(!out.text.contains("ignored raw cell"), "raw cells must be skipped");
+    }
+
+    #[test]
+    fn ipynb_malformed_is_error_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.ipynb");
+        std::fs::write(&path, "{ this is not valid notebook json ").unwrap();
+        let err = extract(&path).unwrap_err();
+        assert!(matches!(err, Error::Extraction(_)));
     }
 
     #[test]

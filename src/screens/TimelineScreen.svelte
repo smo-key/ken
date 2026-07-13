@@ -9,8 +9,6 @@
 
   let query = $state("");
   let category = $state<string | null>(null);
-  let asOfOpen = $state(false);
-  let asOf = $state("");
 
   const model = $derived(knowledge.model);
   const allEvents = $derived(model?.events ?? []);
@@ -31,7 +29,6 @@
     const q = query.trim().toLowerCase();
     return allEvents.filter(
       (ev) =>
-        (!asOf || ev.date <= asOf) &&
         (!category || ev.category === category) &&
         (!q || ev.text.toLowerCase().includes(q)),
     );
@@ -65,11 +62,6 @@
   function chipLabel(path: string): string {
     return path.split("/").pop() ?? path;
   }
-
-  function toggleAsOf() {
-    asOfOpen = !asOfOpen;
-    if (!asOfOpen) asOf = "";
-  }
 </script>
 
 <div class="screen">
@@ -80,11 +72,6 @@
         <span class="when">built {timeAgo(model.builtAt)}</span>
       {/if}
       <span class="spacer"></span>
-      {#if !knowledge.empty}
-        <button class="asof" class:active={asOfOpen} onclick={toggleAsOf}>
-          View as of… ◷
-        </button>
-      {/if}
       <button
         class="btn btn-small"
         disabled={knowledge.building}
@@ -120,13 +107,6 @@
         {/if}
       </div>
     {:else}
-      {#if asOfOpen}
-        <div class="asof-row">
-          <label for="asof-date">Show what was known on or before</label>
-          <input id="asof-date" type="date" bind:value={asOf} />
-        </div>
-      {/if}
-
       <div class="search">
         <span class="lens" aria-hidden="true"></span>
         <input
@@ -224,36 +204,6 @@
   .error {
     font-size: 12.5px;
     color: var(--danger);
-  }
-
-  .asof {
-    font-size: 12px;
-    color: var(--accent);
-    font-weight: 600;
-    border: 1px solid rgba(138, 90, 68, 0.35);
-    border-radius: 7px;
-    padding: 5px 12px;
-    background: rgba(138, 90, 68, 0.06);
-  }
-  .asof:hover,
-  .asof.active {
-    background: rgba(138, 90, 68, 0.12);
-  }
-  .asof-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 12.5px;
-    color: var(--ink-secondary);
-  }
-  .asof-row input {
-    font-family: inherit;
-    font-size: 12.5px;
-    color: var(--ink);
-    border: 1px solid var(--border-strong);
-    border-radius: 7px;
-    padding: 4px 8px;
-    background: var(--surface);
   }
 
   .search {
