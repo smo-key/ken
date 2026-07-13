@@ -10,6 +10,7 @@ pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod hooks;
+pub mod knowledge_model;
 pub mod project;
 pub mod pty_registry;
 pub mod recipe;

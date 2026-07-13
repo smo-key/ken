@@ -9,9 +9,11 @@ use tauri::{AppHandle, Emitter, State};
 use ken_core::assistant::{self, OneshotOutcome};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::db::{
-    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, DigestRow, FileRow, RunRow, SearchHit,
+    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, DigestRow, EdgeRow, EntityRow,
+    EventRow, FileRow, RunRow, SearchHit,
 };
 use ken_core::digest;
+use ken_core::knowledge_model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
 use ken_core::research;
 use ken_core::runner::{CancelToken, RunOutcome};
@@ -43,6 +45,8 @@ struct ActiveProject {
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
     /// True while a digest generation thread is running for this project.
     digest_running: Arc<AtomicBool>,
+    /// True while a knowledge-model build thread is running.
+    knowledge_running: Arc<AtomicBool>,
     /// Live research runs: chat/session id → cancel token.
     research: Arc<Mutex<std::collections::HashMap<String, CancelToken>>>,
 }
@@ -273,6 +277,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         digest_running: Arc::new(AtomicBool::new(false)),
+        knowledge_running: Arc::new(AtomicBool::new(false)),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
     drop(guard);
@@ -1486,6 +1491,97 @@ fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> Cmd
     Ok(true)
 }
 
+// ---------- knowledge model (Map & Timeline) ----------
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeModelDto {
+    entities: Vec<EntityRow>,
+    edges: Vec<EdgeRow>,
+    events: Vec<EventRow>,
+    /// Epoch seconds of the last build; null before the first one.
+    built_at: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeModelState {
+    /// `building` | `ready` | `error`
+    state: String,
+    detail: Option<String>,
+}
+
+/// The whole stored knowledge model in one call — it's small by
+/// construction (extraction caps), so no pagination.
+#[tauri::command]
+fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
+    Ok(KnowledgeModelDto {
+        entities,
+        edges,
+        events: active.db.list_events().map_err(err)?,
+        built_at: active.db.knowledge_model_built_at().map_err(err)?,
+    })
+}
+
+/// Rebuild the knowledge model — manual only in v1. Progress arrives as
+/// `knowledge-model-state` events: building → ready | error {detail}.
+#[tauri::command]
+fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    };
+    let running = active.knowledge_running.clone();
+    if running.swap(true, Ordering::SeqCst) {
+        return Err("Ken is already mapping this project — give it a moment.".into());
+    }
+    let project = active.project.clone();
+    let project_id = project.config.id;
+    let base = guard.base_dir.clone();
+    drop(guard);
+
+    let _ = app.emit("knowledge-model-state", KnowledgeModelState {
+        state: "building".into(),
+        detail: None,
+    });
+    let thread_app = app.clone();
+    std::thread::spawn(move || {
+        let today = local_date_today();
+        let result = Db::open(&base, project_id)
+            .map_err(|e| e.to_string())
+            .and_then(|mut db| {
+                knowledge_model::build_knowledge_model(
+                    &binary,
+                    &project,
+                    &mut db,
+                    &today,
+                    &CancelToken::new(),
+                )
+                .map_err(|e| e.to_string())
+            });
+        let event = match result {
+            Ok(counts) => KnowledgeModelState {
+                state: "ready".into(),
+                detail: Some(format!(
+                    "{} entities, {} events",
+                    counts.entities, counts.events
+                )),
+            },
+            Err(detail) => KnowledgeModelState {
+                state: "error".into(),
+                detail: Some(detail),
+            },
+        };
+        let _ = thread_app.emit("knowledge-model-state", event);
+        running.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
 // ---------- chat commands ----------
 
 #[tauri::command]
@@ -1983,6 +2079,8 @@ pub fn run() {
             current_digest,
             refresh_digest,
             quick_answer,
+            knowledge_model,
+            refresh_knowledge_model,
             list_chats,
             chat_transcript,
             create_chat,

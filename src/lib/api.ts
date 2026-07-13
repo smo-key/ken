@@ -249,6 +249,49 @@ export interface QuickAnswer {
   sources: string[];
 }
 
+/** A knowledge-model entity (Map node). */
+export interface EntityRow {
+  id: number;
+  kind: "person" | "organization" | "topic" | "decision" | "other";
+  name: string;
+  summary: string;
+  /** Project-relative paths this entity is grounded in. */
+  sources: string[];
+}
+
+/** A relation between two entities (Map edge). */
+export interface EntityEdge {
+  id: number;
+  a: number;
+  b: number;
+  label: string;
+}
+
+/** A knowledge-model event (Timeline entry). */
+export interface EventRow {
+  id: number;
+  /** Best-effort yyyy-mm-dd. */
+  date: string;
+  category: string;
+  text: string;
+  /** Project-relative path the event came from. */
+  source: string;
+}
+
+/** The whole stored knowledge model — small by construction. */
+export interface KnowledgeModel {
+  entities: EntityRow[];
+  edges: EntityEdge[];
+  events: EventRow[];
+  /** Epoch seconds of the last build; null before the first one. */
+  builtAt: number | null;
+}
+
+export interface KnowledgeModelState {
+  state: "building" | "ready" | "error";
+  detail: string | null;
+}
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -313,6 +356,9 @@ export const api = {
   refreshDigest: () => invoke<void>("refresh_digest"),
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
 
+  knowledgeModel: () => invoke<KnowledgeModel>("knowledge_model"),
+  refreshKnowledgeModel: () => invoke<void>("refresh_knowledge_model"),
+
   listChats: () => invoke<ChatRow[]>("list_chats"),
   chatTranscript: (chatId: string) =>
     invoke<ChatMessage[]>("chat_transcript", { chatId }),
@@ -366,4 +412,8 @@ export const api = {
     listen<string>("digest-error", (e) => fn(e.payload)),
   onQuickAnswer: (fn: (answer: QuickAnswer) => void): Promise<UnlistenFn> =>
     listen<QuickAnswer>("quick-answer", (e) => fn(e.payload)),
+  onKnowledgeModelState: (
+    fn: (ev: KnowledgeModelState) => void,
+  ): Promise<UnlistenFn> =>
+    listen<KnowledgeModelState>("knowledge-model-state", (e) => fn(e.payload)),
 };

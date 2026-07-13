@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub struct Db {
     conn: Connection,
@@ -226,6 +226,32 @@ impl Db {
                     date       TEXT NOT NULL UNIQUE,
                     content    TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+        if version < 6 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS entities (
+                    id      INTEGER PRIMARY KEY,
+                    kind    TEXT NOT NULL,
+                    name    TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    sources TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE IF NOT EXISTS entity_edges (
+                    id    INTEGER PRIMARY KEY,
+                    a     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    b     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                    id       INTEGER PRIMARY KEY,
+                    date     TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    text     TEXT NOT NULL,
+                    source   TEXT NOT NULL DEFAULT ''
                 );
                 "#,
             )?;
@@ -802,6 +828,125 @@ impl Db {
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
+
+    // --- knowledge model (entities, edges, events — derived read model
+    //     for the Map and Timeline screens; replaced wholesale on build) ---
+
+    /// Replace the whole knowledge model in one transaction: entities,
+    /// their edges (given as indices into `entities`), events, and the
+    /// build timestamp (`knowledge_model_built_at` in `meta`).
+    pub fn replace_knowledge_model(
+        &mut self,
+        entities: &[EntityInput],
+        events: &[EventInput],
+        built_at: i64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM entities", [])?; // cascades to entity_edges
+        tx.execute("DELETE FROM events", [])?;
+        let mut ids: Vec<i64> = Vec::with_capacity(entities.len());
+        for e in entities {
+            let sources = serde_json::to_string(&e.sources)
+                .unwrap_or_else(|_| "[]".into());
+            tx.execute(
+                "INSERT INTO entities (kind, name, summary, sources)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![e.kind, e.name, e.summary, sources],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        for (from, e) in entities.iter().enumerate() {
+            for (to, label) in &e.connections {
+                let (Some(a), Some(b)) = (ids.get(from), ids.get(*to)) else {
+                    continue;
+                };
+                tx.execute(
+                    "INSERT INTO entity_edges (a, b, label) VALUES (?1, ?2, ?3)",
+                    params![a, b, label],
+                )?;
+            }
+        }
+        for ev in events {
+            tx.execute(
+                "INSERT INTO events (date, category, text, source)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![ev.date, ev.category, ev.text, ev.source],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value)
+             VALUES ('knowledge_model_built_at', ?1)",
+            params![built_at.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_entities_with_edges(&self) -> Result<(Vec<EntityRow>, Vec<EdgeRow>)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, summary, sources FROM entities ORDER BY id",
+        )?;
+        let entities: Vec<EntityRow> = stmt
+            .query_map([], |r| {
+                let sources: String = r.get(4)?;
+                Ok(EntityRow {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    name: r.get(2)?,
+                    summary: r.get(3)?,
+                    sources: serde_json::from_str(&sources).unwrap_or_default(),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, a, b, label FROM entity_edges ORDER BY id",
+        )?;
+        let edges: Vec<EdgeRow> = stmt
+            .query_map([], |r| {
+                Ok(EdgeRow {
+                    id: r.get(0)?,
+                    a: r.get(1)?,
+                    b: r.get(2)?,
+                    label: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok((entities, edges))
+    }
+
+    /// Events newest first (`yyyy-mm-dd` sorts chronologically).
+    pub fn list_events(&self) -> Result<Vec<EventRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, date, category, text, source FROM events
+             ORDER BY date DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(EventRow {
+                    id: r.get(0)?,
+                    date: r.get(1)?,
+                    category: r.get(2)?,
+                    text: r.get(3)?,
+                    source: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Epoch seconds of the last knowledge-model build; None before the
+    /// first one.
+    pub fn knowledge_model_built_at(&self) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'knowledge_model_built_at'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(v.parse().ok()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -870,6 +1015,62 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at: i64,
+}
+
+/// A stored knowledge-model entity.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityRow {
+    pub id: i64,
+    /// `person` | `organization` | `topic` | `decision` | `other`
+    pub kind: String,
+    pub name: String,
+    pub summary: String,
+    /// Project-relative paths this entity is grounded in.
+    pub sources: Vec<String>,
+}
+
+/// A stored relation between two entities.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeRow {
+    pub id: i64,
+    pub a: i64,
+    pub b: i64,
+    pub label: String,
+}
+
+/// A stored knowledge-model event.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventRow {
+    pub id: i64,
+    /// Best-effort `yyyy-mm-dd`.
+    pub date: String,
+    pub category: String,
+    pub text: String,
+    /// Project-relative path the event came from.
+    pub source: String,
+}
+
+/// An entity as the extractor produced it, edges as indices into the
+/// same batch — `replace_knowledge_model` maps them to row ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityInput {
+    pub kind: String,
+    pub name: String,
+    pub summary: String,
+    pub sources: Vec<String>,
+    /// (index of the other entity in this batch, edge label)
+    pub connections: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventInput {
+    pub date: String,
+    pub category: String,
+    pub text: String,
+    pub source: String,
 }
 
 /// Filename tokens for the `name` FTS column: stem + extension with
@@ -1139,6 +1340,127 @@ mod tests {
         db.upsert_digest("2026-07-12", "A quiet day.", 100).unwrap();
         assert!(db.get_digest("2026-07-12").unwrap().is_some());
         assert_eq!(db.file_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn v5_db_migrates_to_v6() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Rewind a fresh DB to v5 state.
+            let mut db = Db::open_at(&path).unwrap();
+            db.upsert_file("notes/a.md", "md", 10, 1, "indexed", None, "kept").unwrap();
+            db.conn.execute("DROP TABLE entity_edges", []).unwrap();
+            db.conn.execute("DROP TABLE entities", []).unwrap();
+            db.conn.execute("DROP TABLE events", []).unwrap();
+            db.conn
+                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])
+                .unwrap();
+        }
+        let mut db = Db::open_at(&path).unwrap();
+        // v6 tables exist again and are usable; earlier data survives.
+        db.replace_knowledge_model(
+            &[EntityInput {
+                kind: "person".into(),
+                name: "Priya N.".into(),
+                summary: "Owns billing cutover.".into(),
+                sources: vec!["knowledge/People.md".into()],
+                connections: vec![],
+            }],
+            &[EventInput {
+                date: "2026-07-11".into(),
+                category: "decision".into(),
+                text: "Cutover date is firm.".into(),
+                source: "notes/standup.md".into(),
+            }],
+            100,
+        )
+        .unwrap();
+        assert_eq!(db.list_events().unwrap().len(), 1);
+        assert_eq!(db.file_count().unwrap(), 1);
+    }
+
+    fn sample_model() -> (Vec<EntityInput>, Vec<EventInput>) {
+        let entities = vec![
+            EntityInput {
+                kind: "topic".into(),
+                name: "Billing cutover".into(),
+                summary: "The migration to the new billing system.".into(),
+                sources: vec!["notes/meeting-jul-8.md".into()],
+                connections: vec![(1, "owned by".into()), (2, "vendor".into())],
+            },
+            EntityInput {
+                kind: "person".into(),
+                name: "Priya N.".into(),
+                summary: "Owns the cutover.".into(),
+                sources: vec!["knowledge/People.md".into()],
+                connections: vec![],
+            },
+            EntityInput {
+                kind: "organization".into(),
+                name: "LangdonSoft".into(),
+                summary: "Billing vendor.".into(),
+                sources: vec![],
+                connections: vec![],
+            },
+        ];
+        let events = vec![
+            EventInput {
+                date: "2026-07-11".into(),
+                category: "decision".into(),
+                text: "Vendor sign-off confirmed.".into(),
+                source: "notes/standup.md".into(),
+            },
+            EventInput {
+                date: "2026-06-26".into(),
+                category: "people".into(),
+                text: "Retro calls for a public FAQ.".into(),
+                source: "notes/retro.md".into(),
+            },
+        ];
+        (entities, events)
+    }
+
+    #[test]
+    fn replace_knowledge_model_is_atomic_and_idempotent() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Empty until built.
+        let (entities, edges) = db.list_entities_with_edges().unwrap();
+        assert!(entities.is_empty() && edges.is_empty());
+        assert!(db.list_events().unwrap().is_empty());
+        assert!(db.knowledge_model_built_at().unwrap().is_none());
+
+        let (ents, evs) = sample_model();
+        db.replace_knowledge_model(&ents, &evs, 100).unwrap();
+        db.replace_knowledge_model(&ents, &evs, 200).unwrap();
+
+        // Replacing twice leaves exactly one copy — no duplicates, no
+        // orphaned edges — and the newest timestamp.
+        let (entities, edges) = db.list_entities_with_edges().unwrap();
+        assert_eq!(entities.len(), 3);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(db.knowledge_model_built_at().unwrap(), Some(200));
+        let priya = entities.iter().find(|e| e.name == "Priya N.").unwrap();
+        assert_eq!(priya.kind, "person");
+        assert_eq!(priya.sources, vec!["knowledge/People.md"]);
+        // Edge endpoints reference live entity rows with the right label.
+        let owned = edges.iter().find(|e| e.label == "owned by").unwrap();
+        let topic = entities.iter().find(|e| e.name == "Billing cutover").unwrap();
+        assert_eq!(owned.a, topic.id);
+        assert_eq!(owned.b, priya.id);
+        let orphans: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM entity_edges
+             WHERE a NOT IN (SELECT id FROM entities)
+                OR b NOT IN (SELECT id FROM entities)",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(orphans, 0);
+
+        // Events come back newest first.
+        let events = db.list_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].date, "2026-07-11");
+        assert_eq!(events[1].category, "people");
     }
 
     #[test]
