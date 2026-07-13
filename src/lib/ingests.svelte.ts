@@ -66,6 +66,12 @@ class IngestsStore {
     await api.cancelRun(slug);
   }
 
+  async delete(slug: string) {
+    await api.deleteIngest(slug);
+    if (this.selected === slug) await this.select(null);
+    await this.refresh();
+  }
+
   async approve(runId: number) {
     await api.approveRun(runId);
     await this.refresh();

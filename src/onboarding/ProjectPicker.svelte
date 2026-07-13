@@ -1,10 +1,46 @@
 <script lang="ts">
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api } from "../lib/api";
+  import { api, type RegistryEntryStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
+  import Trash2 from "@lucide/svelte/icons/trash-2";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   let error = $state<string | null>(null);
+
+  async function forgetId(id: string) {
+    await api.forgetProject(id);
+    await app.refreshRegistry();
+  }
+
+  function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
+    e.preventDefault();
+    const x = e.clientX;
+    const y = e.clientY;
+    openContextMenu(x, y, [
+      {
+        label: "Open",
+        icon: FolderOpen,
+        disabled: !entry.available,
+        onSelect: () => openExisting(entry.path, entry.available),
+      },
+      "separator",
+      {
+        label: "Remove from Ken…",
+        icon: Trash2,
+        danger: true,
+        onSelect: () =>
+          openConfirm(x, y, {
+            title: `Remove “${entry.name}”?`,
+            body: "Removes it from Ken's list — the folder and its files stay on disk.",
+            confirmLabel: "Remove from Ken",
+            onConfirm: () => void forgetId(entry.id),
+          }),
+      },
+    ]);
+  }
   let pendingPath = $state<string | null>(null);
   let pendingName = $state("");
 
@@ -85,6 +121,7 @@
             class="recent"
             class:unavailable={!entry.available}
             onclick={() => openExisting(entry.path, entry.available)}
+            oncontextmenu={(e) => rowMenu(e, entry)}
           >
             <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
             <span class="info">
@@ -104,6 +141,9 @@
   </div>
 </div>
 
+<ContextMenu />
+<ConfirmMenu />
+
 <style>
   .wrap {
     height: 100vh;
@@ -116,8 +156,8 @@
         to bottom,
         transparent,
         transparent 27px,
-        rgba(33, 30, 25, 0.045) 27px,
-        rgba(33, 30, 25, 0.045) 28px
+        var(--rule-line) 27px,
+        var(--rule-line) 28px
       ),
       var(--paper);
   }
@@ -196,7 +236,7 @@
   }
   input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(138, 90, 68, 0.12);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .confirm-actions {
     display: flex;
@@ -205,8 +245,8 @@
   .error {
     font-size: 13px;
     color: var(--danger);
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 10px;
     padding: 10px 14px;
   }

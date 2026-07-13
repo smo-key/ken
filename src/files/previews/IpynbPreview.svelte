@@ -155,8 +155,8 @@
     overflow-x: auto;
   }
   .out.err {
-    background: rgba(163, 77, 63, 0.07);
-    border-color: rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 25%, transparent);
     color: var(--danger);
   }
   .out.raw {

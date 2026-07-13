@@ -187,7 +187,7 @@
   .scrim {
     position: absolute;
     inset: 0;
-    background: rgba(33, 30, 25, 0.18);
+    background: var(--scrim);
     z-index: 50;
     border: none;
   }
@@ -256,7 +256,7 @@
     text-align: left;
   }
   .hit.selected {
-    background: rgba(138, 90, 68, 0.07);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
   }
   .hit-body {
     flex: 1;
@@ -314,8 +314,8 @@
   }
   .qa {
     margin: 10px 10px 4px;
-    border: 1px solid rgba(138, 90, 68, 0.25);
-    background: rgba(138, 90, 68, 0.05);
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
     border-radius: 10px;
     padding: 13px 15px;
     display: flex;

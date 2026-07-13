@@ -325,7 +325,7 @@
   }
   .digest-body :global(a) {
     color: var(--accent-deep);
-    text-decoration-color: rgba(138, 90, 68, 0.4);
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
     text-underline-offset: 2px;
   }
   .digest-quiet {

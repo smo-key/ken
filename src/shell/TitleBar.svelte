@@ -168,15 +168,15 @@
     height: 28px;
     padding: 0 11px;
     border-radius: 8px;
-    border: 1px solid rgba(138, 90, 68, 0.35);
-    background: rgba(138, 90, 68, 0.08);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
     color: var(--accent-deep);
     font-size: 12.5px;
     font-weight: 600;
     cursor: pointer;
   }
   .chats:hover {
-    background: rgba(138, 90, 68, 0.16);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
   }
   .chats.open {
     background: var(--accent);

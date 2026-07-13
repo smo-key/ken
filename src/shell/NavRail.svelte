@@ -78,7 +78,7 @@
     color: var(--ink-secondary);
   }
   button.active {
-    background: rgba(138, 90, 68, 0.12);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
   }

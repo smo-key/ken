@@ -167,7 +167,7 @@
     background: var(--sunken);
   }
   .row.selected {
-    background: rgba(138, 90, 68, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
   }
@@ -176,7 +176,7 @@
     opacity: 0.65;
   }
   .row.drop-target {
-    background: rgba(138, 90, 68, 0.12);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-color: var(--accent);
   }
   .chev {

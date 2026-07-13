@@ -68,7 +68,7 @@
     --crepe-color-inline-code: var(--accent-deep);
     --crepe-color-error: var(--danger);
     --crepe-color-hover: var(--sunken);
-    --crepe-color-selected: #e8dccb;
+    --crepe-color-selected: var(--selection-bg);
     --crepe-color-inline-area: var(--sunken);
     --crepe-font-title: var(--font-serif);
     --crepe-font-default: var(--font-sans);

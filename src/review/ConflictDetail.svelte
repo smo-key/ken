@@ -251,7 +251,7 @@
 <style>
   .conflict-card {
     background: var(--surface);
-    border: 1px solid rgba(163, 77, 63, 0.3);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
     border-radius: var(--radius-card);
     padding: 18px 20px;
     display: flex;
@@ -272,10 +272,10 @@
     min-width: 0;
   }
   .version.mine {
-    background: rgba(163, 77, 63, 0.04);
+    background: color-mix(in srgb, var(--danger) 4%, transparent);
   }
   .version.theirs {
-    background: rgba(90, 122, 94, 0.05);
+    background: color-mix(in srgb, var(--healthy) 5%, transparent);
   }
   .version-head {
     font-weight: 700;
@@ -380,13 +380,13 @@
     min-width: 0;
   }
   .line.del {
-    background: rgba(163, 77, 63, 0.09);
+    background: color-mix(in srgb, var(--danger) 9%, transparent);
   }
   .line.del .gutter {
     color: var(--danger);
   }
   .line.add {
-    background: rgba(90, 122, 94, 0.1);
+    background: color-mix(in srgb, var(--healthy) 10%, transparent);
   }
   .line.add .gutter {
     color: var(--healthy-text);

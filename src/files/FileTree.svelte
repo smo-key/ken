@@ -226,7 +226,7 @@
     border-radius: 8px;
   }
   .nodes.drop-root {
-    background: rgba(138, 90, 68, 0.06);
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
     box-shadow: inset 0 0 0 1px var(--accent);
   }
   .empty {
@@ -240,8 +240,8 @@
     gap: 8px;
     margin: 0 6px 8px;
     padding: 7px 10px;
-    background: rgba(163, 77, 63, 0.08);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 8px;
     font-size: 12px;
     color: var(--danger);

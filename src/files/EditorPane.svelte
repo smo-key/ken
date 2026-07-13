@@ -280,8 +280,8 @@
     gap: 10px;
     margin: 10px 20px 0;
     padding: 10px 14px;
-    background: rgba(168, 116, 44, 0.08);
-    border: 1px solid rgba(168, 116, 44, 0.28);
+    background: color-mix(in srgb, var(--needs-input) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--needs-input) 28%, transparent);
     border-radius: 10px;
     font-size: 12.5px;
     flex: none;
@@ -315,8 +315,8 @@
   .error {
     margin: 16px 20px;
     padding: 12px 16px;
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 10px;
     font-size: 13px;
     color: var(--danger);

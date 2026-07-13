@@ -1,11 +1,47 @@
 <script lang="ts">
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api } from "../lib/api";
+  import { api, type RegistryEntryStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import Plus from "@lucide/svelte/icons/plus";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
+  import Trash2 from "@lucide/svelte/icons/trash-2";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   let { close }: { close: () => void } = $props();
   let error = $state<string | null>(null);
+
+  async function forgetId(id: string) {
+    await api.forgetProject(id);
+    await app.refreshRegistry();
+  }
+
+  function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
+    e.preventDefault();
+    const x = e.clientX;
+    const y = e.clientY;
+    openContextMenu(x, y, [
+      {
+        label: "Open",
+        icon: FolderOpen,
+        disabled: !entry.available,
+        onSelect: () => pick(entry.path, entry.available),
+      },
+      "separator",
+      {
+        label: "Remove from Ken…",
+        icon: Trash2,
+        danger: true,
+        onSelect: () =>
+          openConfirm(x, y, {
+            title: `Remove “${entry.name}”?`,
+            body: "Removes it from Ken's list — the folder and its files stay on disk.",
+            confirmLabel: "Remove from Ken",
+            onConfirm: () => void forgetId(entry.id),
+          }),
+      },
+    ]);
+  }
 
   async function pick(path: string, available: boolean) {
     if (!available) return;
@@ -44,6 +80,7 @@
       class:current={entry.id === app.project?.id}
       class:unavailable={!entry.available}
       onclick={() => pick(entry.path, entry.available)}
+      oncontextmenu={(e) => rowMenu(e, entry)}
     >
       <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
       <span class="info">
@@ -67,6 +104,9 @@
     <div class="error">{error}</div>
   {/if}
 </div>
+
+<ContextMenu />
+<ConfirmMenu />
 
 <style>
   .scrim {
@@ -107,7 +147,7 @@
     background: var(--sunken);
   }
   .row.current {
-    background: rgba(138, 90, 68, 0.08);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
   .row.unavailable {
     opacity: 0.7;

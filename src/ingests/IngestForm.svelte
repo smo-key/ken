@@ -167,7 +167,7 @@
   .scrim {
     position: fixed;
     inset: 0;
-    background: rgba(33, 30, 25, 0.18);
+    background: var(--scrim);
     border: none;
     z-index: 60;
   }
@@ -234,7 +234,7 @@
   input:focus,
   textarea:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(138, 90, 68, 0.12);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .chips {
     display: flex;
@@ -251,8 +251,8 @@
     color: var(--ink-secondary);
   }
   .chip.on {
-    border-color: rgba(138, 90, 68, 0.5);
-    background: rgba(138, 90, 68, 0.08);
+    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
   }
@@ -277,15 +277,15 @@
     color: var(--ink-secondary);
   }
   .seg button.on {
-    background: rgba(138, 90, 68, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
   }
   .error {
     font-size: 12.5px;
     color: var(--danger);
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 9px;
     padding: 9px 12px;
   }

@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
+  import { theme, type ThemeMode } from "../lib/theme.svelte";
   import { api, type McpInfo, type SyncStatus } from "../lib/api";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
@@ -16,6 +17,12 @@
   let mcp = $state<McpInfo | null>(null);
   let copied = $state<"command" | "instruction" | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const themeOptions: { value: ThemeMode; title: string; hint: string }[] = [
+    { value: "light", title: "Light", hint: "" },
+    { value: "dark", title: "Dark", hint: "" },
+    { value: "system", title: "System", hint: "(follows your OS appearance)" },
+  ];
 
   onMount(() => {
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
@@ -90,6 +97,24 @@
 <div class="wrap">
   <div class="inner">
     <h1>Settings</h1>
+
+    <div class="card">
+      <div class="card-title">Appearance</div>
+      {#each themeOptions as opt (opt.value)}
+        <div class="row">
+          <span class="label">{opt.value === "light" ? "Theme" : ""}</span>
+          <label class="radio">
+            <input
+              type="radio"
+              name="theme"
+              checked={theme.mode === opt.value}
+              onchange={() => theme.set(opt.value)}
+            />
+            {opt.title} <span class="soft">{opt.hint}</span>
+          </label>
+        </div>
+      {/each}
+    </div>
 
     <div class="card">
       <div class="card-title">Project</div>

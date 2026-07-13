@@ -37,6 +37,12 @@
   --danger: #a34d3f;
   --match-highlight: rgba(217, 164, 65, 0.25);
 
+  /* surfaces & marks that need to flip with the theme */
+  --scrim: rgba(33, 30, 25, 0.18);
+  --rule-line: rgba(33, 30, 25, 0.045);
+  --selection-bg: #e8dccb;
+  --file-doc: #3f5e8c;
+
   /* type */
   --font-serif: "Source Serif 4", Georgia, serif;
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -51,6 +57,47 @@
   --shadow-control: 0 1px 2px rgba(33, 30, 25, 0.04);
   --shadow-overlay: 0 24px 64px rgba(33, 30, 25, 0.3);
   --shadow-drawer: -12px 0 32px rgba(33, 30, 25, 0.14);
+}
+
+/* Warm dark theme — same "Paper & Ink" character, inverted. All token names
+   match :root so components pick these up automatically. */
+:root[data-theme="dark"] {
+  /* neutrals — paper (deep warm brown-black ground) */
+  --paper: #191713;
+  --surface: #221f1a;
+  --sunken: #2b2721;
+  --sunken-2: #1f1c17;
+  --border: #332e27;
+  --border-strong: #423b32;
+  --window: #141210;
+
+  /* neutrals — ink (warm off-white) */
+  --ink: #ece7dd;
+  --ink-secondary: #b3aa9c;
+  --ink-tertiary: #7d766a;
+
+  /* accent & status — lightened for contrast on the dark ground */
+  --accent: #c08a6e;
+  --accent-hover: #cd977c;
+  --accent-deep: #d8ad94;
+  --needs-input: #cf9f52;
+  --needs-input-text: #e0bd85;
+  --healthy: #7ba07f;
+  --healthy-text: #9cc0a0;
+  --danger: #cf8577;
+  --match-highlight: rgba(217, 164, 65, 0.32);
+
+  /* surfaces & marks */
+  --scrim: rgba(0, 0, 0, 0.55);
+  --rule-line: rgba(255, 255, 255, 0.05);
+  --selection-bg: #463a29;
+  --file-doc: #9db4d6;
+
+  /* elevation — heavier on dark */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.6);
+  --shadow-drawer: -12px 0 32px rgba(0, 0, 0, 0.45);
 }
 
 html,
@@ -83,7 +130,7 @@ a:hover {
 }
 
 ::selection {
-  background: #e8dccb;
+  background: var(--selection-bg);
 }
 
 button {

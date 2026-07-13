@@ -212,7 +212,7 @@
     background: var(--sunken);
   }
   .row.active {
-    background: rgba(138, 90, 68, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .row.active .row-top {
     color: var(--accent-deep);

@@ -12,7 +12,27 @@
   import ArrowUp from "@lucide/svelte/icons/arrow-up";
   import ArrowLeft from "@lucide/svelte/icons/arrow-left";
   import Pin from "@lucide/svelte/icons/pin";
+  import PinOff from "@lucide/svelte/icons/pin-off";
+  import Archive from "@lucide/svelte/icons/archive";
   import X from "@lucide/svelte/icons/x";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+
+  function rowMenu(e: MouseEvent, row: ChatRow) {
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, [
+      {
+        label: row.pinned ? "Unpin" : "Pin",
+        icon: row.pinned ? PinOff : Pin,
+        onSelect: () => void chats.pin(row.id, !row.pinned),
+      },
+      "separator",
+      {
+        label: "Close",
+        icon: Archive,
+        onSelect: () => void chats.archive(row.id),
+      },
+    ]);
+  }
 
   function kindIcon(kind: ChatRow["kind"]) {
     if (kind === "ingest") return Sparkles;
@@ -101,6 +121,7 @@
         class="tab"
         class:active={row.id === chats.activeId}
         onclick={() => pickChat(row.id)}
+        oncontextmenu={(e) => rowMenu(e, row)}
         title={row.title}
       >
         <span class="diamond" class:ingest={row.kind === "ingest"}>
@@ -139,7 +160,7 @@
     <div class="overflow-menu">
       {#each overflow as row (row.id)}
         {@const Icon = kindIcon(row.kind)}
-        <button class="overflow-row" onclick={() => pickChat(row.id)}>
+        <button class="overflow-row" onclick={() => pickChat(row.id)} oncontextmenu={(e) => rowMenu(e, row)}>
           <span class="diamond" class:ingest={row.kind === "ingest"}>
             <Icon size={13} strokeWidth={1.75} />
           </span>
@@ -230,6 +251,8 @@
     </div>
   {/if}
 </div>
+
+<ContextMenu />
 
 <style>
   .drawer {
@@ -409,8 +432,8 @@
     font-size: 12px;
     line-height: 1.5;
     color: var(--danger);
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 9px;
   }
   .foot {

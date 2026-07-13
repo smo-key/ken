@@ -27,9 +27,11 @@
 
   let current = $state<OpenState | null>(null);
   // Only the most-recently-mounted instance renders, so mounting <ContextMenu/>
-  // in several screens never double-draws (screens swap, so one is live).
+  // in several screens never double-draws. Ownership falls back to another live
+  // instance when the owner unmounts, so menus keep working across screens.
   let seq = 0;
   let owner = $state(0);
+  const mounted = new Set<number>();
 
   /** Open the shared context menu at viewport coords with the given items. */
   export function openContextMenu(x: number, y: number, items: MenuEntry[]) {
@@ -46,10 +48,12 @@
 
   const myId = ++seq;
   onMount(() => {
+    mounted.add(myId);
     owner = myId;
   });
   onDestroy(() => {
-    if (owner === myId) owner = 0;
+    mounted.delete(myId);
+    if (owner === myId) owner = mounted.size ? Math.max(...mounted) : 0;
   });
 
   let menuEl = $state<HTMLDivElement | null>(null);
@@ -169,7 +173,7 @@
     color: var(--danger);
   }
   .cm-item.danger:hover:not(:disabled) {
-    background: rgba(163, 77, 63, 0.08);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
   }
   .cm-icon {
     display: inline-flex;

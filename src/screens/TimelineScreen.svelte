@@ -49,12 +49,12 @@
     switch (cat) {
       case "decision":
       case "decisions":
-        return "background:rgba(90,122,94,0.12);color:var(--healthy-text)";
+        return "background:color-mix(in srgb, var(--healthy) 12%, transparent);color:var(--healthy-text)";
       case "people":
       case "person":
-        return "background:rgba(138,90,68,0.1);color:var(--accent-deep)";
+        return "background:color-mix(in srgb, var(--accent) 10%, transparent);color:var(--accent-deep)";
       case "vendor":
-        return "background:rgba(168,116,44,0.12);color:var(--needs-input-text)";
+        return "background:color-mix(in srgb, var(--needs-input) 12%, transparent);color:var(--needs-input-text)";
       default:
         return "background:var(--sunken);color:var(--ink-secondary)";
     }

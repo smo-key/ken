@@ -7,6 +7,11 @@
   import TemplateGallery from "../ingests/TemplateGallery.svelte";
   import type { IngestTemplate } from "../lib/templates";
   import type { IngestMode, IngestRefresh, RunRow } from "../lib/api";
+  import Pencil from "@lucide/svelte/icons/pencil";
+  import Play from "@lucide/svelte/icons/play";
+  import Trash2 from "@lucide/svelte/icons/trash-2";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   type FormPreset = {
     name: string;
@@ -78,6 +83,29 @@
     formOpen = true;
   }
 
+  function rowMenu(e: MouseEvent, slug: string, name: string) {
+    e.preventDefault();
+    const x = e.clientX;
+    const y = e.clientY;
+    openContextMenu(x, y, [
+      { label: "Edit", icon: Pencil, onSelect: () => openEdit(slug) },
+      { label: "Run now", icon: Play, onSelect: () => void ingests.run(slug) },
+      "separator",
+      {
+        label: "Delete…",
+        icon: Trash2,
+        danger: true,
+        onSelect: () =>
+          openConfirm(x, y, {
+            title: `Delete “${name}”?`,
+            body: "Removes this ingest and its recipe from Ken. The documents it already produced stay on disk.",
+            confirmLabel: "Delete ingest",
+            onConfirm: () => void ingests.delete(slug),
+          }),
+      },
+    ]);
+  }
+
   function openFromTemplate(t: IngestTemplate) {
     galleryOpen = false;
     editingSlug = null;
@@ -119,6 +147,7 @@
         class="row"
         class:active={ingests.selected === slug}
         onclick={() => ingests.select(slug)}
+        oncontextmenu={(e) => rowMenu(e, slug, name)}
       >
         <span class="row-top">
           {name}
@@ -272,6 +301,9 @@
   />
 {/if}
 
+<ContextMenu />
+<ConfirmMenu />
+
 <style>
   .screen {
     flex: 1;
@@ -312,8 +344,8 @@
     padding: 10px 12px;
     font-size: 12px;
     line-height: 1.55;
-    background: rgba(168, 116, 44, 0.08);
-    border: 1px solid rgba(168, 116, 44, 0.28);
+    background: color-mix(in srgb, var(--needs-input) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--needs-input) 28%, transparent);
     border-radius: 9px;
     color: var(--ink-secondary);
   }
@@ -335,7 +367,7 @@
     background: var(--sunken);
   }
   .row.active {
-    background: rgba(138, 90, 68, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .row.active .row-top {
     color: var(--accent-deep);
@@ -426,11 +458,11 @@
     font-weight: 600;
   }
   .badge.attention {
-    background: rgba(168, 116, 44, 0.12);
+    background: color-mix(in srgb, var(--needs-input) 12%, transparent);
     color: var(--needs-input-text);
   }
   .badge.busy {
-    background: rgba(138, 90, 68, 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     color: var(--accent);
   }
   .spacer {

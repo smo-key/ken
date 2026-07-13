@@ -318,8 +318,8 @@
     box-shadow: 0 2px 8px rgba(33, 30, 25, 0.2);
   }
   .node.unconnected {
-    background: rgba(168, 116, 44, 0.08);
-    border: 1px dashed rgba(168, 116, 44, 0.5);
+    background: color-mix(in srgb, var(--needs-input) 8%, transparent);
+    border: 1px dashed color-mix(in srgb, var(--needs-input) 50%, transparent);
     color: var(--needs-input-text);
     font-weight: 500;
   }

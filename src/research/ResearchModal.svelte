@@ -99,7 +99,7 @@
   .scrim {
     position: fixed;
     inset: 0;
-    background: rgba(33, 30, 25, 0.18);
+    background: var(--scrim);
     border: none;
     z-index: 60;
   }
@@ -165,7 +165,7 @@
   textarea:focus,
   select:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(138, 90, 68, 0.12);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .two-col {
     display: grid;
@@ -175,8 +175,8 @@
   .error {
     font-size: 12.5px;
     color: var(--danger);
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
     border-radius: 9px;
     padding: 9px 12px;
   }

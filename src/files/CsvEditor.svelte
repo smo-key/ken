@@ -335,7 +335,7 @@
   }
   .del:hover {
     color: var(--danger);
-    background: rgba(163, 77, 63, 0.1);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
   }
   .del:disabled {
     display: none;
