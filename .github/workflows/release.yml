@@ -1,0 +1,123 @@
+# Release pipeline: push a v* tag -> draft GitHub Release with platform
+# bundles (via tauri-action) plus explicitly named assets that install.sh
+# downloads. Asset-name contract with install.sh:
+#   Ken-<target-triple>.app.tar.gz   (macOS app bundle, tarred)
+#   Ken-<target-triple>.AppImage     (Linux)
+#   ken-mcp-<target-triple>[.exe]    (all platforms)
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each runner builds natively for its own architecture,
+          # so no cross-compilation targets are needed.
+          - os: macos-14 # aarch64-apple-darwin
+          # macos-13 (the old Intel image) was retired by GitHub;
+          # macos-15-intel is the current x86_64 macOS runner.
+          - os: macos-15-intel # x86_64-apple-darwin
+          - os: ubuntu-22.04 # x86_64-unknown-linux-gnu
+          - os: windows-latest # x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build app bundles and create draft release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Ken ${{ github.ref_name }}"
+          releaseBody: "See the assets below. Install with: curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh"
+          releaseDraft: true
+          prerelease: false
+
+      - name: Build ken-mcp
+        run: cargo build --release -p ken-mcp
+
+      - name: Upload install.sh assets (ken-mcp binary, app bundle)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        run: |
+          set -euo pipefail
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+
+          # Upload one file to the draft release created by tauri-action,
+          # replacing any same-named asset from a previous run attempt.
+          upload() {
+            local file="$1" name="$2"
+            local existing
+            existing=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" \
+              --paginate --jq ".[] | select(.name == \"$name\") | .id" | head -n 1)
+            if [ -n "$existing" ]; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets/${existing}"
+            fi
+            gh api -X POST \
+              -H "Content-Type: application/octet-stream" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}" \
+              --input "$file" > /dev/null
+            echo "uploaded $name"
+          }
+
+          case "$RUNNER_OS" in
+            macOS)
+              tar -czf "Ken-$triple.app.tar.gz" -C target/release/bundle/macos Ken.app
+              upload "Ken-$triple.app.tar.gz" "Ken-$triple.app.tar.gz"
+              upload target/release/ken-mcp "ken-mcp-$triple"
+              ;;
+            Linux)
+              appimage=$(find target/release/bundle/appimage -name '*.AppImage' -type f | head -n 1)
+              upload "$appimage" "Ken-$triple.AppImage"
+              upload target/release/ken-mcp "ken-mcp-$triple"
+              ;;
+            Windows)
+              upload target/release/ken-mcp.exe "ken-mcp-$triple.exe"
+              ;;
+          esac

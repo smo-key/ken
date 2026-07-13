@@ -7,6 +7,27 @@ AI-maintained structured documents, Claude chats, an MCP server for your
 agents, and Git/shared-drive conflict review arrive in upcoming releases
 (see `openspec/` and `docs/superpowers/specs/` for the roadmap).
 
+## Install
+
+On macOS or Linux, paste this into a terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh
+```
+
+It figures out your machine, installs the Ken app and the `ken-mcp`
+helper, and tells you about anything else it needs. If no packaged
+release exists yet it offers to build Ken from source.
+
+Prefer not to use a terminal (or on Windows)? Download an installer from
+the [releases page](https://github.com/smo-key/ken/releases/latest).
+
+**AI features need Claude Code.** Ken's AI features — ingests, chat, deep
+research — run through the Claude Code CLI with your own Claude account.
+Install it with `npm install -g @anthropic-ai/claude-code` and run
+`claude` once to log in. Everything else (indexing, search, editing,
+previews) works without it.
+
 ## Status
 
 - **Walking skeleton** — project create/open, live indexing (md/txt/code,
@@ -19,6 +40,9 @@ agents, and Git/shared-drive conflict review arrive in upcoming releases
 - **Chat drawer** — talk to your project's knowledge: friendly chat by
   default, the real Claude terminal one keystroke away, same session in
   both. Pins, status badges, and live views into running ingests.
+- **Install & release** — one-line installer (`install.sh`), tag-driven
+  release pipeline publishing macOS/Linux/Windows bundles plus `ken-mcp`
+  binaries to GitHub Releases, and CI on every push and PR.
 
 ## Development
 
