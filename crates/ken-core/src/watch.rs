@@ -15,13 +15,16 @@ use crate::scan::{self, ScanStats};
 use crate::{Error, Result};
 
 pub struct WatchHandle {
-    // Dropping the watcher closes the event channel, which ends the thread.
-    _watcher: notify::RecommendedWatcher,
+    watcher: Option<notify::RecommendedWatcher>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for WatchHandle {
     fn drop(&mut self) {
+        // The watcher must drop FIRST: it owns the channel sender, and the
+        // worker thread exits on channel disconnect. Joining before dropping
+        // it would deadlock.
+        drop(self.watcher.take());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -43,6 +46,14 @@ pub fn start(
     watcher
         .watch(&project.root, RecursiveMode::Recursive)
         .map_err(|e| Error::Watch(e.to_string()))?;
+    // macOS FSEvents reports canonical paths (/private/var/…) while the
+    // project may be registered via a symlinked path (/var/…); accept both.
+    let mut roots = vec![project.root.clone()];
+    if let Ok(canonical) = project.root.canonicalize() {
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
 
     let thread = std::thread::spawn(move || {
         let mut db = match Db::open_at(&db_path) {
@@ -64,7 +75,7 @@ pub fn start(
                 Ok(Ok(event)) => {
                     if is_relevant(&event) {
                         for p in event.paths {
-                            if relevant_path(&project, &p) {
+                            if relevant_path(&roots, &p) {
                                 pending.insert(p);
                             }
                         }
@@ -90,7 +101,7 @@ pub fn start(
     });
 
     Ok(WatchHandle {
-        _watcher: watcher,
+        watcher: Some(watcher),
         thread: Some(thread),
     })
 }
@@ -120,15 +131,15 @@ fn is_relevant(event: &notify::Event) -> bool {
 
 /// Ignore events under hidden folders (.git, .ken) — they never affect the
 /// index and .git churn would otherwise trigger constant rescans.
-fn relevant_path(project: &Project, abs: &std::path::Path) -> bool {
-    match abs.strip_prefix(&project.root) {
+fn relevant_path(roots: &[PathBuf], abs: &std::path::Path) -> bool {
+    roots.iter().any(|root| match abs.strip_prefix(root) {
         Ok(rel) => !rel.components().any(|c| {
             c.as_os_str()
                 .to_str()
                 .is_some_and(|s| s.starts_with('.'))
         }),
         Err(_) => false,
-    }
+    })
 }
 
 #[cfg(test)]
