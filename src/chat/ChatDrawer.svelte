@@ -4,6 +4,33 @@
   import ChatTranscript from "./ChatTranscript.svelte";
   import TerminalView from "./TerminalView.svelte";
   import { api, type ChatRow } from "../lib/api";
+  import MessageSquare from "@lucide/svelte/icons/message-square";
+  import Sparkles from "@lucide/svelte/icons/sparkles";
+  import Bot from "@lucide/svelte/icons/bot";
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import Plus from "@lucide/svelte/icons/plus";
+  import ArrowUp from "@lucide/svelte/icons/arrow-up";
+  import ArrowLeft from "@lucide/svelte/icons/arrow-left";
+  import Pin from "@lucide/svelte/icons/pin";
+  import X from "@lucide/svelte/icons/x";
+
+  function kindIcon(kind: ChatRow["kind"]) {
+    if (kind === "ingest") return Sparkles;
+    if (kind === "research") return Bot;
+    return MessageSquare;
+  }
+
+  async function closeChat(id: string, e: Event) {
+    e.stopPropagation();
+    await chats.archive(id);
+  }
+
+  function onCloseKey(id: string, e: KeyboardEvent) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      void closeChat(id, e);
+    }
+  }
 
   let winW = $state(window.innerWidth);
   let overflowOpen = $state(false);
@@ -69,37 +96,68 @@
 <div class="drawer" class:overlay={narrow}>
   <div class="tabs">
     {#each visibleTabs as row (row.id)}
+      {@const Icon = kindIcon(row.kind)}
       <button
         class="tab"
         class:active={row.id === chats.activeId}
         onclick={() => pickChat(row.id)}
         title={row.title}
       >
-        <span class="diamond" class:ingest={row.kind === "ingest"}>◈</span>
+        <span class="diamond" class:ingest={row.kind === "ingest"}>
+          <Icon size={13} strokeWidth={1.75} />
+        </span>
         <span class="tab-title">{row.title}</span>
-        {#if row.pinned}<span class="pin-mark">・pinned</span>{/if}
+        {#if row.pinned}<span class="pin-mark" title="Pinned"><Pin size={11} strokeWidth={1.75} /></span>{/if}
         {#if statusDot(row)}
           <span class="dot" style:background={statusDot(row)}></span>
         {/if}
+        <span
+          class="close"
+          role="button"
+          tabindex="0"
+          aria-label="Close chat"
+          title="Close chat"
+          onclick={(e) => closeChat(row.id, e)}
+          onkeydown={(e) => onCloseKey(row.id, e)}
+        >
+          <X size={12} strokeWidth={2} />
+        </span>
       </button>
     {/each}
     {#if overflow.length > 0}
       <button class="more" onclick={() => (overflowOpen = !overflowOpen)}>
-        +{overflow.length} ⌄
+        +{overflow.length}
+        <ChevronDown size={13} strokeWidth={1.75} />
       </button>
     {/if}
-    <button class="new" title="New chat" onclick={() => chats.newChat()}>+</button>
+    <button class="new" title="New chat" aria-label="New chat" onclick={() => chats.newChat()}>
+      <Plus size={15} strokeWidth={1.75} />
+    </button>
   </div>
 
   {#if overflowOpen}
     <div class="overflow-menu">
       {#each overflow as row (row.id)}
+        {@const Icon = kindIcon(row.kind)}
         <button class="overflow-row" onclick={() => pickChat(row.id)}>
-          <span class="diamond" class:ingest={row.kind === "ingest"}>◈</span>
+          <span class="diamond" class:ingest={row.kind === "ingest"}>
+            <Icon size={13} strokeWidth={1.75} />
+          </span>
           <span class="tab-title">{row.title}</span>
           {#if statusDot(row)}
             <span class="dot" style:background={statusDot(row)}></span>
           {/if}
+          <span
+            class="close"
+            role="button"
+            tabindex="0"
+            aria-label="Close chat"
+            title="Close chat"
+            onclick={(e) => closeChat(row.id, e)}
+            onkeydown={(e) => onCloseKey(row.id, e)}
+          >
+            <X size={12} strokeWidth={2} />
+          </span>
         </button>
       {/each}
     </div>
@@ -127,8 +185,8 @@
   {#if chats.activeId}
     <div class="foot">
       {#if inTerminal}
-        <button class="btn btn-small" onclick={() => chats.exitTerminal()}>
-          ← Back to conversation
+        <button class="btn btn-small back" onclick={() => chats.exitTerminal()}>
+          <ArrowLeft size={14} strokeWidth={1.75} /> Back to conversation
         </button>
         <span class="foot-note">You're in the real Claude terminal.</span>
         {#if researchLive}
@@ -156,7 +214,9 @@
             rows="1"
           ></textarea>
           <span class="slash-hint mono">/ for terminal</span>
-          <button class="send" onclick={submit} aria-label="Send">↑</button>
+          <button class="send" onclick={submit} aria-label="Send">
+            <ArrowUp size={14} strokeWidth={2} />
+          </button>
         </div>
         <div class="chat-actions">
           {#if chats.active}
@@ -221,7 +281,8 @@
   }
   .diamond {
     color: var(--accent);
-    font-size: 10px;
+    display: inline-flex;
+    align-items: center;
     flex: none;
   }
   .diamond.ingest {
@@ -234,9 +295,33 @@
     white-space: nowrap;
   }
   .pin-mark {
-    font-size: 10px;
+    display: inline-flex;
+    align-items: center;
     color: var(--accent);
     flex: none;
+  }
+  .close {
+    flex: none;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    border-radius: 5px;
+    color: var(--ink-tertiary);
+    opacity: 0;
+    transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+  }
+  .tab:hover .close,
+  .tab.active .close,
+  .overflow-row:hover .close,
+  .close:focus-visible {
+    opacity: 1;
+  }
+  .close:hover {
+    background: var(--sunken);
+    color: var(--ink);
   }
   .dot {
     width: 6px;
@@ -246,6 +331,9 @@
   }
   .more {
     flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
     font-size: 12px;
     padding: 6px;
     color: var(--ink-tertiary);
@@ -254,10 +342,11 @@
   }
   .new {
     flex: none;
-    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     color: var(--accent);
     padding: 6px;
-    font-weight: 600;
     border: none;
     background: none;
   }
@@ -365,11 +454,18 @@
     background: var(--accent);
     color: var(--surface);
     border: none;
-    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex: none;
   }
   .send:hover {
     background: var(--accent-hover);
+  }
+  .back {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
   }
   .chat-actions {
     display: flex;

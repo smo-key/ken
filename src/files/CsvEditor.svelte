@@ -29,6 +29,15 @@
   let rows = $state<string[][]>(toGrid(initial));
   const cols = $derived(rows[0]?.length ?? 0);
 
+  // Guard: an editable input per cell doesn't survive six-figure row counts
+  // (a 25MB CSV froze the whole app). Big grids get a capped read-only view;
+  // read-only also protects the file — saving a truncated grid would drop
+  // the rows we didn't render.
+  const EDIT_CELL_CAP = 40_000;
+  const VIEW_ROW_CAP = 1_000;
+  const readOnly = $derived(rows.length * cols > EDIT_CELL_CAP);
+  const viewRows = $derived(readOnly ? rows.slice(1, VIEW_ROW_CAP + 1) : []);
+
   let gridEl = $state<HTMLDivElement | undefined>();
 
   function emit() {
@@ -92,16 +101,46 @@
 
 <div class="csv">
   <div class="toolbar">
-    <button class="chip" onclick={addRow}>+ Row</button>
-    <button class="chip" onclick={addColumn}>+ Column</button>
+    {#if !readOnly}
+      <button class="chip" onclick={addRow}>+ Row</button>
+      <button class="chip" onclick={addColumn}>+ Column</button>
+    {/if}
     <span class="dims">
       {rows.length - 1} row{rows.length - 1 === 1 ? "" : "s"} · {cols} column{cols ===
       1
         ? ""
         : "s"}
+      {#if readOnly}
+        · showing the first {Math.min(VIEW_ROW_CAP, rows.length - 1)} rows,
+        read-only — too large to edit as a grid
+      {/if}
     </span>
   </div>
 
+  {#if readOnly}
+    <div class="grid-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="corner" aria-hidden="true"></th>
+            {#each rows[0] as cell, c (c)}
+              <th class="head-cell"><span class="cell head ro">{cell}</span></th>
+            {/each}
+          </tr>
+        </thead>
+        <tbody>
+          {#each viewRows as row, i (i)}
+            <tr>
+              <td class="rownum"><span class="num">{i + 1}</span></td>
+              {#each row as cell, c (c)}
+                <td><span class="cell ro">{cell}</span></td>
+              {/each}
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {:else}
   <div class="grid-scroll" bind:this={gridEl}>
     <table>
       <thead>
@@ -160,6 +199,7 @@
       </tbody>
     </table>
   </div>
+  {/if}
 </div>
 
 <style>
@@ -252,6 +292,11 @@
   .rownum .num {
     display: inline-block;
     padding: 0 4px;
+  }
+  .cell.ro {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .cell {
     display: block;

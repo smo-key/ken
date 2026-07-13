@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   actionsFor,
+  buildDiffRows,
   conflictCopyPayload,
   conflictPayload,
   dotFor,
@@ -83,6 +84,42 @@ describe("sourceLabel", () => {
   it("shortens paths to the file name and keeps slugs", () => {
     expect(sourceLabel(item({ sourceRef: "notes/x.pdf" }))).toBe("x.pdf");
     expect(sourceLabel(item({ sourceRef: "people" }))).toBe("people");
+  });
+});
+
+describe("buildDiffRows", () => {
+  it("marks added and removed lines and keeps changed context", () => {
+    const a = "one\ntwo\nthree\n";
+    const b = "one\nTWO\nthree\n";
+    const rows = buildDiffRows(a, b);
+    expect(rows).toContainEqual({ type: "del", text: "two" });
+    expect(rows).toContainEqual({ type: "add", text: "TWO" });
+    expect(rows).toContainEqual({ type: "ctx", text: "one" });
+    expect(rows).toContainEqual({ type: "ctx", text: "three" });
+    // No gap: the unchanged runs are shorter than the context window.
+    expect(rows.some((r) => r.type === "gap")).toBe(false);
+  });
+
+  it("collapses long unchanged runs into a gap marker", () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `line ${i}`);
+    const a = lines.join("\n") + "\n";
+    const changed = [...lines];
+    changed[15] = "line 15 EDITED";
+    const b = changed.join("\n") + "\n";
+    const rows = buildDiffRows(a, b, 3);
+    const gaps = rows.filter((r) => r.type === "gap");
+    // A gap before and after the single change.
+    expect(gaps.length).toBe(2);
+    expect(rows).toContainEqual({ type: "del", text: "line 15" });
+    expect(rows).toContainEqual({ type: "add", text: "line 15 EDITED" });
+    // Context lines immediately around the change survive.
+    expect(rows).toContainEqual({ type: "ctx", text: "line 14" });
+    expect(rows).toContainEqual({ type: "ctx", text: "line 16" });
+  });
+
+  it("returns no add/del rows for identical text", () => {
+    const rows = buildDiffRows("same\ntext\n", "same\ntext\n");
+    expect(rows.some((r) => r.type === "add" || r.type === "del")).toBe(false);
   });
 });
 

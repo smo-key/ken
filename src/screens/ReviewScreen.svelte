@@ -13,6 +13,7 @@
   import { timeAgo } from "../lib/format";
   import type { InboxItem } from "../lib/api";
   import ConflictDetail from "../review/ConflictDetail.svelte";
+  import Check from "@lucide/svelte/icons/check";
 
   onMount(() => void review.init());
 
@@ -112,7 +113,7 @@
         >
           <span class="row-top muted">
             {it.title}
-            <span class="check">✓</span>
+            <span class="check"><Check size={13} strokeWidth={1.75} /></span>
           </span>
         </button>
       {/each}
@@ -127,7 +128,7 @@
           <h1>{item.title}</h1>
           <span class="meta mono">{sourceLabel(item)} · {timeAgo(item.when)}</span>
         </div>
-        {#if item.kind === "conflict" && !itemIsDone}
+        {#if (item.kind === "conflict" || item.kind === "conflict-copy") && !itemIsDone}
           <div class="body-note">{item.body}</div>
           <ConflictDetail {item} />
         {:else}
@@ -230,7 +231,9 @@
   }
   .check {
     margin-left: auto;
-    font-size: 10.5px;
+    display: inline-flex;
+    align-items: center;
+    color: var(--healthy);
   }
   .dot {
     width: 6px;

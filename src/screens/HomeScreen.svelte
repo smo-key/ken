@@ -8,6 +8,9 @@
   import { isProjectLink, renderMarkdown } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
   import ResearchModal from "../research/ResearchModal.svelte";
+  import Check from "@lucide/svelte/icons/check";
+  import Copy from "@lucide/svelte/icons/copy";
+  import Search from "@lucide/svelte/icons/search";
 
   onMount(() => void digest.init());
 
@@ -74,25 +77,33 @@
 
 <div class="wrap">
   <div class="inner">
-    <h1>{today}</h1>
-
-    <div class="card">
-      <div class="head">
-        <span class="overline-accent">Today's digest</span>
+    <!-- Masthead: the day, set like a paper's dateline -->
+    <header class="masthead rise" style="--d: 0">
+      <h1>{today}</h1>
+      <div class="rule">
+        <span class="rule-label">Today's digest</span>
         {#if digest.digest}
-          <span class="when">
-            {digestTime(digest.digest.generatedAt)} ·
-            <button class="share" onclick={share}>{copied ? "Copied" : "share"}</button>
+          <span class="rule-meta">
+            {digestTime(digest.digest.generatedAt)}
+            <button class="share" onclick={share} title="Copy as markdown">
+              {#if copied}<Check size={12} strokeWidth={2} /> copied
+              {:else}<Copy size={12} strokeWidth={1.75} /> share{/if}
+            </button>
           </span>
         {/if}
       </div>
+    </header>
+
+    <!-- The digest is the lead story: open serif prose, no chrome -->
+    <section class="digest rise" style="--d: 1">
       {#if digest.digest}
-<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
         <div class="digest-body" onclick={onDigestClick}>
           {@html renderMarkdown(digest.digest.body)}
         </div>
         {#if digest.digest.sources.length > 0}
-          <div class="chips">
+          <div class="sources">
+            <span class="from">From</span>
             {#each digest.digest.sources as source (source)}
               <button
                 class="chip mono"
@@ -105,93 +116,104 @@
           </div>
         {/if}
       {:else if digest.generating}
-        <p class="pulse">Ken is writing today's digest…</p>
+        <p class="digest-quiet pulse">Ken is writing today's digest…</p>
       {:else if digest.claudeFound}
-        <p>Ken writes you a morning digest — it'll appear here.</p>
+        <p class="digest-quiet">
+          Ken writes you a morning digest — what changed, what's waiting —
+          and it will appear here.
+        </p>
         {#if digest.error}
           <p class="digest-error">Last try didn't finish — {digest.error}</p>
         {/if}
-        <div class="actions">
+        <div class="digest-actions">
           <button class="btn" onclick={() => void digest.writeNow()}>Write it now</button>
         </div>
       {:else}
-        <p>
+        <p class="digest-quiet">
           The daily digest needs Claude Code — once it's installed, Ken
           writes you one each morning.
         </p>
       {/if}
-    </div>
+    </section>
 
-    <div class="card">
-      <div class="head">
-        <span class="overline-accent">Your knowledge</span>
-        {#if app.lastScanAt}
-          <span class="when">updated {timeAgo(Math.floor(app.lastScanAt / 1000))}</span>
+    <!-- Quiet status strip: one line about the folder, plus the day's verbs -->
+    <section class="status rise" style="--d: 2">
+      <p class="status-line">
+        {#if app.scanning}
+          Ken is reading your folder for the first time — search lights up as
+          files are indexed.
+        {:else}
+          Watching <strong>{app.project?.name}</strong> —
+          {app.files.length} files, {indexedCount} searchable{app.failedFiles.length
+            ? `, ${app.failedFiles.length} unreadable`
+            : ""}{app.lastScanAt
+            ? ` · updated ${timeAgo(Math.floor(app.lastScanAt / 1000))}`
+            : ""}
         {/if}
-      </div>
-      {#if app.scanning}
-        <p>Ken is reading your folder for the first time — search lights up as files are indexed.</p>
-      {:else}
-        <p>
-          Watching <strong>{app.project?.name}</strong> — {app.files.length}
-          files known, {indexedCount} with searchable content{app.failedFiles.length
-            ? `, ${app.failedFiles.length} couldn't be read`
-            : ""}. Press <span class="kbd">⌘K</span> to search, or browse and edit
-          anything in Files.
-        </p>
-      {/if}
-      <div class="actions">
-        <button class="btn" onclick={() => (app.searchOpen = true)}>Search knowledge</button>
+      </p>
+      <div class="status-actions">
+        <button class="btn" onclick={() => (app.searchOpen = true)}>
+          <Search size={13} strokeWidth={1.75} /> Search
+          <span class="kbd">⌘K</span>
+        </button>
         <button class="btn btn-ghost" onclick={() => (app.screen = "files")}>Browse files</button>
         <button class="btn btn-ghost" onclick={() => (researchOpen = true)}>Start research</button>
       </div>
-    </div>
+    </section>
 
     {#if ingests.pending.length > 0 || blockedSlugs.length > 0 || otherReviewCount > 0}
-      <div class="section-label">Waiting on you</div>
-      {#each ingests.pending as run (run.id)}
-        <div class="callout attention">
-          <span class="cdot amber"></span>
-          <div class="ctext">
-            <strong>{run.slug}</strong> finished a big refresh —
-            {run.summary ?? "review it before Ken writes it."}
-          </div>
-          <button class="btn btn-small" onclick={() => openIngest(run.slug)}>Review</button>
+      <section class="rise" style="--d: 3">
+        <div class="section-label amber">Waiting on you</div>
+        <div class="group">
+          {#each ingests.pending as run (run.id)}
+            <div class="row">
+              <span class="rdot amber"></span>
+              <div class="rtext">
+                <strong>{run.slug}</strong> finished a big refresh —
+                {run.summary ?? "review it before Ken writes it."}
+              </div>
+              <button class="btn btn-small" onclick={() => openIngest(run.slug)}>Review</button>
+            </div>
+          {/each}
+          {#each blockedSlugs as slug (slug)}
+            <div class="row">
+              <span class="rdot amber"></span>
+              <div class="rtext"><strong>{slug}</strong> is waiting on your input.</div>
+              <button class="btn btn-small" onclick={() => openIngest(slug)}>Open</button>
+            </div>
+          {/each}
+          {#if otherReviewCount > 0}
+            <div class="row">
+              <span class="rdot amber"></span>
+              <div class="rtext">
+                {otherReviewCount === 1
+                  ? "One more thing is"
+                  : `${otherReviewCount} more things are`} waiting in Review — documents
+                going stale or things Ken couldn't handle alone.
+              </div>
+              <button class="btn btn-small" onclick={() => (app.screen = "review")}>Open Review</button>
+            </div>
+          {/if}
         </div>
-      {/each}
-      {#each blockedSlugs as slug (slug)}
-        <div class="callout attention">
-          <span class="cdot amber"></span>
-          <div class="ctext"><strong>{slug}</strong> is waiting on your input.</div>
-          <button class="btn btn-small" onclick={() => openIngest(slug)}>Open</button>
-        </div>
-      {/each}
-      {#if otherReviewCount > 0}
-        <div class="callout attention">
-          <span class="cdot amber"></span>
-          <div class="ctext">
-            {otherReviewCount === 1
-              ? "One more thing is"
-              : `${otherReviewCount} more things are`} waiting in Review — documents
-            going stale or things Ken couldn't handle alone.
-          </div>
-          <button class="btn btn-small" onclick={() => (app.screen = "review")}>Open Review</button>
-        </div>
-      {/if}
+      </section>
     {/if}
 
     {#if app.failedFiles.length > 0}
-      <div class="section-label">Needs a look</div>
-      {#each app.failedFiles.slice(0, 5) as f (f.relPath)}
-        <div class="callout">
-          <span class="cdot"></span>
-          <div class="ctext">
-            <strong>{f.relPath.split("/").pop()}</strong> couldn't be indexed —
-            {f.error ?? "unknown reason"}. It's still findable by name.
-          </div>
-          <button class="btn btn-small" onclick={() => app.openInFiles(f.relPath)}>View</button>
+      <section class="rise" style="--d: 4">
+        <div class="section-label">Needs a look</div>
+        <div class="group">
+          {#each app.failedFiles.slice(0, 5) as f (f.relPath)}
+            <div class="row">
+              <span class="rdot"></span>
+              <div class="rtext">
+                <strong>{f.relPath.split("/").pop()}</strong> couldn't be indexed —
+                {f.error ?? "unknown reason"}. It's still findable by name.
+              </div>
+              <button class="btn btn-small" onclick={() => app.openInFiles(f.relPath)}>View</button>
+            </div>
+          {/each}
         </div>
-      {/each}
+      </section>
     {/if}
 
   </div>
@@ -206,101 +228,69 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 36px 44px;
+    padding: 44px 44px 56px;
   }
   .inner {
-    max-width: 720px;
+    max-width: 680px;
     margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
   }
+
+  /* Entrance: one staggered rise, then still. */
+  .rise {
+    animation: rise 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation-delay: calc(var(--d) * 60ms);
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(7px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rise {
+      animation: none;
+    }
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
   h1 {
-    margin: 0 0 10px;
+    margin: 0;
     font-family: var(--font-serif);
-    font-size: 30px;
+    font-size: 31px;
     font-weight: 500;
     letter-spacing: -0.01em;
   }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 22px 24px;
-    box-shadow: var(--shadow-card);
-  }
-  .card.muted p {
-    color: var(--ink-tertiary);
-  }
-  .head {
+  .rule {
     display: flex;
-    align-items: center;
-    gap: 9px;
-    margin-bottom: 10px;
-  }
-  .overline-accent {
-    font-size: 11.5px;
-    font-weight: 700;
-    color: var(--accent-deep);
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-  }
-  .when {
-    margin-left: auto;
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
-  }
-  p {
-    margin: 0;
-    font-size: 14px;
-    line-height: 1.7;
-  }
-  .actions {
-    display: flex;
-    gap: 8px;
+    align-items: baseline;
+    gap: 10px;
     margin-top: 14px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--border);
   }
-  .section-label {
-    font-size: 11.5px;
+  .rule-label {
+    font-size: 11px;
     font-weight: 700;
     color: var(--accent-deep);
-    letter-spacing: 0.07em;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
-    margin-top: 8px;
   }
-  .callout {
-    display: flex;
-    gap: 12px;
-    align-items: flex-start;
-    background: var(--surface);
-    border: 1px solid rgba(163, 77, 63, 0.3);
-    border-radius: 10px;
-    padding: 14px 16px;
-  }
-  .cdot {
-    width: 8px;
-    height: 8px;
-    border-radius: 4px;
-    background: var(--danger);
-    margin-top: 5px;
-    flex: none;
-  }
-  .cdot.amber {
-    background: var(--needs-input);
-  }
-  .callout.attention {
-    border-color: rgba(168, 116, 44, 0.3);
-  }
-  .ctext {
-    flex: 1;
-    font-size: 13px;
-    line-height: 1.6;
-  }
-  .card .overline {
-    display: block;
-    margin-bottom: 8px;
+  .rule-meta {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
   }
   .share {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     border: none;
     background: transparent;
     padding: 0;
@@ -310,23 +300,75 @@
     cursor: pointer;
   }
   .share:hover {
-    text-decoration: underline;
+    color: var(--accent-hover);
+  }
+
+  /* ── The lead: digest prose, serif, no box ────────────── */
+  .digest {
+    margin-top: 18px;
   }
   .digest-body {
-    font-size: 14px;
-    line-height: 1.7;
+    font-family: var(--font-serif);
+    font-size: 16px;
+    line-height: 1.8;
+    color: var(--ink);
+    max-width: 62ch;
   }
   .digest-body :global(p) {
-    margin: 0 0 8px;
+    margin: 0 0 12px;
+  }
+  .digest-body :global(p:first-child) {
+    font-size: 17.5px;
   }
   .digest-body :global(p:last-child) {
     margin-bottom: 0;
   }
-  .chips {
-    display: flex;
-    gap: 8px;
+  .digest-body :global(a) {
+    color: var(--accent-deep);
+    text-decoration-color: rgba(138, 90, 68, 0.4);
+    text-underline-offset: 2px;
+  }
+  .digest-quiet {
+    margin: 0;
+    font-family: var(--font-serif);
+    font-size: 15.5px;
+    line-height: 1.75;
+    color: var(--ink-secondary);
+    max-width: 58ch;
+  }
+  .digest-error {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--ink-tertiary);
+  }
+  .digest-actions {
     margin-top: 14px;
+  }
+  .pulse {
+    animation: digest-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes digest-pulse {
+    0%,
+    100% {
+      opacity: 0.45;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .sources {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     flex-wrap: wrap;
+    margin-top: 18px;
+  }
+  .from {
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--ink-tertiary);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
   .chip {
     font-size: 11px;
@@ -340,22 +382,88 @@
   .chip:hover {
     border-color: var(--accent);
   }
-  .pulse {
-    color: var(--ink-tertiary);
-    animation: digest-pulse 1.6s ease-in-out infinite;
+
+  /* ── Status strip: the folder, in one quiet line ──────── */
+  .status {
+    margin-top: 44px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 13px 16px;
+    background: var(--sunken-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
   }
-  @keyframes digest-pulse {
-    0%,
-    100% {
-      opacity: 0.45;
-    }
-    50% {
-      opacity: 1;
-    }
+  .status-line {
+    margin: 0;
+    flex: 1;
+    min-width: 240px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--ink-secondary);
   }
-  .digest-error {
-    margin-top: 8px;
-    font-size: 12px;
+  .status-line strong {
+    color: var(--ink);
+  }
+  .status-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .status-actions .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* ── Grouped attention lists ──────────────────────────── */
+  section {
+    margin-top: 36px;
+  }
+  .status + section {
+    margin-top: 28px;
+  }
+  .section-label {
+    font-size: 11px;
+    font-weight: 700;
     color: var(--ink-tertiary);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .section-label.amber {
+    color: var(--needs-input-text);
+  }
+  .group {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 13px 16px;
+  }
+  .row + .row {
+    border-top: 1px solid var(--border);
+  }
+  .rdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    margin-top: 6px;
+    flex: none;
+  }
+  .rdot.amber {
+    background: var(--needs-input);
+  }
+  .rtext {
+    flex: 1;
+    font-size: 13px;
+    line-height: 1.6;
   }
 </style>

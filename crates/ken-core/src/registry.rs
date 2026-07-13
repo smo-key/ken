@@ -23,6 +23,9 @@ pub struct RegistryEntry {
 pub struct Registry {
     #[serde(default)]
     pub projects: Vec<RegistryEntry>,
+    /// The project that was open last — reopened on launch.
+    #[serde(default, rename = "lastProject", skip_serializing_if = "Option::is_none")]
+    pub last_project: Option<Uuid>,
 }
 
 /// A registry entry plus whether its folder still exists on disk.

@@ -3,6 +3,8 @@
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { api, type McpInfo, type SyncStatus } from "../lib/api";
+  import Copy from "@lucide/svelte/icons/copy";
+  import Check from "@lucide/svelte/icons/check";
 
   let busy = $state(false);
   let toggling = $state(false);
@@ -264,7 +266,11 @@
               class="mcp-copy"
               onclick={() => mcp && copy(mcp.addCommand, "command")}
             >
-              {copied === "command" ? "copied" : "⧉ copy"}
+              {#if copied === "command"}
+                <Check size={13} strokeWidth={1.75} /> copied
+              {:else}
+                <Copy size={13} strokeWidth={1.75} /> copy
+              {/if}
             </button>
           </div>
         </div>
@@ -278,7 +284,11 @@
           >
             <strong>LLM instruction</strong> — paste into any agent ·
             <span class="mcp-chip-action">
-              {copied === "instruction" ? "copied" : "⧉ copy"}
+              {#if copied === "instruction"}
+                <Check size={12} strokeWidth={1.75} /> copied
+              {:else}
+                <Copy size={12} strokeWidth={1.75} /> copy
+              {/if}
             </span>
           </button>
         </div>
@@ -455,6 +465,9 @@
   }
   .mcp-copy {
     flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     border: none;
     background: none;
     padding: 0;
@@ -488,7 +501,11 @@
     border-color: var(--border-strong);
   }
   .mcp-chip-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
     color: var(--accent);
     font-weight: 600;
+    vertical-align: middle;
   }
 </style>

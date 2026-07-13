@@ -357,4 +357,35 @@ mod tests {
         assert_eq!(stats.added, 11);
         assert!(db.search("ghost content", 5).unwrap().is_empty());
     }
+
+    #[test]
+    fn refresh_path_reflects_a_move() {
+        // Mirrors the `move_file` command: rename on disk, then refresh both
+        // endpoints so the index follows the file to its new path.
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(db.get_file("notes/plain.txt").unwrap().is_some());
+
+        fs::rename(
+            dir.path().join("notes/plain.txt"),
+            dir.path().join("src/plain.txt"),
+        )
+        .unwrap();
+        assert!(refresh_path(&project, &mut db, "notes/plain.txt").unwrap());
+        assert!(refresh_path(&project, &mut db, "src/plain.txt").unwrap());
+
+        assert!(db.get_file("notes/plain.txt").unwrap().is_none());
+        assert!(db.get_file("src/plain.txt").unwrap().is_some());
+
+        let hits = db.search("rollback rehearsal", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.rel_path == "src/plain.txt"),
+            "moved file searchable at new path: {hits:?}",
+        );
+        assert!(
+            !hits.iter().any(|h| h.rel_path == "notes/plain.txt"),
+            "old path gone from index: {hits:?}",
+        );
+    }
 }

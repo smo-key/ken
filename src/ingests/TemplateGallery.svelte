@@ -1,41 +1,24 @@
 <script lang="ts">
-  import { api } from "../lib/api";
   import { TEMPLATES, type IngestTemplate } from "../lib/templates";
 
-  let { close }: { close: (createdSlug: string | null) => void } = $props();
-  let error = $state<string | null>(null);
-  let busy = $state<string | null>(null);
-
-  async function use(t: IngestTemplate) {
-    busy = t.id;
-    error = null;
-    try {
-      const recipe = await api.saveIngest({
-        name: t.name,
-        description: t.description,
-        instruction: t.instruction,
-        sources: [],
-        output: t.output,
-        mode: t.mode,
-        refresh: t.refresh,
-      });
-      close(recipe.slug);
-    } catch (e) {
-      error = String(e);
-      busy = null;
-    }
-  }
+  // Picking a template opens the editable form pre-filled from the recipe —
+  // it never saves on its own, so every field stays tailorable before saving.
+  let {
+    pick,
+    close,
+  }: {
+    pick: (template: IngestTemplate) => void;
+    close: () => void;
+  } = $props();
 </script>
 
-<button class="scrim" onclick={() => close(null)} aria-label="Close"></button>
+<button class="scrim" onclick={close} aria-label="Close"></button>
 <div class="modal" role="dialog" aria-label="Template library">
   <h2>Start from a template</h2>
   <p class="lede">
-    Templates are starting points — after you pick one it's yours to tailor.
+    Templates are starting points — after you pick one it's yours to tailor
+    before saving.
   </p>
-  {#if error}
-    <div class="error">{error}</div>
-  {/if}
   <div class="grid">
     {#each TEMPLATES as t (t.id)}
       <div class="tile">
@@ -43,9 +26,7 @@
         <div class="tile-desc">{t.description}</div>
         <div class="tile-foot">
           <span class="mono out">{t.output}</span>
-          <button class="btn btn-small" disabled={busy !== null} onclick={() => use(t)}>
-            {busy === t.id ? "Adding…" : "Use"}
-          </button>
+          <button class="btn btn-small" onclick={() => pick(t)}>Use</button>
         </div>
       </div>
     {/each}
@@ -126,13 +107,5 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .error {
-    font-size: 12.5px;
-    color: var(--danger);
-    background: rgba(163, 77, 63, 0.07);
-    border: 1px solid rgba(163, 77, 63, 0.25);
-    border-radius: 9px;
-    padding: 9px 12px;
   }
 </style>

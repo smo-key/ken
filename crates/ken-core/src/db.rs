@@ -412,11 +412,16 @@ impl Db {
 
     /// Ranked full-text search. Query is treated as-you-type: all terms
     /// required, last term matched as a prefix. Filename matches are
-    /// boosted over body matches.
+    /// boosted over body matches, and a second query-time pass matches
+    /// filenames by case-insensitive substring (every token must appear
+    /// somewhere in the rel_path) so partial names like "roadmap" still
+    /// find `Q3RoadmapFinal.docx`; both passes are merged and deduped.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let Some(fts_query) = build_fts_query(query) else {
+        let tokens = query_tokens(query);
+        if tokens.is_empty() {
             return Ok(Vec::new());
-        };
+        }
+        let fts_query = build_fts_query(&tokens);
         let mut stmt = self.conn.prepare(
             r#"SELECT f.rel_path, f.kind, f.status,
                       snippet(search, 0, '<mark>', '</mark>', '…', 12),
@@ -426,7 +431,7 @@ impl Db {
                ORDER BY bm25(search, 1.0, 4.0)
                LIMIT ?2"#,
         )?;
-        let rows = stmt
+        let mut hits: Vec<SearchHit> = stmt
             .query_map(params![fts_query, limit as i64], |r| {
                 Ok(SearchHit {
                     rel_path: r.get(0)?,
@@ -437,7 +442,55 @@ impl Db {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
-        Ok(rows)
+        drop(stmt);
+
+        // Filename pass: every token as a case-insensitive substring of the
+        // rel_path. Catches what FTS name tokens can't — mid-word matches
+        // and non-final prefixes.
+        let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+        let clauses = vec!["lower(rel_path) LIKE ? ESCAPE '\\'"; lowered.len()].join(" AND ");
+        let sql = format!("SELECT rel_path, kind, status FROM files WHERE {clauses}");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let patterns: Vec<String> = lowered
+            .iter()
+            .map(|t| format!("%{}%", like_escape(t)))
+            .collect();
+        let name_rows: Vec<(String, String, String)> = stmt
+            .query_map(rusqlite::params_from_iter(&patterns), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+
+        for (rel_path, kind, status) in name_rows {
+            let rank = name_match_rank(&rel_path, query);
+            match hits.iter_mut().find(|h| h.rel_path == rel_path) {
+                Some(hit) => {
+                    // Both passes hit: keep the better rank, and the content
+                    // snippet unless it's empty (metadata-only/failed files).
+                    if rank < hit.rank {
+                        hit.rank = rank;
+                    }
+                    if hit.snippet.is_empty() {
+                        hit.snippet = name_snippet(&rel_path, &lowered);
+                    }
+                }
+                None => hits.push(SearchHit {
+                    snippet: name_snippet(&rel_path, &lowered),
+                    rel_path,
+                    kind,
+                    status,
+                    rank,
+                }),
+            }
+        }
+        hits.sort_by(|a, b| {
+            a.rank
+                .partial_cmp(&b.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// Drop all indexed data (schema stays). Used by reindex.
@@ -1088,18 +1141,20 @@ fn like_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
-/// Build a safe FTS5 query from raw user input: alphanumeric tokens only,
-/// each quoted, all ANDed, last token as prefix for as-you-type feel.
-fn build_fts_query(input: &str) -> Option<String> {
-    let tokens: Vec<String> = input
+/// Split raw user input into safe query tokens: alphanumeric runs only —
+/// FTS5 syntax and LIKE wildcards can't survive this.
+fn query_tokens(input: &str) -> Vec<String> {
+    input
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
-        .collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let last = tokens.len() - 1;
+        .collect()
+}
+
+/// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
+/// prefix for as-you-type feel.
+fn build_fts_query(tokens: &[String]) -> String {
+    let last = tokens.len().saturating_sub(1);
     let parts: Vec<String> = tokens
         .iter()
         .enumerate()
@@ -1111,7 +1166,67 @@ fn build_fts_query(input: &str) -> Option<String> {
             }
         })
         .collect();
-    Some(parts.join(" "))
+    parts.join(" ")
+}
+
+// Synthetic ranks for filename matches, on the bm25 scale (lower = better).
+// Exact and prefix basename matches outrank any realistic content score; a
+// plain substring match beats weak content hits (bm25 near zero) but yields
+// to strongly relevant content.
+const NAME_RANK_EXACT: f64 = -100.0;
+const NAME_RANK_PREFIX: f64 = -50.0;
+const NAME_RANK_SUBSTRING: f64 = -2.0;
+
+/// Rank a filename match: exact basename (with or without extension) first,
+/// then basename prefix, then plain substring-in-path.
+fn name_match_rank(rel_path: &str, raw_query: &str) -> f64 {
+    let base = rel_path.rsplit('/').next().unwrap_or(rel_path).to_lowercase();
+    let stem = base.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_else(|| base.clone());
+    let q = raw_query.trim().to_lowercase();
+    if base == q || stem == q {
+        NAME_RANK_EXACT
+    } else if base.starts_with(&q) {
+        NAME_RANK_PREFIX
+    } else {
+        NAME_RANK_SUBSTRING
+    }
+}
+
+/// Snippet for a filename hit: the basename with each matched token wrapped
+/// in `<mark>` — the same shape content snippets have, so the UI renders it
+/// unchanged. Tokens that only matched in the directory part stay unmarked.
+fn name_snippet(rel_path: &str, lowered_tokens: &[String]) -> String {
+    let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let lower = base.to_lowercase();
+    // Lowercasing can shift byte offsets for exotic Unicode; skip marking
+    // rather than risk splitting a char.
+    if lower.len() != base.len() {
+        return base.to_string();
+    }
+    let mut ranges: Vec<(usize, usize)> = lowered_tokens
+        .iter()
+        .filter_map(|t| lower.find(t.as_str()).map(|i| (i, i + t.len())))
+        .collect();
+    ranges.sort_unstable();
+    let mut out = String::new();
+    let mut pos = 0;
+    for (start, end) in ranges {
+        if start < pos {
+            continue; // overlaps a previous mark; keep it simple
+        }
+        let (Some(before), Some(hit)) = (base.get(pos..start), base.get(start..end)) else {
+            return base.to_string();
+        };
+        out.push_str(before);
+        out.push_str("<mark>");
+        out.push_str(hit);
+        out.push_str("</mark>");
+        pos = end;
+    }
+    match base.get(pos..) {
+        Some(rest) => out + rest,
+        None => base.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1158,6 +1273,79 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "vendor/Contract v3.pdf");
         assert_eq!(hits[0].status, "failed");
+    }
+
+    #[test]
+    fn filename_substring_matches_without_content_hit() {
+        let mut db = seeded();
+        // "roadmap" is neither a name token (camelCase stays one token) nor
+        // in the content — only the substring pass can find this.
+        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None,
+            "Milestones for the third quarter.")
+            .unwrap();
+        let hits = db.search("roadmap", 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].rel_path, "plans/Q3RoadmapFinal.docx");
+        // Snippet is the basename with the match marked.
+        assert_eq!(hits[0].snippet, "Q3<mark>Roadmap</mark>Final.docx");
+    }
+
+    #[test]
+    fn filename_match_is_case_insensitive() {
+        let mut db = seeded();
+        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None, "")
+            .unwrap();
+        for q in ["ROADMAP", "q3roadmap", "RoadMapFin"] {
+            let hits = db.search(q, 10).unwrap();
+            assert!(
+                hits.iter().any(|h| h.rel_path == "plans/Q3RoadmapFinal.docx"),
+                "query {q:?} should match by filename: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_basename_match_outranks_weak_content_hits() {
+        let mut db = seeded();
+        db.upsert_file("finance/budget.md", "md", 50, 1, "indexed", None,
+            "Numbers for the quarter.")
+            .unwrap();
+        db.upsert_file("notes/long-doc.md", "md", 5000, 1, "indexed", None,
+            "A long meandering note that mentions the budget once in passing.")
+            .unwrap();
+        let hits = db.search("budget", 10).unwrap();
+        assert!(hits.len() >= 2, "{hits:?}");
+        assert_eq!(hits[0].rel_path, "finance/budget.md", "{hits:?}");
+        assert_eq!(hits[0].rank, NAME_RANK_EXACT);
+    }
+
+    #[test]
+    fn name_and_content_match_dedupes_to_one_hit() {
+        let mut db = seeded();
+        db.upsert_file("finance/budget.md", "md", 50, 1, "indexed", None,
+            "The budget was approved on Friday.")
+            .unwrap();
+        let hits = db.search("budget", 10).unwrap();
+        let count = hits.iter().filter(|h| h.rel_path == "finance/budget.md").count();
+        assert_eq!(count, 1, "{hits:?}");
+        // The better (filename) rank wins; the content snippet is kept.
+        assert_eq!(hits[0].rank, NAME_RANK_EXACT);
+        assert!(hits[0].snippet.contains("<mark>budget</mark>"), "{hits:?}");
+    }
+
+    #[test]
+    fn multi_token_filename_query_requires_all_tokens() {
+        let mut db = seeded();
+        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None, "")
+            .unwrap();
+        // Both tokens appear in the rel_path (one in the folder, one in the
+        // basename) — hit. A token that appears nowhere — no hit.
+        assert!(db
+            .search("plans roadmap", 10)
+            .unwrap()
+            .iter()
+            .any(|h| h.rel_path == "plans/Q3RoadmapFinal.docx"));
+        assert!(db.search("roadmap missing", 10).unwrap().is_empty());
     }
 
     #[test]

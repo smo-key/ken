@@ -12,6 +12,13 @@
   import MapScreen from "../screens/MapScreen.svelte";
   import TimelineScreen from "../screens/TimelineScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
+  import { SvelteSet } from "svelte/reactivity";
+
+  // Screens the user has actually opened this session (home is always live).
+  const visited = new SvelteSet<string>();
+  $effect(() => {
+    if (app.screen !== "home") visited.add(app.screen);
+  });
 
   function onKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -30,14 +37,28 @@
   <div class="body">
     <NavRail />
     <main class="screen">
-      <!-- Screens stay mounted so open file / query survive switching. -->
+      <!-- Screens mount on first visit and then stay mounted, so open file /
+           query survive switching — without paying for every screen (and the
+           restored editor tab) at boot. -->
       <div class="pane" hidden={app.screen !== "home"}><HomeScreen /></div>
-      <div class="pane" hidden={app.screen !== "files"}><FilesScreen /></div>
-      <div class="pane" hidden={app.screen !== "review"}><ReviewScreen /></div>
-      <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
-      <div class="pane" hidden={app.screen !== "map"}><MapScreen /></div>
-      <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
-      <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
+      {#if visited.has("files")}
+        <div class="pane" hidden={app.screen !== "files"}><FilesScreen /></div>
+      {/if}
+      {#if visited.has("review")}
+        <div class="pane" hidden={app.screen !== "review"}><ReviewScreen /></div>
+      {/if}
+      {#if visited.has("ingests")}
+        <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
+      {/if}
+      {#if visited.has("map")}
+        <div class="pane" hidden={app.screen !== "map"}><MapScreen /></div>
+      {/if}
+      {#if visited.has("timeline")}
+        <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
+      {/if}
+      {#if visited.has("settings")}
+        <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
+      {/if}
     </main>
     {#if chats.open}
       <ChatDrawer />

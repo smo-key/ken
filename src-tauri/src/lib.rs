@@ -122,6 +122,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
 
     let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
     registry.add(&project);
+    registry.last_project = Some(project.config.id);
     registry.save(&guard.base_dir).map_err(err)?;
 
     let db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
@@ -338,10 +339,21 @@ fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdR
 #[tauri::command]
 fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let uuid = id.parse().map_err(err)?;
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
     let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
     registry.remove(uuid);
+    if registry.last_project == Some(uuid) {
+        registry.last_project = None;
+    }
     registry.save(&guard.base_dir).map_err(err)
+}
+
+/// The id of the most recently opened project, for launch-to-last-project.
+#[tauri::command]
+fn last_project_id(state: State<SharedState>) -> CmdResult<Option<String>> {
+    let guard = state.lock().unwrap();
+    let registry = Registry::load(&guard.base_dir).map_err(err)?;
+    Ok(registry.last_project.map(|id| id.to_string()))
 }
 
 #[tauri::command]
@@ -480,6 +492,60 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(abs.to_string_lossy(), None::<&str>)
         .map_err(err)
+}
+
+/// `errno` for a cross-device rename on Unix; `fs::rename` fails with this when
+/// source and destination live on different filesystems.
+#[cfg(unix)]
+const EXDEV: i32 = 18;
+
+/// Move a file within the project. Both paths are validated to stay inside the
+/// project root (`resolve` rejects `..`/absolute escapes); overwriting an
+/// existing file is refused. The state guard is dropped across the rename, then
+/// re-taken to refresh the index for both paths so search stays correct before
+/// the watcher fires.
+#[tauri::command]
+fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> CmdResult<()> {
+    let (from_abs, to_abs) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        let from_abs = active.project.resolve(&from_rel).map_err(err)?;
+        let to_abs = active.project.resolve(&to_rel).map_err(err)?;
+        (from_abs, to_abs)
+    };
+
+    if from_abs == to_abs {
+        return Ok(());
+    }
+    if !from_abs.is_file() {
+        return Err("That file no longer exists.".to_string());
+    }
+    if to_abs.exists() {
+        let name = to_abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to_rel.clone());
+        return Err(format!("\u{201c}{name}\u{201d} already exists in that folder."));
+    }
+    if let Some(parent) = to_abs.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+
+    match std::fs::rename(&from_abs, &to_abs) {
+        Ok(()) => {}
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            std::fs::copy(&from_abs, &to_abs).map_err(err)?;
+            std::fs::remove_file(&from_abs).map_err(err)?;
+        }
+        Err(e) => return Err(err(e)),
+    }
+
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
+    scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2045,6 +2111,7 @@ pub fn run() {
             create_project,
             open_project,
             forget_project,
+            last_project_id,
             current_project,
             set_folder_selection,
             get_tree,
@@ -2055,6 +2122,7 @@ pub fn run() {
             file_meta,
             extracted_text,
             reindex,
+            move_file,
             open_external,
             file_mtime,
             list_ingests,

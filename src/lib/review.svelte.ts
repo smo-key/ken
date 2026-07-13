@@ -1,6 +1,7 @@
 // Review inbox state: the unified list of everything Ken needs a human
 // for, plus recently resolved items. Assembled by the review_inbox
 // command; refreshed on run, index, and sync events.
+import { diffLines } from "diff";
 import {
   api,
   type ConflictCopyPayload,
@@ -66,6 +67,52 @@ export function conflictCopyPayload(
   } catch {
     return null;
   }
+}
+
+/** One rendered row of a collapsed unified diff. */
+export type DiffRow =
+  | { type: "add" | "del" | "ctx"; text: string }
+  | { type: "gap"; count: number };
+
+/**
+ * Build collapsed unified-diff rows comparing text `a` (the "−"/removed side)
+ * against text `b` (the "+"/added side). Runs of unchanged lines longer than
+ * `2 * context` collapse to a single "gap" marker so the eye lands on changes.
+ * Pure and dependency-light — safe to unit test.
+ */
+export function buildDiffRows(a: string, b: string, context = 3): DiffRow[] {
+  const lines: { type: "add" | "del" | "ctx"; text: string }[] = [];
+  for (const part of diffLines(a, b)) {
+    const type = part.added ? "add" : part.removed ? "del" : "ctx";
+    const chunk = part.value.split("\n");
+    // diffLines values keep a trailing newline; drop the empty tail it leaves.
+    if (chunk.length > 1 && chunk[chunk.length - 1] === "") chunk.pop();
+    for (const text of chunk) lines.push({ type, text });
+  }
+
+  const rows: DiffRow[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].type !== "ctx") {
+      rows.push(lines[i]);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < lines.length && lines[j].type === "ctx") j++;
+    const run = j - i;
+    const head = i === 0 ? 0 : context; // keep context after the prior change
+    const tail = j === lines.length ? 0 : context; // and before the next change
+    if (run <= head + tail) {
+      for (let k = i; k < j; k++) rows.push(lines[k]);
+    } else {
+      for (let k = i; k < i + head; k++) rows.push(lines[k]);
+      rows.push({ type: "gap", count: run - head - tail });
+      for (let k = j - tail; k < j; k++) rows.push(lines[k]);
+    }
+    i = j;
+  }
+  return rows;
 }
 
 /** Numeric id parsed back out of a kind-prefixed inbox id ("run-12" → 12). */

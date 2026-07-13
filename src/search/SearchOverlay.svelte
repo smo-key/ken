@@ -7,6 +7,7 @@
   import { isQuestionQuery } from "../lib/assist";
   import { renderMarkdown } from "../lib/markdown";
   import FileGlyph from "../files/FileGlyph.svelte";
+  import Search from "@lucide/svelte/icons/search";
 
   let query = $state("");
   let hits = $state<SearchHit[]>([]);
@@ -115,7 +116,7 @@
 <button class="scrim" onclick={() => (app.searchOpen = false)} aria-label="Close search"></button>
 <div class="overlay" role="dialog" aria-label="Search project knowledge">
   <div class="query-row">
-    <span class="lens" aria-hidden="true"></span>
+    <Search class="lens" size={16} strokeWidth={1.75} aria-hidden="true" />
     <input
       bind:this={input}
       bind:value={query}
@@ -214,23 +215,9 @@
     border-bottom: 1px solid var(--sunken);
     flex: none;
   }
-  .lens {
-    width: 14px;
-    height: 14px;
-    border: 1.5px solid var(--ink-secondary);
-    border-radius: 50%;
-    position: relative;
+  .query-row :global(.lens) {
+    color: var(--ink-secondary);
     flex: none;
-  }
-  .lens::after {
-    content: "";
-    position: absolute;
-    width: 1.5px;
-    height: 6px;
-    background: var(--ink-secondary);
-    transform: rotate(-45deg);
-    top: 11px;
-    left: 13px;
   }
   input {
     flex: 1;

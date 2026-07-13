@@ -305,6 +305,7 @@ export const api = {
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
+  lastProjectId: () => invoke<string | null>("last_project_id"),
   currentProject: () => invoke<ProjectInfo | null>("current_project"),
   setFolderSelection: (excluded: string[]) =>
     invoke<ProjectInfo>("set_folder_selection", { excluded }),
@@ -320,6 +321,8 @@ export const api = {
   extractedText: (relPath: string) =>
     invoke<string>("extracted_text", { relPath }),
   reindex: () => invoke<ScanStats>("reindex"),
+  moveFile: (fromRel: string, toRel: string) =>
+    invoke<void>("move_file", { fromRel, toRel }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
   fileMtime: (relPath: string) => invoke<number>("file_mtime", { relPath }),
 

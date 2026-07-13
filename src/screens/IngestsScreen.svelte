@@ -5,10 +5,21 @@
   import { timeAgo } from "../lib/format";
   import IngestForm from "../ingests/IngestForm.svelte";
   import TemplateGallery from "../ingests/TemplateGallery.svelte";
-  import type { RunRow } from "../lib/api";
+  import type { IngestTemplate } from "../lib/templates";
+  import type { IngestMode, IngestRefresh, RunRow } from "../lib/api";
+
+  type FormPreset = {
+    name: string;
+    description: string;
+    instruction: string;
+    output: string;
+    mode: IngestMode;
+    refresh: IngestRefresh;
+  };
 
   let formOpen = $state(false);
   let editingSlug = $state<string | null>(null);
+  let formPreset = $state<FormPreset | null>(null);
   let galleryOpen = $state(false);
 
   onMount(() => void ingests.init());
@@ -57,11 +68,27 @@
 
   function openEdit(slug: string) {
     editingSlug = slug;
+    formPreset = null;
     formOpen = true;
   }
 
   function openNew() {
     editingSlug = null;
+    formPreset = null;
+    formOpen = true;
+  }
+
+  function openFromTemplate(t: IngestTemplate) {
+    galleryOpen = false;
+    editingSlug = null;
+    formPreset = {
+      name: t.name,
+      description: t.description,
+      instruction: t.instruction,
+      output: t.output,
+      mode: t.mode,
+      refresh: t.refresh,
+    };
     formOpen = true;
   }
 </script>
@@ -127,6 +154,9 @@
             <span class="badge busy">running…</span>
           {/if}
           <span class="spacer"></span>
+          <button class="btn btn-small" onclick={() => openEdit(detail.recipe.slug)}>
+            Edit
+          </button>
           {#if isRunning}
             <button class="btn btn-small" onclick={() => ingests.cancel(detail.recipe.slug)}>
               Cancel run
@@ -161,10 +191,7 @@
         </div>
 
         <div class="card">
-          <div class="card-label">
-            Instruction
-            <button class="edit-link" onclick={() => openEdit(detail.recipe.slug)}>Edit</button>
-          </div>
+          <div class="card-label">Instruction</div>
           <div class="instruction">{detail.recipe.instruction}</div>
         </div>
 
@@ -228,8 +255,10 @@
 {#if formOpen}
   <IngestForm
     slug={editingSlug}
+    preset={formPreset ?? undefined}
     close={(saved) => {
       formOpen = false;
+      formPreset = null;
       void ingests.refresh();
       if (saved) void ingests.select(saved);
     }}
@@ -238,11 +267,8 @@
 
 {#if galleryOpen}
   <TemplateGallery
-    close={(createdSlug) => {
-      galleryOpen = false;
-      void ingests.refresh();
-      if (createdSlug) void ingests.select(createdSlug);
-    }}
+    pick={openFromTemplate}
+    close={() => (galleryOpen = false)}
   />
 {/if}
 
@@ -432,16 +458,6 @@
     color: var(--ink-tertiary);
     letter-spacing: 0.07em;
     text-transform: uppercase;
-  }
-  .edit-link {
-    margin-left: auto;
-    font-size: 11.5px;
-    color: var(--accent);
-    font-weight: 600;
-    text-transform: none;
-    letter-spacing: 0;
-    border: none;
-    background: none;
   }
   .chips {
     display: flex;

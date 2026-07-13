@@ -2,6 +2,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import KenMark from "../lib/ui/KenMark.svelte";
 
   let error = $state<string | null>(null);
   let pendingPath = $state<string | null>(null);
@@ -47,8 +48,8 @@
 <div class="wrap" data-tauri-drag-region>
   <div class="panel">
     <div class="brand">
-      <span class="mark">K</span>
-      <span class="wordmark">KEN</span>
+      <KenMark size={36} />
+      <span class="wordmark">Ken</span>
     </div>
     <h1>Your team's knowledge, in one calm place.</h1>
     <p class="lede">
@@ -109,7 +110,16 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--paper);
+    /* Gentle lined paper: faint rules every 28px on the paper ground. */
+    background:
+      repeating-linear-gradient(
+        to bottom,
+        transparent,
+        transparent 27px,
+        rgba(33, 30, 25, 0.045) 27px,
+        rgba(33, 30, 25, 0.045) 28px
+      ),
+      var(--paper);
   }
   .panel {
     width: 460px;
@@ -123,24 +133,13 @@
     align-items: center;
     gap: 12px;
   }
-  .mark {
-    width: 36px;
-    height: 36px;
-    border-radius: 9px;
-    background: var(--ink);
-    color: var(--paper);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-family: var(--font-serif);
-    font-size: 20px;
-    font-weight: 600;
-  }
   .wordmark {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--ink-tertiary);
-    letter-spacing: 0.06em;
+    font-family: var(--font-script);
+    font-size: 26px;
+    line-height: 1;
+    color: var(--ink);
+    /* Script baseline sits low; nudge up so it aligns with the mark. */
+    transform: translateY(-3px);
   }
   h1 {
     margin: 6px 0 0;

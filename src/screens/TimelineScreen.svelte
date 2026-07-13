@@ -4,6 +4,7 @@
   import { knowledge } from "../lib/knowledge.svelte";
   import { highlightMatches } from "../lib/knowledge";
   import { timeAgo } from "../lib/format";
+  import Search from "@lucide/svelte/icons/search";
 
   onMount(() => void knowledge.visit());
 
@@ -108,7 +109,7 @@
       </div>
     {:else}
       <div class="search">
-        <span class="lens" aria-hidden="true"></span>
+        <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
         <input
           bind:value={query}
           placeholder="Search events…"
@@ -217,23 +218,9 @@
     padding: 0 14px;
     box-shadow: var(--shadow-control);
   }
-  .lens {
-    width: 12px;
-    height: 12px;
-    border: 1.5px solid var(--ink-tertiary);
-    border-radius: 50%;
-    position: relative;
+  .search :global(.lens) {
+    color: var(--ink-tertiary);
     flex: none;
-  }
-  .lens::after {
-    content: "";
-    position: absolute;
-    width: 1.5px;
-    height: 5px;
-    background: var(--ink-tertiary);
-    transform: rotate(-45deg);
-    top: 9px;
-    left: 11px;
   }
   .search input {
     flex: 1;

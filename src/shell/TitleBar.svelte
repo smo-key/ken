@@ -3,6 +3,10 @@
   import { chats } from "../lib/chats.svelte";
   import { timeAgo } from "../lib/format";
   import ProjectSwitcher from "./ProjectSwitcher.svelte";
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import Search from "@lucide/svelte/icons/search";
+  import MessagesSquare from "@lucide/svelte/icons/messages-square";
+  import KenMark from "../lib/ui/KenMark.svelte";
 
   let switcherOpen = $state(false);
 
@@ -24,6 +28,8 @@
   <!-- Space for the native macOS traffic lights (titleBarStyle: Overlay) -->
   <div class="traffic-space" data-tauri-drag-region></div>
 
+  <KenMark size={22} />
+
   <button class="project" onclick={() => (switcherOpen = !switcherOpen)}>
     <span class="badge">{initial}</span>
     {app.project?.name}
@@ -33,11 +39,11 @@
       class:error={app.scanError !== null || app.syncState === "attention"}
       title={syncTitle}
     ></span>
-    <span class="chev">▾</span>
+    <ChevronDown class="chev" size={14} strokeWidth={1.75} aria-hidden="true" />
   </button>
 
   <button class="search" onclick={() => (app.searchOpen = true)}>
-    <span class="lens" aria-hidden="true"></span>
+    <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
     <span class="hint">Search project knowledge…</span>
     <span class="kbd">⌘K</span>
   </button>
@@ -45,10 +51,12 @@
   <button
     class="chats"
     class:open={chats.open}
+    aria-pressed={chats.open}
     onclick={() => (chats.open = !chats.open)}
     title={chats.open ? "Close chats" : "Open chats"}
   >
-    ◈ Chats
+    <MessagesSquare size={15} strokeWidth={1.75} aria-hidden="true" />
+    Chats
     {#if chats.needsInput}
       <span class="need-dot"></span>
     {/if}
@@ -124,9 +132,8 @@
       opacity: 0.35;
     }
   }
-  .chev {
+  .project :global(.chev) {
     color: var(--ink-tertiary);
-    font-size: 10px;
   }
   .search {
     flex: 1;
@@ -144,23 +151,9 @@
     cursor: text;
     font-size: 13px;
   }
-  .lens {
-    width: 12px;
-    height: 12px;
-    border: 1.5px solid var(--ink-tertiary);
-    border-radius: 50%;
-    position: relative;
+  .search :global(.lens) {
+    color: var(--ink-tertiary);
     flex: none;
-  }
-  .lens::after {
-    content: "";
-    position: absolute;
-    width: 1.5px;
-    height: 5px;
-    background: var(--ink-tertiary);
-    transform: rotate(-45deg);
-    top: 9px;
-    left: 11px;
   }
   .hint {
     color: var(--ink-tertiary);
@@ -182,9 +175,14 @@
     font-weight: 600;
     cursor: pointer;
   }
-  .chats:hover,
-  .chats.open {
+  .chats:hover {
     background: rgba(138, 90, 68, 0.16);
+  }
+  .chats.open {
+    background: var(--accent);
+    border-color: var(--accent-deep);
+    color: var(--surface);
+    box-shadow: inset 0 1px 2px rgba(33, 30, 25, 0.25);
   }
   .need-dot {
     width: 7px;

@@ -2,6 +2,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import Plus from "@lucide/svelte/icons/plus";
 
   let { close }: { close: () => void } = $props();
   let error = $state<string | null>(null);
@@ -58,7 +59,7 @@
     </button>
   {/each}
   <button class="row new" onclick={openFolder}>
-    <span class="badge plus">+</span>
+    <span class="badge plus"><Plus size={15} strokeWidth={1.75} /></span>
     <span class="info"><span class="name">Open a folder…</span>
       <span class="path">Any folder becomes a Ken project</span></span>
   </button>

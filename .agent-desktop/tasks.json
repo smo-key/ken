@@ -1,0 +1,1 @@
+{"version":1,"tasks":[{"id":"term-mriumfyn-1","name":"Run app","kind":"terminal","command":"pnpm tauri dev","cwd":null}]}
