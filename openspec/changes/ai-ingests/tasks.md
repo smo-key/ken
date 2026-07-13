@@ -2,24 +2,24 @@
 
 ## 1. Foundations
 
-- [ ] 1.1 Add deps (serde_yaml, portable-pty, tiny_http, similar); DB schema v2 migration adding `ingest_runs`; migration test v1→v2
-- [ ] 1.2 Recipe model in ken-core: parse/serialize `.ken/ingests/*.md` (frontmatter + body, unknown-field preservation), list/load/save/delete, validation with plain-language errors; unit tests incl. malformed recipes
-- [ ] 1.3 Rules resolution (recipe > project defaults > built-ins) with tests
+- [x] 1.1 Add deps (serde_yaml, portable-pty, tiny_http, similar); DB schema v2 migration adding `ingest_runs`; migration test v1→v2
+- [x] 1.2 Recipe model in ken-core: parse/serialize `.ken/ingests/*.md` (frontmatter + body, unknown-field preservation), list/load/save/delete, validation with plain-language errors; unit tests incl. malformed recipes
+- [x] 1.3 Rules resolution (recipe > project defaults > built-ins) with tests
 
 ## 2. Runner (ken-core)
 
-- [ ] 2.1 Localhost hook listener (tiny_http, port 0): parse hook POSTs, route by session_id over channels; unit test with raw HTTP
-- [ ] 2.2 `.claude/settings.local.json` merge: install/update Ken's Stop+Notification hooks (replace only entries containing /ken-hook, preserve everything else); tests incl. pre-existing user settings
-- [ ] 2.3 Hidden-TUI runner: portable-pty spawn with --session-id/--permission-mode/prompt arg, ring-buffer drain, Stop-hook completion, /exit shutdown, Notification→blocked, timeout→failed; CLI discovery (`which claude`) with guided-missing error
-- [ ] 2.4 Headless runner: `claude -p --output-format json`, exit/is_error handling; shared RunOutcome type
-- [ ] 2.5 Fake-claude fixture script + runner lifecycle tests: success, failure exit, timeout, blocked, headless variant
+- [x] 2.1 Localhost hook listener (tiny_http, port 0): parse hook POSTs, route by session_id over channels; unit test with raw HTTP
+- [x] 2.2 `.claude/settings.local.json` merge: install/update Ken's Stop+Notification hooks (replace only entries containing /ken-hook, preserve everything else); tests incl. pre-existing user settings
+- [x] 2.3 Hidden-TUI runner: portable-pty spawn with --session-id/--permission-mode/prompt arg, ring-buffer drain, Stop-hook completion, /exit shutdown, Notification→blocked, timeout→failed; CLI discovery (`which claude`) with guided-missing error
+- [x] 2.4 Headless runner: `claude -p --output-format json`, exit/is_error handling; shared RunOutcome type
+- [x] 2.5 Fake-claude fixture script + runner lifecycle tests: success, failure exit, timeout, blocked, headless variant
 
 ## 3. Refresh engine (ken-core)
 
-- [ ] 3.1 Prompt composer: instruction + rules text + changed-files-since-last-success (mtime vs last run; full corpus on first run) + current outputs + staging contract (single/collection, _removed.txt); snapshot tests
-- [ ] 3.2 Staging apply: change-ratio via `similar`, threshold decision, fs apply (renames + _removed deletions), first-run auto-apply, mid-run-human-edit demotion to pending; tests for each rule
-- [ ] 3.3 Run log CRUD on ingest_runs + statuses; approve/discard operations with staging cleanup; tests
-- [ ] 3.4 Refresh queue: on-change trigger from scan stats (source-path intersection, 30s debounce, collapse repeats, no self-retrigger from own outputs), one-at-a-time execution; tests with fake claude
+- [x] 3.1 Prompt composer: instruction + rules text + changed-files-since-last-success (mtime vs last run; full corpus on first run) + current outputs + staging contract (single/collection, _removed.txt); snapshot tests
+- [x] 3.2 Staging apply: change-ratio via `similar`, threshold decision, fs apply (renames + _removed deletions), first-run auto-apply, mid-run-human-edit demotion to pending; tests for each rule
+- [x] 3.3 Run log CRUD on ingest_runs + statuses; approve/discard operations with staging cleanup; tests
+- [x] 3.4 Refresh queue: on-change trigger from scan stats (source-path intersection, 30s debounce, collapse repeats, no self-retrigger from own outputs), one-at-a-time execution; tests with fake claude
 
 ## 4. Tauri commands + events
 

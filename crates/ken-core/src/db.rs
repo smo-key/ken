@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct Db {
     conn: Connection,
@@ -38,6 +38,22 @@ pub struct SearchHit {
     /// Snippet with `<mark>` tags around matched terms.
     pub snippet: String,
     pub rank: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRow {
+    pub id: i64,
+    pub slug: String,
+    pub session_id: Option<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// `running` | `fresh` | `blocked` | `pending_approval` | `failed` |
+    /// `discarded` | `cancelled`
+    pub status: String,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub change_ratio: Option<f64>,
 }
 
 pub fn db_path(base: &Path, project_id: Uuid) -> PathBuf {
@@ -125,11 +141,30 @@ impl Db {
                 END;
                 "#,
             )?;
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
-                params![SCHEMA_VERSION.to_string()],
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS ingest_runs (
+                    id           INTEGER PRIMARY KEY,
+                    slug         TEXT NOT NULL,
+                    session_id   TEXT,
+                    started_at   INTEGER NOT NULL,
+                    finished_at  INTEGER,
+                    status       TEXT NOT NULL,
+                    summary      TEXT,
+                    error        TEXT,
+                    change_ratio REAL
+                );
+                CREATE INDEX IF NOT EXISTS ingest_runs_slug
+                    ON ingest_runs(slug, started_at DESC);
+                "#,
             )?;
         }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
         Ok(())
     }
 
@@ -308,6 +343,98 @@ impl Db {
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
     }
+
+    // --- ingest run log ---
+
+    pub fn insert_run(&mut self, slug: &str, session_id: Option<&str>, started_at: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO ingest_runs (slug, session_id, started_at, status)
+             VALUES (?1, ?2, ?3, 'running')",
+            params![slug, session_id, started_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_run(
+        &mut self,
+        id: i64,
+        status: &str,
+        finished_at: Option<i64>,
+        summary: Option<&str>,
+        error: Option<&str>,
+        change_ratio: Option<f64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"UPDATE ingest_runs SET
+                 status = ?2,
+                 finished_at = COALESCE(?3, finished_at),
+                 summary = COALESCE(?4, summary),
+                 error = COALESCE(?5, error),
+                 change_ratio = COALESCE(?6, change_ratio)
+               WHERE id = ?1"#,
+            params![id, status, finished_at, summary, error, change_ratio],
+        )?;
+        Ok(())
+    }
+
+    fn map_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
+        Ok(RunRow {
+            id: r.get(0)?,
+            slug: r.get(1)?,
+            session_id: r.get(2)?,
+            started_at: r.get(3)?,
+            finished_at: r.get(4)?,
+            status: r.get(5)?,
+            summary: r.get(6)?,
+            error: r.get(7)?,
+            change_ratio: r.get(8)?,
+        })
+    }
+
+    const RUN_COLS: &'static str =
+        "id, slug, session_id, started_at, finished_at, status, summary, error, change_ratio";
+
+    pub fn get_run(&self, id: i64) -> Result<Option<RunRow>> {
+        let sql = format!("SELECT {} FROM ingest_runs WHERE id = ?1", Self::RUN_COLS);
+        match self.conn.query_row(&sql, params![id], Self::map_run) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_runs(&self, slug: &str, limit: usize) -> Result<Vec<RunRow>> {
+        let sql = format!(
+            "SELECT {} FROM ingest_runs WHERE slug = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
+            Self::RUN_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![slug, limit as i64], Self::map_run)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn runs_with_status(&self, status: &str) -> Result<Vec<RunRow>> {
+        let sql = format!(
+            "SELECT {} FROM ingest_runs WHERE status = ?1 ORDER BY started_at DESC",
+            Self::RUN_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![status], Self::map_run)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Epoch seconds of the last run that ended `fresh` for this ingest.
+    pub fn last_success_at(&self, slug: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(started_at) FROM ingest_runs WHERE slug = ?1 AND status = 'fresh'",
+            params![slug],
+            |r| r.get(0),
+        )?)
+    }
 }
 
 /// Filename tokens for the `name` FTS column: stem + extension with
@@ -450,5 +577,49 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn v1_db_migrates_to_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Rewind a fresh DB to v1 state.
+            let db = Db::open_at(&path).unwrap();
+            db.conn.execute("DROP TABLE ingest_runs", []).unwrap();
+            db.conn
+                .execute("UPDATE meta SET value='1' WHERE key='schema_version'", [])
+                .unwrap();
+        }
+        let mut db = Db::open_at(&path).unwrap();
+        // v2 table exists again and is usable.
+        let id = db.insert_run("people", Some("s-1"), 100).unwrap();
+        assert!(db.get_run(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn run_log_lifecycle() {
+        let mut db = Db::open_in_memory().unwrap();
+        let id = db.insert_run("people", Some("sess-1"), 1000).unwrap();
+        assert_eq!(db.get_run(id).unwrap().unwrap().status, "running");
+
+        db.update_run(id, "pending_approval", Some(1060), Some("2 additions"), None, Some(0.4))
+            .unwrap();
+        let row = db.get_run(id).unwrap().unwrap();
+        assert_eq!(row.status, "pending_approval");
+        assert_eq!(row.change_ratio, Some(0.4));
+
+        assert_eq!(db.runs_with_status("pending_approval").unwrap().len(), 1);
+        assert!(db.last_success_at("people").unwrap().is_none());
+
+        db.update_run(id, "fresh", None, None, None, None).unwrap();
+        assert_eq!(db.last_success_at("people").unwrap(), Some(1000));
+        // COALESCE keeps earlier fields.
+        let row = db.get_run(id).unwrap().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("2 additions"));
+        assert_eq!(row.finished_at, Some(1060));
+
+        let runs = db.list_runs("people", 10).unwrap();
+        assert_eq!(runs.len(), 1);
     }
 }
