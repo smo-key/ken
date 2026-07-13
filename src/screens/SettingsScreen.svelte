@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
-  import { api, type SyncStatus } from "../lib/api";
+  import { api, type McpInfo, type SyncStatus } from "../lib/api";
 
   let busy = $state(false);
   let toggling = $state(false);
@@ -11,10 +11,26 @@
   );
   let sync = $state<SyncStatus | null>(null);
   let syncingNow = $state(false);
+  let mcp = $state<McpInfo | null>(null);
+  let copied = $state<"command" | "instruction" | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
   onMount(() => {
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
+    void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
+    return () => clearTimeout(copyTimer);
   });
+
+  async function copy(text: string, what: "command" | "instruction") {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = what;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => (copied = null), 1600);
+    } catch {
+      // Clipboard unavailable — leave the button as-is.
+    }
+  }
 
   async function toggleSyncAuto() {
     if (!sync) return;
@@ -225,11 +241,62 @@
       {/if}
     </div>
 
+    <div class="card">
+      <div class="mcp-head">
+        <span class="card-title">Connect an agent</span>
+        {#if mcp?.binaryPath}
+          <span class="mcp-status">
+            <span class="ok-dot"></span>Ready — agents start it on demand
+          </span>
+        {/if}
+      </div>
+      <p class="note">
+        Ken's connector lets Claude Code, Cursor, and other agents search this
+        project's knowledge and read its documents. It can only read — never
+        change — your files.
+      </p>
+      {#if mcp?.binaryPath}
+        <div class="mcp-block">
+          <div class="mcp-comment"># add Ken to any agent — scoped to this project</div>
+          <div class="mcp-cmd-row">
+            <code class="mcp-cmd">{mcp.addCommand}</code>
+            <button
+              class="mcp-copy"
+              onclick={() => mcp && copy(mcp.addCommand, "command")}
+            >
+              {copied === "command" ? "copied" : "⧉ copy"}
+            </button>
+          </div>
+        </div>
+        <div class="mcp-chips">
+          <span class="mcp-chip">
+            <strong>Scope</strong> — this project only
+          </span>
+          <button
+            class="mcp-chip mcp-chip-btn"
+            onclick={() => mcp && copy(mcp.llmInstruction, "instruction")}
+          >
+            <strong>LLM instruction</strong> — paste into any agent ·
+            <span class="mcp-chip-action">
+              {copied === "instruction" ? "copied" : "⧉ copy"}
+            </span>
+          </button>
+        </div>
+      {:else if mcp}
+        <p class="note">
+          The connector (<span class="mono small">ken-mcp</span>) ships with
+          Ken's installer but wasn't found on this machine — reinstalling Ken
+          restores it. Building from source? Run
+          <span class="mono small">cargo build -p ken-mcp</span>.
+        </p>
+      {/if}
+    </div>
+
     <div class="card muted">
       <div class="card-title">Coming to Ken</div>
       <p class="note">
-        MCP server for your agents, plus knowledge Map and Timeline views —
-        each arrives in an upcoming release.
+        Knowledge Map and Timeline views — each arrives in an upcoming
+        release.
       </p>
     </div>
   </div>
@@ -354,5 +421,81 @@
   }
   .note.warn {
     color: var(--needs-input-text);
+  }
+  .mcp-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .mcp-head .card-title {
+    flex: 1;
+  }
+  .mcp-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--healthy-text);
+  }
+  .mcp-block {
+    background: var(--terminal-bg);
+    border-radius: 10px;
+    padding: 13px 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.7;
+  }
+  .mcp-comment {
+    color: var(--ink-tertiary);
+  }
+  .mcp-cmd-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .mcp-cmd {
+    flex: 1;
+    min-width: 0;
+    color: var(--terminal-text);
+    font-family: inherit;
+    word-break: break-all;
+  }
+  .mcp-copy {
+    flex: none;
+    border: none;
+    background: none;
+    padding: 0;
+    color: var(--terminal-prompt);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .mcp-chips {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-size: 12.5px;
+  }
+  .mcp-chip {
+    flex: 1;
+    min-width: 200px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 10px 12px;
+    background: var(--sunken);
+    text-align: left;
+    line-height: 1.5;
+  }
+  .mcp-chip-btn {
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .mcp-chip-btn:hover {
+    border-color: var(--border-strong);
+  }
+  .mcp-chip-action {
+    color: var(--accent);
+    font-weight: 600;
   }
 </style>

@@ -69,6 +69,19 @@ impl Db {
         Db::open_at(&path)
     }
 
+    /// Open an existing index without any ability to write — no migration,
+    /// no pragmas, and SQLite itself refuses every write. This is the only
+    /// handle `ken-mcp` uses; a missing index is an error (the app has to
+    /// build it first).
+    pub fn open_read_only(base: &Path, project_id: Uuid) -> Result<Db> {
+        let path = db_path(base, project_id);
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(Db { conn })
+    }
+
     pub fn open_at(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -322,6 +335,22 @@ impl Db {
                 other => Err(other),
             })?;
         Ok(row)
+    }
+
+    /// Extracted text stored in the index for a file, if any. This is what
+    /// binary kinds (docx/pdf/…) expose to readers that can't parse the
+    /// original bytes.
+    pub fn get_text(&self, rel_path: &str) -> Result<Option<String>> {
+        match self.conn.query_row(
+            "SELECT c.text FROM contents c JOIN files f ON f.id = c.file_id
+             WHERE f.rel_path = ?1",
+            params![rel_path],
+            |r| r.get(0),
+        ) {
+            Ok(text) => Ok(Some(text)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn list_files(&self) -> Result<Vec<FileRow>> {
@@ -901,6 +930,39 @@ mod tests {
         for q in ["\"unbalanced", "a AND OR NOT", "col:x", "(((", "*", "  "] {
             let _ = db.search(q, 10).unwrap();
         }
+    }
+
+    #[test]
+    fn get_text_returns_indexed_content() {
+        let db = seeded();
+        let text = db.get_text("knowledge/People.md").unwrap().unwrap();
+        assert!(text.contains("Priya Natarajan"));
+        // Failed extraction stored empty text; missing file is None.
+        assert_eq!(db.get_text("vendor/Contract v3.pdf").unwrap().unwrap(), "");
+        assert!(db.get_text("nope.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn open_read_only_reads_but_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let id = Uuid::new_v4();
+        {
+            let mut db = Db::open(base, id).unwrap();
+            db.upsert_file("notes/a.md", "md", 10, 1, "indexed", None, "billing cutover")
+                .unwrap();
+        }
+        let ro = Db::open_read_only(base, id).unwrap();
+        assert_eq!(ro.file_count().unwrap(), 1);
+        assert_eq!(ro.search("billing", 5).unwrap().len(), 1);
+        assert!(ro.get_text("notes/a.md").unwrap().is_some());
+        // SQLite itself refuses writes on this handle.
+        assert!(ro
+            .conn
+            .execute("INSERT INTO meta(key, value) VALUES ('x', 'y')", [])
+            .is_err());
+        // A missing index is an open error, not an empty database.
+        assert!(Db::open_read_only(base, Uuid::new_v4()).is_err());
     }
 
     #[test]

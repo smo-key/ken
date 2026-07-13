@@ -463,6 +463,97 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
         .map_err(err)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpInfo {
+    binary_path: Option<String>,
+    project_root: String,
+    add_command: String,
+    json_config: String,
+    llm_instruction: String,
+}
+
+/// Where is the `ken-mcp` binary? Installer layout first (sibling of the
+/// app executable, then `~/.local/bin`), then PATH, then a dev build.
+fn find_ken_mcp() -> Option<PathBuf> {
+    let name = format!("ken-mcp{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|d| d.join(&name)) {
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let local = PathBuf::from(home).join(".local/bin").join(&name);
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+    if let Ok(out) = std::process::Command::new("which").arg("ken-mcp").output() {
+        if out.status.success() {
+            let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    let dev = PathBuf::from("target/debug").join(&name);
+    if dev.is_file() {
+        return Some(dev.canonicalize().unwrap_or(dev));
+    }
+    None
+}
+
+/// Quote a word for pasting into a shell only when it needs it.
+fn shell_word(s: &str) -> String {
+    if s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+#[tauri::command]
+fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let root = active.project.root.to_string_lossy().into_owned();
+    let binary_path = find_ken_mcp().map(|p| p.to_string_lossy().into_owned());
+    // When the binary isn't found the strings still render with the bare
+    // name so copied configs work once it lands on PATH.
+    let command = binary_path.clone().unwrap_or_else(|| "ken-mcp".into());
+    let add_command = format!(
+        "claude mcp add ken -- {} --project {}",
+        shell_word(&command),
+        shell_word(&root)
+    );
+    let json_config = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "ken": { "command": command, "args": ["--project", root] }
+        }
+    }))
+    .map_err(err)?;
+    let llm_instruction = format!(
+        "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
+Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
+server binary, ken-mcp, exposes read-only tools over that index: search_knowledge \
+(full-text search), read_document, list_documents, and list_projects. It runs on \
+demand over stdio and never modifies any files.\n\n\
+If you are Claude Code, register it by running:\n\n  {add_command}\n\n\
+Otherwise, add this to your MCP configuration:\n\n{json_config}\n\n\
+Once connected, use search_knowledge to find relevant documents and read_document \
+to read them."
+    );
+    Ok(McpInfo {
+        binary_path,
+        project_root: root,
+        add_command,
+        json_config,
+        llm_instruction,
+    })
+}
+
 #[tauri::command]
 fn file_mtime(state: State<SharedState>, rel_path: String) -> CmdResult<i64> {
     let guard = state.lock().unwrap();
@@ -1483,6 +1574,7 @@ pub fn run() {
             resolve_conflict_copy,
             set_ingest_runner_mode,
             claude_doctor,
+            mcp_info,
             list_chats,
             chat_transcript,
             create_chat,

@@ -225,6 +225,14 @@ export interface PtyChunk {
   data: string; // base64
 }
 
+export interface McpInfo {
+  binaryPath: string | null;
+  projectRoot: string;
+  addCommand: string;
+  jsonConfig: string;
+  llmInstruction: string;
+}
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -283,6 +291,7 @@ export const api = {
   setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
     invoke<void>("set_ingest_runner_mode", { mode }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
+  mcpInfo: () => invoke<McpInfo>("mcp_info"),
 
   listChats: () => invoke<ChatRow[]>("list_chats"),
   chatTranscript: (chatId: string) =>

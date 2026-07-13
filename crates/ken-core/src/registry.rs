@@ -34,9 +34,13 @@ pub struct RegistryEntryStatus {
 }
 
 /// Default app-data base directory (`~/Library/Application Support/ken` on
-/// macOS). All registry/db functions take the base explicitly so tests can
-/// point at a temp dir.
+/// macOS). A `KEN_DATA_DIR` environment variable overrides it — that's how
+/// tests isolate themselves and how power users relocate app data. All
+/// registry/db functions still take the base explicitly.
 pub fn default_base_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("KEN_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     dirs::data_dir()
         .map(|d| d.join("ken"))
         .ok_or_else(|| Error::Other("no OS data directory available".into()))
@@ -139,6 +143,19 @@ mod tests {
         assert!(reg.statuses()[0].available);
         drop(proj_dir); // folder deleted
         assert!(!reg.statuses()[0].available);
+    }
+
+    #[test]
+    fn ken_data_dir_overrides_base_dir() {
+        // No other test reads KEN_DATA_DIR, so mutating it here is safe.
+        std::env::set_var("KEN_DATA_DIR", "/tmp/ken-test-base");
+        assert_eq!(
+            default_base_dir().unwrap(),
+            PathBuf::from("/tmp/ken-test-base")
+        );
+        std::env::remove_var("KEN_DATA_DIR");
+        let default = default_base_dir().unwrap();
+        assert!(default.ends_with("ken"), "unexpected default: {default:?}");
     }
 
     #[test]
