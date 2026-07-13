@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
@@ -183,6 +183,25 @@ impl Db {
                 );
                 CREATE INDEX IF NOT EXISTS chat_messages_chat
                     ON chat_messages(chat_id, id);
+                "#,
+            )?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS review_items (
+                    id          INTEGER PRIMARY KEY,
+                    kind        TEXT NOT NULL,
+                    title       TEXT NOT NULL,
+                    body        TEXT NOT NULL DEFAULT '',
+                    source_ref  TEXT NOT NULL DEFAULT '',
+                    status      TEXT NOT NULL DEFAULT 'open',
+                    payload     TEXT,
+                    created_at  INTEGER NOT NULL,
+                    resolved_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS review_items_status
+                    ON review_items(status, created_at DESC);
                 "#,
             )?;
         }
@@ -461,6 +480,96 @@ impl Db {
         )?)
     }
 
+    /// Runs finished at or after `since`, newest first. Feeds the Review
+    /// inbox's Done section.
+    pub fn runs_finished_since(&self, since: i64) -> Result<Vec<RunRow>> {
+        let sql = format!(
+            "SELECT {} FROM ingest_runs
+             WHERE finished_at IS NOT NULL AND finished_at >= ?1
+             ORDER BY finished_at DESC, id DESC",
+            Self::RUN_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![since], Self::map_run)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    // --- review items (stored substrate; derived inbox kinds live in
+    //     their own tables and are assembled at read time) ---
+
+    pub fn insert_review_item(
+        &mut self,
+        kind: &str,
+        title: &str,
+        body: &str,
+        source_ref: &str,
+        payload: Option<&str>,
+        created_at: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO review_items (kind, title, body, source_ref, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![kind, title, body, source_ref, payload, created_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn resolve_review_item(&mut self, id: i64, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE review_items SET status = 'resolved', resolved_at = ?2
+             WHERE id = ?1 AND status = 'open'",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    fn map_review_item(r: &rusqlite::Row) -> rusqlite::Result<ReviewItemRow> {
+        Ok(ReviewItemRow {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            title: r.get(2)?,
+            body: r.get(3)?,
+            source_ref: r.get(4)?,
+            status: r.get(5)?,
+            payload: r.get(6)?,
+            created_at: r.get(7)?,
+            resolved_at: r.get(8)?,
+        })
+    }
+
+    const REVIEW_ITEM_COLS: &'static str =
+        "id, kind, title, body, source_ref, status, payload, created_at, resolved_at";
+
+    pub fn list_open_review_items(&self) -> Result<Vec<ReviewItemRow>> {
+        let sql = format!(
+            "SELECT {} FROM review_items WHERE status = 'open'
+             ORDER BY created_at DESC, id DESC",
+            Self::REVIEW_ITEM_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], Self::map_review_item)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Items resolved at or after `since`, newest first.
+    pub fn list_recent_resolved_review_items(&self, since: i64) -> Result<Vec<ReviewItemRow>> {
+        let sql = format!(
+            "SELECT {} FROM review_items
+             WHERE status = 'resolved' AND resolved_at >= ?1
+             ORDER BY resolved_at DESC, id DESC",
+            Self::REVIEW_ITEM_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![since], Self::map_review_item)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     // --- chats ---
 
     pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
@@ -609,6 +718,24 @@ pub struct ChatRow {
     pub created_at: i64,
     pub last_active_at: i64,
     pub archived: bool,
+}
+
+/// A stored Review item — the substrate for inbox kinds that have no
+/// other table of their own (sync conflicts, AI questions, …).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewItemRow {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub source_ref: String,
+    /// `open` | `resolved`
+    pub status: String,
+    /// Free-form JSON for kind-specific data.
+    pub payload: Option<String>,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -815,6 +942,84 @@ mod tests {
         // v2 table exists again and is usable.
         let id = db.insert_run("people", Some("s-1"), 100).unwrap();
         assert!(db.get_run(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn v3_db_migrates_to_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Rewind a fresh DB to v3 state.
+            let db = Db::open_at(&path).unwrap();
+            db.conn.execute("DROP TABLE review_items", []).unwrap();
+            db.conn
+                .execute("UPDATE meta SET value='3' WHERE key='schema_version'", [])
+                .unwrap();
+        }
+        let mut db = Db::open_at(&path).unwrap();
+        // v4 table exists again and is usable.
+        let id = db
+            .insert_review_item("conflict", "Merge conflict", "", "Decisions.md", None, 100)
+            .unwrap();
+        assert_eq!(db.list_open_review_items().unwrap().len(), 1);
+        assert_eq!(db.list_open_review_items().unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn review_item_lifecycle() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db
+            .insert_review_item(
+                "question",
+                "Same person?",
+                "Priya N. and Priya Natarajan look alike.",
+                "People.md",
+                Some(r#"{"options":["yes","no"]}"#),
+                100,
+            )
+            .unwrap();
+        let b = db
+            .insert_review_item("conflict", "Merge conflict", "", "Decisions.md", None, 200)
+            .unwrap();
+
+        let open = db.list_open_review_items().unwrap();
+        assert_eq!(open.len(), 2);
+        // Newest first.
+        assert_eq!(open[0].id, b);
+        assert_eq!(open[1].status, "open");
+        assert_eq!(open[1].payload.as_deref(), Some(r#"{"options":["yes","no"]}"#));
+
+        db.resolve_review_item(a, 300).unwrap();
+        assert_eq!(db.list_open_review_items().unwrap().len(), 1);
+        let resolved = db.list_recent_resolved_review_items(250).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, a);
+        assert_eq!(resolved[0].resolved_at, Some(300));
+        // Outside the window → not listed.
+        assert!(db.list_recent_resolved_review_items(301).unwrap().is_empty());
+        // Resolving again is a no-op that keeps the original timestamp.
+        db.resolve_review_item(a, 999).unwrap();
+        assert_eq!(
+            db.list_recent_resolved_review_items(0).unwrap()[0].resolved_at,
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn runs_finished_since_window() {
+        let mut db = Db::open_in_memory().unwrap();
+        let old = db.insert_run("people", None, 10).unwrap();
+        db.update_run(old, "discarded", Some(20), None, None, None).unwrap();
+        let recent = db.insert_run("people", None, 100).unwrap();
+        db.update_run(recent, "fresh", Some(120), None, None, Some(0.5)).unwrap();
+        let unfinished = db.insert_run("people", None, 130).unwrap();
+
+        let rows = db.runs_finished_since(50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, recent);
+        let all = db.runs_finished_since(0).unwrap();
+        assert_eq!(all.len(), 2, "running run {unfinished} must be excluded");
+        assert_eq!(all[0].id, recent, "newest finish first");
     }
 
     #[test]

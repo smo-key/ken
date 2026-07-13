@@ -1,5 +1,6 @@
 <script lang="ts">
   import { app, type Screen } from "../lib/app.svelte";
+  import { review } from "../lib/review.svelte";
 
   const items: { key: Screen; icon: string; label: string }[] = [
     { key: "home", icon: "▦", label: "Home" },
@@ -21,6 +22,9 @@
       <span class="icon">{item.icon}</span>{item.label}
       {#if item.key === "files" && app.failedFiles.length > 0}
         <span class="dot" title="{app.failedFiles.length} files could not be indexed"></span>
+      {/if}
+      {#if item.key === "review" && review.count > 0}
+        <span class="count" title="{review.count} things are waiting on you">{review.count}</span>
       {/if}
     </button>
   {/each}
@@ -80,6 +84,23 @@
     height: 7px;
     border-radius: 4px;
     background: var(--danger);
+    border: 1.5px solid var(--paper);
+  }
+  .count {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    border-radius: 8px;
+    background: var(--danger);
+    color: var(--surface);
+    font-size: 9px;
+    font-weight: 700;
     border: 1.5px solid var(--paper);
   }
   .settings {

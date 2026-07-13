@@ -1,12 +1,21 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
+  import { review } from "../lib/review.svelte";
   import { timeAgo } from "../lib/format";
 
   const blockedSlugs = $derived(
     Object.values(ingests.live)
       .filter((ev) => ev.status === "blocked")
       .map((ev) => ev.slug),
+  );
+
+  // Open Review items beyond what this screen already shows individually
+  // (approvals and blocked runs above, failed files below).
+  const otherReviewCount = $derived(
+    review.items.filter(
+      (i) => i.kind === "stale" || i.kind === "broken-recipe" || i.kind === "stored",
+    ).length,
   );
 
   function openIngest(slug: string) {
@@ -51,7 +60,7 @@
       </div>
     </div>
 
-    {#if ingests.pending.length > 0 || blockedSlugs.length > 0}
+    {#if ingests.pending.length > 0 || blockedSlugs.length > 0 || otherReviewCount > 0}
       <div class="section-label">Waiting on you</div>
       {#each ingests.pending as run (run.id)}
         <div class="callout attention">
@@ -70,6 +79,18 @@
           <button class="btn btn-small" onclick={() => openIngest(slug)}>Open</button>
         </div>
       {/each}
+      {#if otherReviewCount > 0}
+        <div class="callout attention">
+          <span class="cdot amber"></span>
+          <div class="ctext">
+            {otherReviewCount === 1
+              ? "One more thing is"
+              : `${otherReviewCount} more things are`} waiting in Review — documents
+            going stale or things Ken couldn't handle alone.
+          </div>
+          <button class="btn btn-small" onclick={() => (app.screen = "review")}>Open Review</button>
+        </div>
+      {/if}
     {/if}
 
     {#if app.failedFiles.length > 0}

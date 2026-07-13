@@ -134,6 +134,28 @@ export interface IngestForm {
   rules?: RulesOverride | null;
 }
 
+export type InboxKind =
+  | "approval"
+  | "stale"
+  | "failed-file"
+  | "broken-recipe"
+  | "stored";
+
+export interface InboxItem {
+  /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
+  id: string;
+  kind: InboxKind;
+  title: string;
+  body: string;
+  when: number;
+  sourceRef: string;
+}
+
+export interface ReviewInbox {
+  items: InboxItem[];
+  done: InboxItem[];
+}
+
 export type ChatStatus = "working" | "needs_input" | "done" | "error";
 
 export interface ChatRow {
@@ -201,6 +223,9 @@ export const api = {
   approveRun: (runId: number) => invoke<void>("approve_run", { runId }),
   discardRun: (runId: number) => invoke<void>("discard_run", { runId }),
   pendingApprovals: () => invoke<RunRow[]>("pending_approvals"),
+  reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
+  resolveReviewItem: (id: number) =>
+    invoke<void>("resolve_review_item", { id }),
   setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
     invoke<void>("set_ingest_runner_mode", { mode }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),

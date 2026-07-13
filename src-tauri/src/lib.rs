@@ -589,21 +589,39 @@ fn cancel_run(state: State<SharedState>, slug: String) -> CmdResult<()> {
     Ok(())
 }
 
+/// Tell listeners (ingests + review stores) a run changed outside the
+/// engine — approvals and discards resolve runs from a command, not a run
+/// thread, so the engine never emits for them.
+fn emit_run_changed(app: &AppHandle, db: &Db, run_id: i64) {
+    if let Ok(Some(run)) = db.get_run(run_id) {
+        let _ = app.emit("ingest-run-changed", IngestEvent {
+            slug: run.slug,
+            run_id,
+            session_id: run.session_id,
+            status: run.status,
+            detail: run.summary,
+        });
+    }
+}
+
 #[tauri::command]
-fn approve_run(state: State<SharedState>, run_id: i64) -> CmdResult<()> {
+fn approve_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
     engine::approve_run(&active.project, &mut active.db, run_id).map_err(err)?;
     // Applied files land on disk; index them promptly.
     let _ = scan::scan(&active.project, &mut active.db);
+    emit_run_changed(&app, &active.db, run_id);
     Ok(())
 }
 
 #[tauri::command]
-fn discard_run(state: State<SharedState>, run_id: i64) -> CmdResult<()> {
+fn discard_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
-    engine::discard_run(&active.project, &mut active.db, run_id).map_err(err)
+    engine::discard_run(&active.project, &mut active.db, run_id).map_err(err)?;
+    emit_run_changed(&app, &active.db, run_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -611,6 +629,204 @@ fn pending_approvals(state: State<SharedState>) -> CmdResult<Vec<RunRow>> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
     active.db.runs_with_status("pending_approval").map_err(err)
+}
+
+// ---------- review inbox ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboxItem {
+    /// Kind-prefixed and stable across refreshes: "run-12", "stale-people",
+    /// "file-notes/x.pdf", "broken-people", "item-3".
+    id: String,
+    /// `approval` | `stale` | `failed-file` | `broken-recipe` | `stored`
+    kind: String,
+    title: String,
+    body: String,
+    when: i64,
+    source_ref: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewInbox {
+    items: Vec<InboxItem>,
+    done: Vec<InboxItem>,
+}
+
+/// Sort key mirroring the prototype's top-down severity order.
+fn inbox_rank(kind: &str) -> u8 {
+    match kind {
+        "approval" => 0,
+        "stored" => 1,
+        "broken-recipe" => 2,
+        "failed-file" => 3,
+        _ => 4, // stale
+    }
+}
+
+/// The unified Review inbox, assembled at read time: pending approvals,
+/// stale ingests, failed files, and broken recipes stay derived from their
+/// own sources of truth; stored review items are merged in. `done` is the
+/// last 7 days of resolved items.
+#[tauri::command]
+fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let now = engine::now_epoch();
+    let mut items: Vec<InboxItem> = Vec::new();
+
+    // One walk over the recipes yields stale + broken items and the
+    // name/threshold lookups the run-based items need.
+    let mut names: std::collections::HashMap<String, String> = Default::default();
+    let mut thresholds: std::collections::HashMap<String, f64> = Default::default();
+    for entry in recipe::list(&active.project).map_err(err)? {
+        match entry {
+            RecipeEntry::Ok { recipe: r } => {
+                let rules = recipe::resolve_rules(&r, &active.project);
+                names.insert(r.slug.clone(), r.name.clone());
+                thresholds.insert(r.slug.clone(), rules.review_threshold_pct as f64 / 100.0);
+                // Same staleness derivation as list_ingests.
+                let last = active.db.list_runs(&r.slug, 1).map_err(err)?.into_iter().next();
+                if let Some(last) = last.filter(|l| l.status == "fresh") {
+                    if now - last.started_at > rules.stale_days as i64 * 86_400 {
+                        items.push(InboxItem {
+                            id: format!("stale-{}", r.slug),
+                            kind: "stale".into(),
+                            title: format!("{} may be out of date", r.name),
+                            body: format!(
+                                "{} hasn't been refreshed in over {} days. Run it to check for drift, or leave it if nothing has changed.",
+                                r.output, rules.stale_days
+                            ),
+                            when: last.started_at,
+                            source_ref: r.slug.clone(),
+                        });
+                    }
+                }
+            }
+            RecipeEntry::Broken { error } => {
+                let when = recipe::recipe_path(&active.project.root, &error.slug)
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(now);
+                items.push(InboxItem {
+                    id: format!("broken-{}", error.slug),
+                    kind: "broken-recipe".into(),
+                    title: format!("The {} recipe has a problem", error.slug),
+                    body: format!(
+                        "Ken can't read this ingest recipe, so it won't run — {}. Open it in Ingests to fix or recreate it.",
+                        error.reason
+                    ),
+                    when,
+                    source_ref: error.slug,
+                });
+            }
+        }
+    }
+
+    for run in active.db.runs_with_status("pending_approval").map_err(err)? {
+        let name = names.get(&run.slug).cloned().unwrap_or_else(|| run.slug.clone());
+        let held = run
+            .summary
+            .clone()
+            .unwrap_or_else(|| "A large update is staged.".into());
+        items.push(InboxItem {
+            id: format!("run-{}", run.id),
+            kind: "approval".into(),
+            title: format!("Large refresh — {name}"),
+            body: format!(
+                "{held}\n\nApprove to write the update, or discard to keep the document as it is."
+            ),
+            when: run.finished_at.unwrap_or(run.started_at),
+            source_ref: run.slug,
+        });
+    }
+
+    for f in active.db.list_files().map_err(err)? {
+        if f.status != "failed" {
+            continue;
+        }
+        let file_name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path).to_string();
+        items.push(InboxItem {
+            id: format!("file-{}", f.rel_path),
+            kind: "failed-file".into(),
+            title: format!("{file_name} couldn't be read"),
+            body: format!(
+                "Ken couldn't get text out of this file, so its contents aren't searchable — {}. It's still findable by name; open it in Files for the details.",
+                f.error.as_deref().unwrap_or("the reason is unknown")
+            ),
+            when: f.mtime,
+            source_ref: f.rel_path,
+        });
+    }
+
+    for it in active.db.list_open_review_items().map_err(err)? {
+        items.push(InboxItem {
+            id: format!("item-{}", it.id),
+            kind: "stored".into(),
+            title: it.title,
+            body: it.body,
+            when: it.created_at,
+            source_ref: it.source_ref,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        inbox_rank(&a.kind)
+            .cmp(&inbox_rank(&b.kind))
+            .then(b.when.cmp(&a.when))
+    });
+
+    // Done: the simplest honest cut — discarded runs (only reachable from
+    // pending_approval), fresh runs whose ratio exceeded their threshold
+    // (i.e. held-then-approved; a first full build can also land here),
+    // and resolved stored items.
+    let since = now - 7 * 86_400;
+    let default_threshold = recipe::DEFAULT_RULES.review_threshold_pct as f64 / 100.0;
+    let mut done: Vec<InboxItem> = Vec::new();
+    for run in active.db.runs_finished_since(since).map_err(err)? {
+        let threshold = thresholds.get(&run.slug).copied().unwrap_or(default_threshold);
+        let what = match run.status.as_str() {
+            "discarded" => "Refresh discarded",
+            "fresh" if run.change_ratio.is_some_and(|r| r > threshold) => "Large refresh applied",
+            _ => continue,
+        };
+        let name = names.get(&run.slug).cloned().unwrap_or_else(|| run.slug.clone());
+        done.push(InboxItem {
+            id: format!("run-{}", run.id),
+            kind: "approval".into(),
+            title: format!("{what} — {name}"),
+            body: run.summary.clone().unwrap_or_default(),
+            when: run.finished_at.unwrap_or(run.started_at),
+            source_ref: run.slug,
+        });
+    }
+    for it in active.db.list_recent_resolved_review_items(since).map_err(err)? {
+        done.push(InboxItem {
+            id: format!("item-{}", it.id),
+            kind: "stored".into(),
+            title: it.title,
+            body: it.body,
+            when: it.resolved_at.unwrap_or(it.created_at),
+            source_ref: it.source_ref,
+        });
+    }
+    done.sort_by(|a, b| b.when.cmp(&a.when));
+
+    Ok(ReviewInbox { items, done })
+}
+
+#[tauri::command]
+fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    active
+        .db
+        .resolve_review_item(id, engine::now_epoch())
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -969,6 +1185,8 @@ pub fn run() {
             approve_run,
             discard_run,
             pending_approvals,
+            review_inbox,
+            resolve_review_item,
             set_ingest_runner_mode,
             claude_doctor,
             list_chats,
