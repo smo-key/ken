@@ -1,0 +1,51 @@
+// Display helpers: file glyph labels/tints, sizes, relative times.
+
+export interface GlyphStyle {
+  label: string;
+  bg: string;
+  border: string;
+  color: string;
+  /** Ken-maintained structured docs render in full ink. */
+  solid?: boolean;
+}
+
+const GLYPHS: Record<string, GlyphStyle> = {
+  md: { label: "MD", bg: "var(--paper)", border: "var(--border-strong)", color: "var(--ink-secondary)" },
+  txt: { label: "TXT", bg: "var(--paper)", border: "var(--border-strong)", color: "var(--ink-secondary)" },
+  code: { label: "SRC", bg: "var(--paper)", border: "var(--border-strong)", color: "var(--ink-secondary)" },
+  docx: { label: "DOC", bg: "rgba(63,94,140,0.08)", border: "rgba(63,94,140,0.3)", color: "#3F5E8C" },
+  xlsx: { label: "XLS", bg: "rgba(90,122,94,0.1)", border: "rgba(90,122,94,0.35)", color: "var(--healthy-text)" },
+  pptx: { label: "PPT", bg: "rgba(168,116,44,0.1)", border: "rgba(168,116,44,0.32)", color: "var(--needs-input-text)" },
+  pdf: { label: "PDF", bg: "rgba(163,77,63,0.09)", border: "rgba(163,77,63,0.32)", color: "var(--danger)" },
+  image: { label: "IMG", bg: "var(--sunken)", border: "var(--border-strong)", color: "var(--ink-secondary)" },
+  binary: { label: "BIN", bg: "var(--sunken)", border: "var(--border-strong)", color: "var(--ink-tertiary)" },
+};
+
+export function glyphFor(kind: string): GlyphStyle {
+  return GLYPHS[kind] ?? GLYPHS.binary;
+}
+
+export function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function timeAgo(epochSeconds: number, nowMs = Date.now()): string {
+  const s = Math.max(0, Math.floor(nowMs / 1000) - epochSeconds);
+  if (s < 10) return "just now";
+  if (s < 60) return `${s} sec ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  const d = Math.floor(h / 24);
+  if (d === 1) return "yesterday";
+  if (d < 30) return `${d} days ago`;
+  return new Date(epochSeconds * 1000).toLocaleDateString();
+}
+
+/** Formats editable by the WYSIWYG/plain editor. */
+export function isEditable(kind: string): boolean {
+  return kind === "md" || kind === "txt" || kind === "code";
+}

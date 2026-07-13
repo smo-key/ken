@@ -2,16 +2,16 @@
 
 ## 1. Workspace scaffold
 
-- [ ] 1.1 Create Cargo workspace with `crates/ken-core` (lib), `crates/ken-mcp` (stub bin), and Tauri 2 app in `src-tauri`; `cargo build` passes
+- [x] 1.1 Create Cargo workspace with `crates/ken-core` (lib), `crates/ken-mcp` (stub bin), and Tauri 2 app in `src-tauri`; `cargo build` passes
 - [ ] 1.2 Scaffold Svelte 5 + TypeScript + Vite frontend in `src/` wired to Tauri dev; `pnpm tauri dev` opens a window
-- [ ] 1.3 Add Paper & Ink tokens as CSS custom properties in `src/app.css`; bundle Source Serif 4 + IBM Plex Mono woff2 locally
+- [x] 1.3 Add Paper & Ink tokens as CSS custom properties in `src/app.css`; bundle Source Serif 4 + IBM Plex Mono woff2 locally
 - [ ] 1.4 Set up test harness: `cargo test` for ken-core with a `fixtures/` project folder (md, docx, xlsx, pptx, pdf, png, unknown-binary); vitest for frontend stores
 
 ## 2. ken-core: project + database
 
-- [ ] 2.1 Implement project model: create/adopt `.ken/project.json` (name, uuid, include/exclude, settings) with serde round-trip tests
-- [ ] 2.2 Implement app-data registry (`projects.json`) with add/remove/list and missing-path detection
-- [ ] 2.3 Create SQLite schema (files, contents, FTS5 search, meta with schema_version) via rusqlite bundled, WAL mode; migration-on-open test
+- [x] 2.1 Implement project model: create/adopt `.ken/project.json` (name, uuid, include/exclude, settings) with serde round-trip tests
+- [x] 2.2 Implement app-data registry (`projects.json`) with add/remove/list and missing-path detection
+- [x] 2.3 Create SQLite schema (files, contents, FTS5 search, meta with schema_version) via rusqlite bundled, WAL mode; migration-on-open test
 
 ## 3. ken-core: extraction + indexing
 

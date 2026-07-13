@@ -1,0 +1,7 @@
+[package]
+name = "ken-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ken-core = { path = "../ken-core" }

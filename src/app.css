@@ -1,0 +1,153 @@
+/* Ken — Paper & Ink design tokens (docs/design/design-tokens.md) */
+@import "@fontsource/source-serif-4/400.css";
+@import "@fontsource/source-serif-4/500.css";
+@import "@fontsource/source-serif-4/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+:root {
+  /* neutrals — paper */
+  --paper: #f6f4ef;
+  --surface: #fdfcfa;
+  --sunken: #efece4;
+  --sunken-2: #fbfaf6;
+  --border: #e4e0d7;
+  --border-strong: #d8d3c8;
+  --window: #ebe8e0;
+
+  /* neutrals — ink */
+  --ink: #211e19;
+  --ink-secondary: #57524a;
+  --ink-tertiary: #8b857a;
+  --terminal-bg: #1c1916;
+  --terminal-text: #c9c3b7;
+  --terminal-prompt: #b08968;
+  --terminal-dim: #6b655c;
+  --terminal-warn: #d9a441;
+
+  /* accent & status */
+  --accent: #8a5a44;
+  --accent-hover: #7a4e3a;
+  --accent-deep: #6f4534;
+  --needs-input: #a8742c;
+  --needs-input-text: #8a5e20;
+  --healthy: #5a7a5e;
+  --healthy-text: #47614b;
+  --danger: #a34d3f;
+  --match-highlight: rgba(217, 164, 65, 0.25);
+
+  /* type */
+  --font-serif: "Source Serif 4", Georgia, serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* shape & elevation */
+  --radius-control: 8px;
+  --radius-card: 12px;
+  --radius-overlay: 14px;
+  --shadow-card: 0 1px 3px rgba(33, 30, 25, 0.06);
+  --shadow-control: 0 1px 2px rgba(33, 30, 25, 0.04);
+  --shadow-overlay: 0 24px 64px rgba(33, 30, 25, 0.3);
+  --shadow-drawer: -12px 0 32px rgba(33, 30, 25, 0.14);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--paper);
+  font-family: var(--font-sans);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+#app {
+  height: 100vh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent-deep);
+  text-decoration: underline;
+}
+
+::selection {
+  background: #e8dccb;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* shared control styles */
+.btn {
+  height: 34px;
+  padding: 0 16px;
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-control);
+}
+.btn:hover {
+  background: var(--paper);
+}
+.btn-primary {
+  border-color: var(--accent-deep);
+  background: var(--accent);
+  color: var(--surface);
+  font-weight: 600;
+}
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+.btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-secondary);
+  box-shadow: none;
+}
+.btn-ghost:hover {
+  background: var(--sunken);
+  color: var(--ink);
+}
+.btn-small {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.overline {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-tertiary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: var(--paper);
+}
