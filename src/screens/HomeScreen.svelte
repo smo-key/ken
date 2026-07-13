@@ -1,8 +1,46 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
+  import { digest } from "../lib/digest.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { review } from "../lib/review.svelte";
+  import { digestMarkdown } from "../lib/assist";
+  import { isProjectLink, renderMarkdown } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
+
+  onMount(() => void digest.init());
+
+  let copied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function share() {
+    if (!digest.digest) return;
+    await navigator.clipboard.writeText(digestMarkdown(digest.digest));
+    copied = true;
+    if (copyTimer) clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copied = false), 1500);
+  }
+
+  function digestTime(epoch: number): string {
+    return new Date(epoch * 1000).toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  function chipLabel(relPath: string): string {
+    return relPath.split("/").pop() || relPath;
+  }
+
+  /** Project-relative links in the digest prose open in Files. */
+  function onDigestClick(e: MouseEvent) {
+    const a = (e.target as HTMLElement).closest("a");
+    if (a) {
+      e.preventDefault();
+      const href = a.getAttribute("href") ?? "";
+      if (isProjectLink(href)) app.openInFiles(href);
+    }
+  }
 
   const blockedSlugs = $derived(
     Object.values(ingests.live)
@@ -35,6 +73,52 @@
 <div class="wrap">
   <div class="inner">
     <h1>{today}</h1>
+
+    <div class="card">
+      <div class="head">
+        <span class="overline-accent">Today's digest</span>
+        {#if digest.digest}
+          <span class="when">
+            {digestTime(digest.digest.generatedAt)} ·
+            <button class="share" onclick={share}>{copied ? "Copied" : "share"}</button>
+          </span>
+        {/if}
+      </div>
+      {#if digest.digest}
+<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <div class="digest-body" onclick={onDigestClick}>
+          {@html renderMarkdown(digest.digest.body)}
+        </div>
+        {#if digest.digest.sources.length > 0}
+          <div class="chips">
+            {#each digest.digest.sources as source (source)}
+              <button
+                class="chip mono"
+                title={source}
+                onclick={() => app.openInFiles(source)}
+              >
+                {chipLabel(source)}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      {:else if digest.generating}
+        <p class="pulse">Ken is writing today's digest…</p>
+      {:else if digest.claudeFound}
+        <p>Ken writes you a morning digest — it'll appear here.</p>
+        {#if digest.error}
+          <p class="digest-error">Last try didn't finish — {digest.error}</p>
+        {/if}
+        <div class="actions">
+          <button class="btn" onclick={() => void digest.writeNow()}>Write it now</button>
+        </div>
+      {:else}
+        <p>
+          The daily digest needs Claude Code — once it's installed, Ken
+          writes you one each morning.
+        </p>
+      {/if}
+    </div>
 
     <div class="card">
       <div class="head">
@@ -110,9 +194,9 @@
     <div class="card muted">
       <span class="overline">Coming to Ken</span>
       <p>
-        A daily digest of what changed, chats with Claude, and a unified Review
-        inbox — arriving in upcoming releases. Ingests are live now: visit the
-        Ingests screen to set up your first structured document.
+        A living Map of your knowledge and a Timeline of how it changed —
+        arriving in upcoming releases. The digest, chats, ingests, and the
+        Review inbox are live now.
       </p>
     </div>
   </div>
@@ -216,5 +300,63 @@
   .card .overline {
     display: block;
     margin-bottom: 8px;
+  }
+  .share {
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-size: 11.5px;
+    font-family: inherit;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .share:hover {
+    text-decoration: underline;
+  }
+  .digest-body {
+    font-size: 14px;
+    line-height: 1.7;
+  }
+  .digest-body :global(p) {
+    margin: 0 0 8px;
+  }
+  .digest-body :global(p:last-child) {
+    margin-bottom: 0;
+  }
+  .chips {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .chip {
+    font-size: 11px;
+    color: var(--ink-secondary);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 2px 8px;
+    background: var(--sunken);
+    cursor: pointer;
+  }
+  .chip:hover {
+    border-color: var(--accent);
+  }
+  .pulse {
+    color: var(--ink-tertiary);
+    animation: digest-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes digest-pulse {
+    0%,
+    100% {
+      opacity: 0.45;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .digest-error {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--ink-tertiary);
   }
 </style>

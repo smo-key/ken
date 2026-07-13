@@ -233,6 +233,22 @@ export interface McpInfo {
   llmInstruction: string;
 }
 
+/** One day's digest, parsed for the Home card. */
+export interface DigestDto {
+  /** Local calendar day, yyyy-mm-dd. */
+  date: string;
+  body: string;
+  sources: string[];
+  generatedAt: number;
+}
+
+/** A ⌘K quick answer, tied to the query it answered. */
+export interface QuickAnswer {
+  query: string;
+  body: string;
+  sources: string[];
+}
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -293,6 +309,10 @@ export const api = {
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
 
+  currentDigest: () => invoke<DigestDto | null>("current_digest"),
+  refreshDigest: () => invoke<void>("refresh_digest"),
+  quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
+
   listChats: () => invoke<ChatRow[]>("list_chats"),
   chatTranscript: (chatId: string) =>
     invoke<ChatMessage[]>("chat_transcript", { chatId }),
@@ -332,4 +352,12 @@ export const api = {
     listen<null>("review-changed", () => fn()),
   onScanError: (fn: (message: string) => void): Promise<UnlistenFn> =>
     listen<string>("scan-error", (e) => fn(e.payload)),
+  onDigestUpdated: (fn: (digest: DigestDto) => void): Promise<UnlistenFn> =>
+    listen<DigestDto>("digest-updated", (e) => fn(e.payload)),
+  onDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>
+    listen<null>("digest-generating", () => fn()),
+  onDigestError: (fn: (message: string) => void): Promise<UnlistenFn> =>
+    listen<string>("digest-error", (e) => fn(e.payload)),
+  onQuickAnswer: (fn: (answer: QuickAnswer) => void): Promise<UnlistenFn> =>
+    listen<QuickAnswer>("quick-answer", (e) => fn(e.payload)),
 };

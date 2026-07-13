@@ -79,7 +79,7 @@ pub fn discover_claude() -> Option<PathBuf> {
     None
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -473,6 +473,15 @@ case "$BEHAVIOR" in
     sleep 0.2
     write_outputs
     if [ "$HEADLESS" = "1" ]; then
+      # One-shot hook: a file named oneshot_result next to the script
+      # becomes the result text (JSON-escaped), for assistant tests.
+      ONESHOT="$(dirname "$0")/oneshot_result"
+      if [ -f "$ONESHOT" ]; then
+        ESCAPED=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$ONESHOT" | awk '{printf "%s\\n", $0}')
+        ESCAPED=${ESCAPED%\\n}
+        echo '{"is_error": false, "result": "'"$ESCAPED"'"}'
+        exit 0
+      fi
       echo '{"is_error": false, "result": "done"}'
       exit 0
     fi

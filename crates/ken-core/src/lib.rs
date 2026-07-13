@@ -2,8 +2,10 @@
 //! extraction, indexing, search, and file watching. Shared by the Tauri app
 //! and the `ken-mcp` sidecar so both operate on the same data the same way.
 
+pub mod assistant;
 pub mod chat;
 pub mod db;
+pub mod digest;
 pub mod engine;
 pub mod error;
 pub mod extract;

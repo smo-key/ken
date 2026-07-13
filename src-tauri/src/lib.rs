@@ -1,15 +1,19 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
+use ken_core::assistant::{self, OneshotOutcome};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::db::{
-    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, FileRow, RunRow, SearchHit,
+    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, DigestRow, FileRow, RunRow, SearchHit,
 };
+use ken_core::digest;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
+use ken_core::runner::CancelToken;
 use ken_core::hooks::HookListener;
 use ken_core::project::Project;
 use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
@@ -36,6 +40,8 @@ struct ActiveProject {
     chat_db: Arc<Mutex<Db>>,
     sync: Arc<SyncEngine>,
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
+    /// True while a digest generation thread is running for this project.
+    digest_running: Arc<AtomicBool>,
 }
 
 struct AppState {
@@ -263,6 +269,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         chat_db,
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        digest_running: Arc::new(AtomicBool::new(false)),
     });
     drop(guard);
 
@@ -289,6 +296,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
             }
         }
     });
+
+    // The morning digest may be due the moment a project opens.
+    let _ = maybe_generate_digest(app, state, false);
 
     Ok(info)
 }
@@ -1245,6 +1255,233 @@ fn claude_doctor() -> CmdResult<ClaudeDoctor> {
 }
 
 
+// ---------- daily digest + quick answer ----------
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DigestDto {
+    /// Local calendar day, `yyyy-mm-dd`.
+    date: String,
+    body: String,
+    sources: Vec<String>,
+    generated_at: i64,
+}
+
+fn digest_dto(row: &DigestRow) -> DigestDto {
+    let parsed = digest::parse_digest(&row.content);
+    DigestDto {
+        date: row.date.clone(),
+        body: parsed.body,
+        sources: parsed.sources,
+        generated_at: row.created_at,
+    }
+}
+
+fn local_date_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn local_hour() -> u32 {
+    use chrono::Timelike;
+    chrono::Local::now().hour()
+}
+
+/// The cheap digest check, run on activate, window focus, and (with
+/// `force`) from the refresh command: today already digested → nothing;
+/// otherwise past 07:00 local with Claude installed and nothing in
+/// flight → generate in the background, store, and emit
+/// `digest-updated`. A day with nothing to report stores the quiet
+/// fallback without calling Claude.
+fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let Some(active) = guard.active.as_mut() else {
+        return Ok(());
+    };
+    let today = local_date_today();
+    if !force {
+        if active.db.get_digest(&today).map_err(err)?.is_some() {
+            return Ok(()); // already written today
+        }
+        if local_hour() < 7 {
+            return Ok(()); // the digest is a morning thing
+        }
+    }
+    let running = active.digest_running.clone();
+    if running.swap(true, Ordering::SeqCst) {
+        return if force {
+            Err("Today's digest is already being written.".into())
+        } else {
+            Ok(())
+        };
+    }
+    // Everything below must clear the flag on early return.
+    let done = |r: &Arc<AtomicBool>| r.store(false, Ordering::SeqCst);
+
+    let since = engine::now_epoch() - 86_400;
+    let sources = match digest::gather(&active.db, since) {
+        Ok(s) => s,
+        Err(e) => {
+            done(&running);
+            return Err(err(e));
+        }
+    };
+    if sources.is_quiet() {
+        // Nothing happened — say so honestly, no AI call.
+        let now = engine::now_epoch();
+        active
+            .db
+            .upsert_digest(&today, digest::QUIET_DIGEST, now)
+            .map_err(err)?;
+        done(&running);
+        if let Ok(Some(row)) = active.db.get_digest(&today) {
+            let _ = app.emit("digest-updated", digest_dto(&row));
+        }
+        return Ok(());
+    }
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        done(&running);
+        return if force {
+            Err(ken_core::runner::MISSING_CLAUDE_HELP.into())
+        } else {
+            Ok(())
+        };
+    };
+
+    let prompt = digest::compose_digest_prompt(&active.project.config.name, &sources);
+    let root = active.project.root.clone();
+    let project_id = active.project.config.id;
+    let base = guard.base_dir.clone();
+    drop(guard);
+
+    let thread_app = app.clone();
+    let thread_state = state.clone();
+    let _ = app.emit("digest-generating", ());
+    std::thread::spawn(move || {
+        let outcome = assistant::oneshot(
+            &binary,
+            &root,
+            &prompt,
+            Duration::from_secs(180),
+            &CancelToken::new(),
+        );
+        // If the user switched projects mid-write, store quietly but
+        // don't repaint the new project's Home with the old digest.
+        let still_active = || {
+            let guard = thread_state.lock().unwrap();
+            guard
+                .active
+                .as_ref()
+                .is_some_and(|a| a.project.config.id == project_id)
+        };
+        match outcome {
+            Ok(OneshotOutcome::Completed(text)) => {
+                if let Ok(mut db) = Db::open(&base, project_id) {
+                    let _ = db.upsert_digest(&today, &text, engine::now_epoch());
+                    if let Ok(Some(row)) = db.get_digest(&today) {
+                        if still_active() {
+                            let _ = thread_app.emit("digest-updated", digest_dto(&row));
+                        }
+                    }
+                }
+            }
+            Ok(OneshotOutcome::TimedOut) if still_active() => {
+                let _ = thread_app.emit(
+                    "digest-error",
+                    "Writing the digest took too long and was stopped — it'll try again later.",
+                );
+            }
+            Ok(OneshotOutcome::Failed(detail)) if still_active() => {
+                let _ = thread_app.emit("digest-error", detail);
+            }
+            Err(e) => {
+                let _ = thread_app.emit("digest-error", e.to_string());
+            }
+            _ => {}
+        }
+        running.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Today's digest, parsed for the Home card. None until it's written.
+#[tauri::command]
+fn current_digest(state: State<SharedState>) -> CmdResult<Option<DigestDto>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    Ok(active
+        .db
+        .get_digest(&local_date_today())
+        .map_err(err)?
+        .map(|row| digest_dto(&row)))
+}
+
+/// Force-regenerate today's digest ("Write it now" / re-run).
+#[tauri::command]
+fn refresh_digest(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    maybe_generate_digest(&app, state.inner(), true)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QuickAnswerEvent {
+    query: String,
+    body: String,
+    sources: Vec<String>,
+}
+
+fn quick_answer_prompt(query: &str, hits: &[SearchHit]) -> String {
+    let mut p = format!(
+        "Question: {query}\n\nMaterial from the project's search index:\n\n"
+    );
+    for hit in hits {
+        let snippet = hit.snippet.replace("<mark>", "").replace("</mark>", "");
+        p.push_str(&format!("- {}: {}\n", hit.rel_path, snippet));
+    }
+    p.push_str(
+        "\nAnswer the question in one or two sentences using ONLY this \
+material; name the source paths you used; if the material doesn't answer \
+it, say you don't know. End with a final line `SOURCES: path1, path2` \
+listing the project-relative paths you used (omit the line if none).\n",
+    );
+    p
+}
+
+/// Kick off a background quick answer for a ⌘K query. Returns false when
+/// Claude Code is missing (the overlay stops asking); the answer arrives
+/// later as a `quick-answer` event and never blocks the match list.
+#[tauri::command]
+fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> CmdResult<bool> {
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return Ok(false);
+    };
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let hits = active.db.search(&query, 8).map_err(err)?;
+    let root = active.project.root.clone();
+    drop(guard);
+    if hits.is_empty() {
+        return Ok(true); // nothing to ground an answer on — no card
+    }
+    let prompt = quick_answer_prompt(&query, &hits);
+    std::thread::spawn(move || {
+        if let Ok(OneshotOutcome::Completed(text)) = assistant::oneshot(
+            &binary,
+            &root,
+            &prompt,
+            Duration::from_secs(60),
+            &CancelToken::new(),
+        ) {
+            let parsed = digest::parse_digest(&text);
+            let _ = app.emit("quick-answer", QuickAnswerEvent {
+                query,
+                body: parsed.body,
+                sources: parsed.sources,
+            });
+        }
+    });
+    Ok(true)
+}
+
 // ---------- chat commands ----------
 
 #[tauri::command]
@@ -1525,7 +1762,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(state)
-        // Focus = "the user is back" — the moment to fetch teammates' work.
+        // Focus = "the user is back" — the moment to fetch teammates'
+        // work and to check whether today's digest is due.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(true) = event {
                 use tauri::Manager;
@@ -1537,6 +1775,7 @@ pub fn run() {
                 if let Some(sync) = sync {
                     sync.pull_now();
                 }
+                let _ = maybe_generate_digest(window.app_handle(), state.inner(), false);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1575,6 +1814,9 @@ pub fn run() {
             set_ingest_runner_mode,
             claude_doctor,
             mcp_info,
+            current_digest,
+            refresh_digest,
+            quick_answer,
             list_chats,
             chat_transcript,
             create_chat,

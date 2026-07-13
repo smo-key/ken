@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     conn: Connection,
@@ -215,6 +215,18 @@ impl Db {
                 );
                 CREATE INDEX IF NOT EXISTS review_items_status
                     ON review_items(status, created_at DESC);
+                "#,
+            )?;
+        }
+        if version < 5 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS digests (
+                    id         INTEGER PRIMARY KEY,
+                    date       TEXT NOT NULL UNIQUE,
+                    content    TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
                 "#,
             )?;
         }
@@ -621,6 +633,54 @@ impl Db {
         Ok(rows)
     }
 
+    // --- daily digests (one row per local calendar day) ---
+
+    /// Store the digest for a local day, replacing any earlier one.
+    pub fn upsert_digest(&mut self, date: &str, content: &str, created_at: i64) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO digests (date, content, created_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(date) DO UPDATE SET content = ?2, created_at = ?3"#,
+            params![date, content, created_at],
+        )?;
+        Ok(())
+    }
+
+    fn map_digest(r: &rusqlite::Row) -> rusqlite::Result<DigestRow> {
+        Ok(DigestRow {
+            id: r.get(0)?,
+            date: r.get(1)?,
+            content: r.get(2)?,
+            created_at: r.get(3)?,
+        })
+    }
+
+    pub fn get_digest(&self, date: &str) -> Result<Option<DigestRow>> {
+        match self.conn.query_row(
+            "SELECT id, date, content, created_at FROM digests WHERE date = ?1",
+            params![date],
+            Self::map_digest,
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The newest digest by date (`yyyy-mm-dd` sorts chronologically).
+    pub fn latest_digest(&self) -> Result<Option<DigestRow>> {
+        match self.conn.query_row(
+            "SELECT id, date, content, created_at FROM digests
+             ORDER BY date DESC LIMIT 1",
+            [],
+            Self::map_digest,
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // --- chats ---
 
     pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
@@ -769,6 +829,18 @@ pub struct ChatRow {
     pub created_at: i64,
     pub last_active_at: i64,
     pub archived: bool,
+}
+
+/// One day's digest. `content` is the raw model output — a paragraph
+/// plus an optional `SOURCES:` line — parsed at read time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DigestRow {
+    pub id: i64,
+    /// Local calendar day, `yyyy-mm-dd`.
+    pub date: String,
+    pub content: String,
+    pub created_at: i64,
 }
 
 /// A stored Review item — the substrate for inbox kinds that have no
@@ -1047,6 +1119,51 @@ mod tests {
             .unwrap();
         assert_eq!(db.list_open_review_items().unwrap().len(), 1);
         assert_eq!(db.list_open_review_items().unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn v4_db_migrates_to_v5() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Rewind a fresh DB to v4 state.
+            let mut db = Db::open_at(&path).unwrap();
+            db.upsert_file("notes/a.md", "md", 10, 1, "indexed", None, "kept").unwrap();
+            db.conn.execute("DROP TABLE digests", []).unwrap();
+            db.conn
+                .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+                .unwrap();
+        }
+        let mut db = Db::open_at(&path).unwrap();
+        // v5 table exists again and is usable; earlier data survives.
+        db.upsert_digest("2026-07-12", "A quiet day.", 100).unwrap();
+        assert!(db.get_digest("2026-07-12").unwrap().is_some());
+        assert_eq!(db.file_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn digest_upsert_replaces_same_day() {
+        let mut db = Db::open_in_memory().unwrap();
+        assert!(db.get_digest("2026-07-12").unwrap().is_none());
+        assert!(db.latest_digest().unwrap().is_none());
+
+        db.upsert_digest("2026-07-11", "Yesterday.", 100).unwrap();
+        db.upsert_digest("2026-07-12", "First draft.", 200).unwrap();
+        db.upsert_digest("2026-07-12", "Second draft.\nSOURCES: a.md", 300)
+            .unwrap();
+
+        let today = db.get_digest("2026-07-12").unwrap().unwrap();
+        assert_eq!(today.content, "Second draft.\nSOURCES: a.md");
+        assert_eq!(today.created_at, 300);
+        // Still one row per day.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM digests WHERE date='2026-07-12'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let latest = db.latest_digest().unwrap().unwrap();
+        assert_eq!(latest.date, "2026-07-12");
     }
 
     #[test]
