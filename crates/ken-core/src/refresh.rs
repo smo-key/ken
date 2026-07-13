@@ -286,7 +286,7 @@ struct Staged {
     removals: Vec<String>,
 }
 
-fn read_staging(project: &Project, recipe: &Recipe, staging: &Path) -> Result<Staged> {
+fn read_staging(_project: &Project, recipe: &Recipe, staging: &Path) -> Result<Staged> {
     let mut files = Vec::new();
     if staging.is_dir() {
         collect_files(staging, staging, &mut files)?;

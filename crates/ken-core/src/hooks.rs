@@ -4,7 +4,6 @@
 //! project's `.claude/settings.local.json` without touching user settings.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -191,7 +190,7 @@ pub fn install_hooks(project_root: &Path, hook_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
 
     fn post(port: u16, body: &str) {

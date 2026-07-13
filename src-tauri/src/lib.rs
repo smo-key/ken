@@ -5,8 +5,11 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use ken_core::db::{db_path, Db, FileRow, SearchHit};
+use ken_core::db::{db_path, Db, FileRow, RunRow, SearchHit};
+use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
+use ken_core::hooks::HookListener;
 use ken_core::project::Project;
+use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
 use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::scan::{self, ScanStats};
 use ken_core::watch::{self, WatchHandle};
@@ -15,10 +18,12 @@ struct ActiveProject {
     project: Project,
     db: Db,
     _watch: WatchHandle,
+    engine: Arc<IngestEngine>,
 }
 
 struct AppState {
     base_dir: PathBuf,
+    hooks: Option<Arc<HookListener>>,
     active: Option<ActiveProject>,
 }
 
@@ -31,6 +36,7 @@ struct ProjectInfo {
     name: String,
     root: String,
     excluded: Vec<String>,
+    ingest_runner: String,
 }
 
 impl ProjectInfo {
@@ -40,6 +46,13 @@ impl ProjectInfo {
             name: project.config.name.clone(),
             root: project.root.to_string_lossy().into_owned(),
             excluded: project.config.excluded.clone(),
+            ingest_runner: project
+                .config
+                .extra
+                .get("ingestRunner")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hidden-tui")
+                .to_string(),
         }
     }
 }
@@ -76,12 +89,38 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
     let watch_db_path = db_path(&guard.base_dir, project.config.id);
 
+    let hooks = match &guard.hooks {
+        Some(h) => h.clone(),
+        None => {
+            let h = Arc::new(HookListener::start().map_err(err)?);
+            guard.hooks = Some(h.clone());
+            h
+        }
+    };
+    let engine_app = app.clone();
+    let engine = Arc::new(
+        IngestEngine::start(
+            project.root.clone(),
+            watch_db_path.clone(),
+            hooks,
+            EngineConfig::default(),
+            move |ev: IngestEvent| {
+                let _ = engine_app.emit("ingest-run-changed", ev);
+            },
+        )
+        .map_err(err)?,
+    );
+
     let emit_app = app.clone();
+    let watch_engine = engine.clone();
     let watch = watch::start(
         project.clone(),
         watch_db_path,
         Duration::from_secs(2),
         move |stats: &ScanStats| {
+            if !stats.changed_paths.is_empty() {
+                watch_engine.sources_changed(stats.changed_paths.clone());
+            }
             let _ = emit_app.emit("index-updated", stats.clone());
         },
     )
@@ -92,6 +131,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         project: project.clone(),
         db,
         _watch: watch,
+        engine,
     });
     drop(guard);
 
@@ -296,11 +336,241 @@ fn file_mtime(state: State<SharedState>, rel_path: String) -> CmdResult<i64> {
         .unwrap_or(0))
 }
 
+
+// ---------- ingest commands ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestSummary {
+    entry: RecipeEntry,
+    last_run: Option<RunRow>,
+    resolved_rules: Option<ResolvedRules>,
+    stale: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestDetail {
+    recipe: Recipe,
+    runs: Vec<RunRow>,
+    resolved_rules: ResolvedRules,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestForm {
+    slug: Option<String>,
+    name: String,
+    #[serde(default)]
+    description: String,
+    instruction: String,
+    #[serde(default)]
+    sources: Vec<String>,
+    output: String,
+    mode: Mode,
+    refresh: Refresh,
+    #[serde(default)]
+    rules: Option<RulesOverride>,
+}
+
+fn kebab(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() { "ingest".into() } else { trimmed }
+}
+
+#[tauri::command]
+fn list_ingests(state: State<SharedState>) -> CmdResult<Vec<IngestSummary>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let now = engine::now_epoch();
+    let mut out = Vec::new();
+    for entry in recipe::list(&active.project).map_err(err)? {
+        let (last_run, rules, stale) = match &entry {
+            RecipeEntry::Ok { recipe: r } => {
+                let last = active.db.list_runs(&r.slug, 1).map_err(err)?.into_iter().next();
+                let rules = recipe::resolve_rules(r, &active.project);
+                let stale = last
+                    .as_ref()
+                    .filter(|l| l.status == "fresh")
+                    .map(|l| now - l.started_at > rules.stale_days as i64 * 86_400)
+                    .unwrap_or(false);
+                (last, Some(rules), stale)
+            }
+            RecipeEntry::Broken { .. } => (None, None, false),
+        };
+        out.push(IngestSummary { entry, last_run, resolved_rules: rules, stale });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn get_ingest(state: State<SharedState>, slug: String) -> CmdResult<IngestDetail> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let recipe = recipe::load_slug(&active.project, &slug).map_err(err)?;
+    let runs = active.db.list_runs(&slug, 20).map_err(err)?;
+    let resolved_rules = recipe::resolve_rules(&recipe, &active.project);
+    Ok(IngestDetail { recipe, runs, resolved_rules })
+}
+
+#[tauri::command]
+fn save_ingest(state: State<SharedState>, form: IngestForm) -> CmdResult<Recipe> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let slug = match form.slug {
+        Some(s) => s,
+        None => {
+            // New ingest: derive a unique slug from the name.
+            let base = kebab(&form.name);
+            let mut slug = base.clone();
+            let mut n = 2;
+            while recipe::recipe_path(&active.project.root, &slug).exists() {
+                slug = format!("{base}-{n}");
+                n += 1;
+            }
+            slug
+        }
+    };
+    // Editing goes through the loaded recipe so unknown frontmatter fields
+    // survive; a fresh slug builds from scratch.
+    let mut recipe = recipe::load_slug(&active.project, &slug).unwrap_or_else(|_| {
+        Recipe::build(
+            slug.clone(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            String::from("out.md"),
+            form.mode,
+            form.refresh,
+            None,
+            String::from("-"),
+        )
+    });
+    recipe.update_from_form(
+        form.name,
+        form.description,
+        form.sources,
+        form.output,
+        form.mode,
+        form.refresh,
+        form.rules,
+        form.instruction,
+    );
+    recipe::save(&active.project, &recipe).map_err(err)?;
+    let recipe = recipe::load_slug(&active.project, &recipe.slug).map_err(err)?;
+    Ok(recipe)
+}
+
+#[tauri::command]
+fn delete_ingest(state: State<SharedState>, slug: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    recipe::delete(&active.project, &slug).map_err(err)
+}
+
+#[tauri::command]
+fn run_ingest(state: State<SharedState>, slug: String, full: Option<bool>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    active.engine.trigger(&slug, full.unwrap_or(true));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_run(state: State<SharedState>, slug: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    active.engine.cancel(&slug);
+    Ok(())
+}
+
+#[tauri::command]
+fn approve_run(state: State<SharedState>, run_id: i64) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    engine::approve_run(&active.project, &mut active.db, run_id).map_err(err)?;
+    // Applied files land on disk; index them promptly.
+    let _ = scan::scan(&active.project, &mut active.db);
+    Ok(())
+}
+
+#[tauri::command]
+fn discard_run(state: State<SharedState>, run_id: i64) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    engine::discard_run(&active.project, &mut active.db, run_id).map_err(err)
+}
+
+#[tauri::command]
+fn pending_approvals(state: State<SharedState>) -> CmdResult<Vec<RunRow>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    active.db.runs_with_status("pending_approval").map_err(err)
+}
+
+#[tauri::command]
+fn set_ingest_runner_mode(state: State<SharedState>, mode: String) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    if mode != "hidden-tui" && mode != "headless" {
+        return Err("unknown runner mode".into());
+    }
+    active
+        .project
+        .config
+        .extra
+        .insert("ingestRunner".into(), serde_json::Value::String(mode));
+    active.project.save().map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeDoctor {
+    found: bool,
+    path: Option<String>,
+    version: Option<String>,
+    help: String,
+}
+
+#[tauri::command]
+fn claude_doctor() -> CmdResult<ClaudeDoctor> {
+    match ken_core::runner::discover_claude() {
+        Some(path) => {
+            let version = std::process::Command::new(&path)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            Ok(ClaudeDoctor {
+                found: true,
+                path: Some(path.to_string_lossy().into_owned()),
+                version,
+                help: String::new(),
+            })
+        }
+        None => Ok(ClaudeDoctor {
+            found: false,
+            path: None,
+            version: None,
+            help: ken_core::runner::MISSING_CLAUDE_HELP.to_string(),
+        }),
+    }
+}
+
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
     let state: SharedState = Arc::new(Mutex::new(AppState {
         base_dir,
+        hooks: None,
         active: None,
     }));
 
@@ -325,6 +595,17 @@ pub fn run() {
             reindex,
             open_external,
             file_mtime,
+            list_ingests,
+            get_ingest,
+            save_ingest,
+            delete_ingest,
+            run_ingest,
+            cancel_run,
+            approve_run,
+            discard_run,
+            pending_approvals,
+            set_ingest_runner_mode,
+            claude_doctor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ken");

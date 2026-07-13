@@ -1,6 +1,18 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
+  import { ingests } from "../lib/ingests.svelte";
   import { timeAgo } from "../lib/format";
+
+  const blockedSlugs = $derived(
+    Object.values(ingests.live)
+      .filter((ev) => ev.status === "blocked")
+      .map((ev) => ev.slug),
+  );
+
+  function openIngest(slug: string) {
+    app.screen = "ingests";
+    void ingests.select(slug);
+  }
 
   const today = new Date().toLocaleDateString(undefined, {
     weekday: "long",
@@ -39,6 +51,27 @@
       </div>
     </div>
 
+    {#if ingests.pending.length > 0 || blockedSlugs.length > 0}
+      <div class="section-label">Waiting on you</div>
+      {#each ingests.pending as run (run.id)}
+        <div class="callout attention">
+          <span class="cdot amber"></span>
+          <div class="ctext">
+            <strong>{run.slug}</strong> finished a big refresh —
+            {run.summary ?? "review it before Ken writes it."}
+          </div>
+          <button class="btn btn-small" onclick={() => openIngest(run.slug)}>Review</button>
+        </div>
+      {/each}
+      {#each blockedSlugs as slug (slug)}
+        <div class="callout attention">
+          <span class="cdot amber"></span>
+          <div class="ctext"><strong>{slug}</strong> is waiting on your input.</div>
+          <button class="btn btn-small" onclick={() => openIngest(slug)}>Open</button>
+        </div>
+      {/each}
+    {/if}
+
     {#if app.failedFiles.length > 0}
       <div class="section-label">Needs a look</div>
       {#each app.failedFiles.slice(0, 5) as f (f.relPath)}
@@ -56,9 +89,9 @@
     <div class="card muted">
       <span class="overline">Coming to Ken</span>
       <p>
-        A daily digest of what changed, AI-maintained structured documents, chats
-        with Claude, and a Review inbox — arriving in upcoming releases, all built
-        on the index this version keeps fresh.
+        A daily digest of what changed, chats with Claude, and a unified Review
+        inbox — arriving in upcoming releases. Ingests are live now: visit the
+        Ingests screen to set up your first structured document.
       </p>
     </div>
   </div>
@@ -147,6 +180,12 @@
     background: var(--danger);
     margin-top: 5px;
     flex: none;
+  }
+  .cdot.amber {
+    background: var(--needs-input);
+  }
+  .callout.attention {
+    border-color: rgba(168, 116, 44, 0.3);
   }
   .ctext {
     flex: 1;

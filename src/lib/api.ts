@@ -7,6 +7,7 @@ export interface ProjectInfo {
   name: string;
   root: string;
   excluded: string[];
+  ingestRunner: "hidden-tui" | "headless";
 }
 
 export interface RegistryEntryStatus {
@@ -51,6 +52,95 @@ export interface TreeData {
   folders: FolderInfo[];
 }
 
+export type IngestMode = "single" | "collection";
+export type IngestRefresh = "on-change" | "manual";
+
+export interface RulesOverride {
+  reviewThresholdPct?: number;
+  staleDays?: number;
+}
+
+export interface ResolvedRules {
+  reviewThresholdPct: number;
+  staleDays: number;
+}
+
+export interface Recipe {
+  slug: string;
+  name: string;
+  description: string;
+  sources: string[];
+  output: string;
+  mode: IngestMode;
+  refresh: IngestRefresh;
+  rules: RulesOverride | null;
+  instruction: string;
+}
+
+export type RecipeEntry =
+  | { kind: "ok"; recipe: Recipe }
+  | { kind: "broken"; error: { slug: string; reason: string } };
+
+export type RunStatus =
+  | "running"
+  | "fresh"
+  | "blocked"
+  | "pending_approval"
+  | "failed"
+  | "discarded"
+  | "cancelled";
+
+export interface RunRow {
+  id: number;
+  slug: string;
+  sessionId: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+  status: RunStatus;
+  summary: string | null;
+  error: string | null;
+  changeRatio: number | null;
+}
+
+export interface IngestSummary {
+  entry: RecipeEntry;
+  lastRun: RunRow | null;
+  resolvedRules: ResolvedRules | null;
+  stale: boolean;
+}
+
+export interface IngestDetail {
+  recipe: Recipe;
+  runs: RunRow[];
+  resolvedRules: ResolvedRules;
+}
+
+export interface IngestEvent {
+  slug: string;
+  runId: number;
+  status: RunStatus;
+  detail: string | null;
+}
+
+export interface IngestForm {
+  slug?: string;
+  name: string;
+  description?: string;
+  instruction: string;
+  sources: string[];
+  output: string;
+  mode: IngestMode;
+  refresh: IngestRefresh;
+  rules?: RulesOverride | null;
+}
+
+export interface ClaudeDoctor {
+  found: boolean;
+  path: string | null;
+  version: string | null;
+  help: string;
+}
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
@@ -75,6 +165,22 @@ export const api = {
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
   fileMtime: (relPath: string) => invoke<number>("file_mtime", { relPath }),
 
+  listIngests: () => invoke<IngestSummary[]>("list_ingests"),
+  getIngest: (slug: string) => invoke<IngestDetail>("get_ingest", { slug }),
+  saveIngest: (form: IngestForm) => invoke<Recipe>("save_ingest", { form }),
+  deleteIngest: (slug: string) => invoke<void>("delete_ingest", { slug }),
+  runIngest: (slug: string, full = true) =>
+    invoke<void>("run_ingest", { slug, full }),
+  cancelRun: (slug: string) => invoke<void>("cancel_run", { slug }),
+  approveRun: (runId: number) => invoke<void>("approve_run", { runId }),
+  discardRun: (runId: number) => invoke<void>("discard_run", { runId }),
+  pendingApprovals: () => invoke<RunRow[]>("pending_approvals"),
+  setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
+    invoke<void>("set_ingest_runner_mode", { mode }),
+  claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
+
+  onIngestRunChanged: (fn: (ev: IngestEvent) => void): Promise<UnlistenFn> =>
+    listen<IngestEvent>("ingest-run-changed", (e) => fn(e.payload)),
   onIndexUpdated: (fn: (stats: ScanStats) => void): Promise<UnlistenFn> =>
     listen<ScanStats>("index-updated", (e) => fn(e.payload)),
   onFileSaved: (fn: (relPath: string) => void): Promise<UnlistenFn> =>

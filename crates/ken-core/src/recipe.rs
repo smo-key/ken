@@ -88,6 +88,59 @@ pub struct Recipe {
     pub(crate) extra: serde_yaml::Mapping,
 }
 
+impl Recipe {
+    /// Build a brand-new recipe (no preserved extra fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        slug: String,
+        name: String,
+        description: String,
+        sources: Vec<String>,
+        output: String,
+        mode: Mode,
+        refresh: Refresh,
+        rules: Option<RulesOverride>,
+        instruction: String,
+    ) -> Recipe {
+        Recipe {
+            slug,
+            name,
+            description,
+            sources,
+            output,
+            mode,
+            refresh,
+            rules,
+            instruction,
+            extra: serde_yaml::Mapping::new(),
+        }
+    }
+
+    /// Overwrite the form-editable fields, keeping slug and any unknown
+    /// frontmatter fields intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_from_form(
+        &mut self,
+        name: String,
+        description: String,
+        sources: Vec<String>,
+        output: String,
+        mode: Mode,
+        refresh: Refresh,
+        rules: Option<RulesOverride>,
+        instruction: String,
+    ) {
+        self.name = name;
+        self.description = description;
+        self.sources = sources;
+        self.output = output;
+        self.mode = mode;
+        self.refresh = refresh;
+        self.rules = rules;
+        self.instruction = instruction;
+    }
+}
+
 /// A recipe file that failed to parse — surfaced, never fatal.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

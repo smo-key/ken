@@ -1,8 +1,18 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
+  import { ingests } from "../lib/ingests.svelte";
+  import { api } from "../lib/api";
 
   let busy = $state(false);
   let toggling = $state(false);
+  let runnerMode = $state<"hidden-tui" | "headless">(
+    app.project?.ingestRunner ?? "hidden-tui",
+  );
+
+  async function setRunnerMode(mode: "hidden-tui" | "headless") {
+    runnerMode = mode;
+    await api.setIngestRunnerMode(mode);
+  }
 
   const included = $derived(
     app.folders.filter((f) => !f.excluded).map((f) => f.relPath),
@@ -96,12 +106,52 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-title">AI runner</div>
+      {#if ingests.doctor?.found}
+        <p class="note">
+          <span class="ok-dot"></span>Claude Code found
+          {#if ingests.doctor.version}({ingests.doctor.version}){/if}
+          <span class="mono small">{ingests.doctor.path}</span>
+        </p>
+      {:else}
+        <p class="note warn">
+          Claude Code isn't installed — ingests can't run until it is.
+          <span class="mono small">npm i -g @anthropic-ai/claude-code</span>
+        </p>
+      {/if}
+      <div class="row">
+        <span class="label">Mode</span>
+        <label class="radio">
+          <input
+            type="radio"
+            name="runner"
+            checked={runnerMode === "hidden-tui"}
+            onchange={() => setRunnerMode("hidden-tui")}
+          />
+          Interactive session <span class="soft">(recommended — you can watch or step in)</span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label"></span>
+        <label class="radio">
+          <input
+            type="radio"
+            name="runner"
+            checked={runnerMode === "headless"}
+            onchange={() => setRunnerMode("headless")}
+          />
+          Headless <span class="soft">(runs invisibly, no mid-run questions)</span>
+        </label>
+      </div>
+    </div>
+
     <div class="card muted">
       <div class="card-title">Coming to Ken</div>
       <p class="note">
         MCP server for your agents, Git &amp; shared-drive sync with conflict
-        review, AI ingests with global rules, and chats — each arrives in an
-        upcoming release.
+        review, chats with Claude, and a unified Review inbox — each arrives in
+        an upcoming release.
       </p>
     </div>
   </div>
@@ -190,5 +240,30 @@
   }
   .btn {
     margin-left: auto;
+  }
+  .radio {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .radio input {
+    accent-color: var(--accent);
+  }
+  .soft {
+    color: var(--ink-tertiary);
+    font-size: 12px;
+  }
+  .ok-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--healthy);
+    margin-right: 7px;
+  }
+  .note.warn {
+    color: var(--needs-input-text);
   }
 </style>

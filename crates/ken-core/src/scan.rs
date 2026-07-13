@@ -18,6 +18,10 @@ pub struct ScanStats {
     pub removed: usize,
     pub failed: usize,
     pub unchanged: usize,
+    /// Paths that were added, updated, or removed this scan — consumed by
+    /// the ingest engine to decide which recipes to queue.
+    #[serde(skip)]
+    pub changed_paths: Vec<String>,
 }
 
 /// File status values stored in the index.
@@ -73,6 +77,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if !on_disk.contains_key(rel) {
             db.remove_file(rel)?;
             stats.removed += 1;
+            stats.changed_paths.push(rel.clone());
         }
     }
 
@@ -89,6 +94,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if index_one(project, db, rel, *size, *mtime)? == STATUS_FAILED {
             stats.failed += 1;
         }
+        stats.changed_paths.push(rel.clone());
     }
 
     Ok(stats)

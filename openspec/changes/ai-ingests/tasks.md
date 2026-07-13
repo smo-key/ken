@@ -23,20 +23,20 @@
 
 ## 4. Tauri commands + events
 
-- [ ] 4.1 Commands: list_ingests, get_ingest (recipe+runs), save_ingest (form data→recipe file), delete_ingest, run_ingest (now/full), cancel_run, approve_run, discard_run, set_ingest_runner_mode, claude_doctor (binary presence/version)
-- [ ] 4.2 Events: ingest-run-changed (status transitions) wired from queue; frontend store consumes into reactive run state
+- [x] 4.1 Commands: list_ingests, get_ingest (recipe+runs), save_ingest (form data→recipe file), delete_ingest, run_ingest (now/full), cancel_run, approve_run, discard_run, set_ingest_runner_mode, claude_doctor (binary presence/version)
+- [x] 4.2 Events: ingest-run-changed (status transitions) wired from queue; frontend store consumes into reactive run state
 
 ## 5. Frontend
 
-- [ ] 5.1 Ingests store + api wrappers with types
-- [ ] 5.2 Ingests screen: list pane with status dots/captions per prototype; detail cards (Sources chips, Instruction inline-edit, Output, Rules inherited/overridden, Recent runs with Approve/Discard/Cancel/error detail); Run now button
-- [ ] 5.3 New/edit ingest form (name, instruction, source folders, output picker + single/collection, refresh toggle) writing through save_ingest
-- [ ] 5.4 Template gallery (7 bundled templates as ?raw imports) with use-template flow
-- [ ] 5.5 Home wiring: pending-approval + blocked runs as waiting-on-you cards; Claude-missing setup banner on Ingests
-- [ ] 5.6 Settings: ingestRunner mode toggle + claude doctor status line
+- [x] 5.1 Ingests store + api wrappers with types
+- [x] 5.2 Ingests screen: list pane with status dots/captions per prototype; detail cards (Sources chips, Instruction inline-edit, Output, Rules inherited/overridden, Recent runs with Approve/Discard/Cancel/error detail); Run now button
+- [x] 5.3 New/edit ingest form (name, instruction, source folders, output picker + single/collection, refresh toggle) writing through save_ingest
+- [x] 5.4 Template gallery (7 bundled templates as ?raw imports) with use-template flow
+- [x] 5.5 Home wiring: pending-approval + blocked runs as waiting-on-you cards; Claude-missing setup banner on Ingests
+- [x] 5.6 Settings: ingestRunner mode toggle + claude doctor status line
 
 ## 6. Verification
 
-- [ ] 6.1 cargo + vitest green; fake-claude end-to-end: recipe → run → staging → threshold hold → approve → output file updated and indexed
+- [x] 6.1 cargo + vitest green; fake-claude end-to-end: recipe → run → staging → threshold hold → approve → output file updated and indexed
 - [ ] 6.2 Live run-through with real `claude` on the fixture project (People template): create from template, run, inspect output, verify incremental second run; fix gaps
 - [ ] 6.3 Update README status; commit
