@@ -27,5 +27,5 @@
 ## 5. Verification
 
 - [x] 5.1 cargo + vitest + svelte-check green; fake-CLI engine tests cover the spec scenarios
-- [ ] 5.2 Live run-through with real claude: converse, toggle terminal, resume after restart; fix gaps
-- [ ] 5.3 README status; commit
+- [x] 5.2 Live run-through with real claude: converse, toggle terminal, resume after restart; fix gaps
+- [x] 5.3 README status; commit

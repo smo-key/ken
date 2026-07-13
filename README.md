@@ -16,6 +16,9 @@ agents, and Git/shared-drive conflict review arrive in upcoming releases
   Decisions, Requirements…) fresh as files change, run through your local
   Claude Code CLI with review rules: human edits win, big refreshes wait
   for approval. Template library included.
+- **Chat drawer** — talk to your project's knowledge: friendly chat by
+  default, the real Claude terminal one keystroke away, same session in
+  both. Pins, status badges, and live views into running ingests.
 
 ## Development
 

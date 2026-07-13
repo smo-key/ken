@@ -484,6 +484,86 @@ mod tests {
             ChatUpdate::Message { content, .. } if content.contains("two"))));
     }
 
+    /// Live test against the real Claude CLI — run explicitly with
+    /// `cargo test -p ken-core real_chat -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_chat_conversation_and_terminal() {
+        let Some(binary) = crate::runner::discover_claude() else {
+            panic!("claude CLI not found");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fact.md"),
+            "# Project fact\nThe secret launch codename is Bluebird.\n",
+        )
+        .unwrap();
+
+        let (tx, rx) = channel();
+        let engine = ChatEngine::new(binary.clone(), dir.path().to_path_buf(), move |u| {
+            let _ = tx.send(u);
+        });
+        let chat_id = uuid::Uuid::new_v4().to_string();
+
+        // Turn 1.
+        engine
+            .send(&chat_id, "Read fact.md and reply with just the codename.", false)
+            .unwrap();
+        let updates = collect_until_done(&rx, 240);
+        let reply: String = updates
+            .iter()
+            .filter_map(|u| match u {
+                ChatUpdate::Message { role, content, .. } if role == "assistant" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turn 1 reply: {reply}");
+        assert!(reply.contains("Bluebird"), "reply was: {reply}");
+        assert!(matches!(updates.last().unwrap(),
+            ChatUpdate::Status { status, .. } if status == "done"));
+
+        // Kill the process, then resume in a fresh one: context must survive.
+        engine.stop(&chat_id);
+        engine
+            .send(&chat_id, "Repeat the codename you just told me, nothing else.", true)
+            .unwrap();
+        let updates2 = collect_until_done(&rx, 240);
+        let reply2: String = updates2
+            .iter()
+            .filter_map(|u| match u {
+                ChatUpdate::Message { role, content, .. } if role == "assistant" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turn 2 reply (after resume): {reply2}");
+        assert!(reply2.contains("Bluebird"), "resume lost context: {reply2}");
+        engine.stop(&chat_id);
+
+        // Terminal attach on the same session: the TUI must paint something.
+        std::thread::sleep(Duration::from_millis(500));
+        let (dtx, drx) = channel::<usize>();
+        let mut pty = attach_terminal(&binary, dir.path(), &chat_id, true, move |b| {
+            let _ = dtx.send(b.len());
+        })
+        .unwrap();
+        let mut total = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while total < 500 && Instant::now() < deadline {
+            if let Ok(n) = drx.recv_timeout(Duration::from_millis(500)) {
+                total += n;
+            }
+        }
+        eprintln!("terminal painted {total} bytes");
+        assert!(total >= 500, "TUI produced almost no output: {total} bytes");
+        pty.kill();
+    }
+
     #[test]
     fn terminal_attach_round_trip() {
         let dir = tempfile::tempdir().unwrap();
