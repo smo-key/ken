@@ -68,8 +68,10 @@ class ChatsStore {
     }
     this.activeId = id;
     this.transcript = await api.chatTranscript(id).catch(() => []);
-    // Ingest sessions open straight into the terminal — that's where they live.
-    if (this.rows.find((r) => r.id === id)?.kind === "ingest") {
+    // Ingest and research sessions open straight into the terminal —
+    // that's where they live.
+    const kind = this.rows.find((r) => r.id === id)?.kind;
+    if (kind === "ingest" || kind === "research") {
       await this.enterTerminal();
     }
   }

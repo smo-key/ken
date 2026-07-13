@@ -204,7 +204,7 @@ export type ChatStatus = "working" | "needs_input" | "done" | "error";
 export interface ChatRow {
   id: string;
   title: string;
-  kind: "user" | "ingest";
+  kind: "user" | "ingest" | "research";
   pinned: boolean;
   status: ChatStatus;
   createdAt: number;
@@ -332,6 +332,12 @@ export const api = {
     invoke<void>("chat_pty_input", { chatId, data }),
   chatPtyResize: (chatId: string, rows: number, cols: number) =>
     invoke<void>("chat_pty_resize", { chatId, rows, cols }),
+
+  startResearch: (question: string, outputDir: string) =>
+    invoke<string>("start_research", { question, outputDir }),
+  cancelResearch: (chatId: string) =>
+    invoke<void>("cancel_research", { chatId }),
+  researchOutputOptions: () => invoke<string[]>("research_output_options"),
 
   onChatUpdated: (fn: (row: ChatRow) => void): Promise<UnlistenFn> =>
     listen<ChatRow>("chat-updated", (e) => fn(e.payload)),

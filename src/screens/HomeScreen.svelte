@@ -7,9 +7,11 @@
   import { digestMarkdown } from "../lib/assist";
   import { isProjectLink, renderMarkdown } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
+  import ResearchModal from "../research/ResearchModal.svelte";
 
   onMount(() => void digest.init());
 
+  let researchOpen = $state(false);
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -141,6 +143,7 @@
       <div class="actions">
         <button class="btn" onclick={() => (app.searchOpen = true)}>Search knowledge</button>
         <button class="btn btn-ghost" onclick={() => (app.screen = "files")}>Browse files</button>
+        <button class="btn btn-ghost" onclick={() => (researchOpen = true)}>Start research</button>
       </div>
     </div>
 
@@ -201,6 +204,10 @@
     </div>
   </div>
 </div>
+
+{#if researchOpen}
+  <ResearchModal close={() => (researchOpen = false)} />
+{/if}
 
 <style>
   .wrap {

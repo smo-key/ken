@@ -3,7 +3,7 @@
   import { chats } from "../lib/chats.svelte";
   import ChatTranscript from "./ChatTranscript.svelte";
   import TerminalView from "./TerminalView.svelte";
-  import type { ChatRow } from "../lib/api";
+  import { api, type ChatRow } from "../lib/api";
 
   let winW = $state(window.innerWidth);
   let overflowOpen = $state(false);
@@ -17,6 +17,15 @@
   const inTerminal = $derived(
     chats.terminalId !== null && chats.terminalId === chats.activeId,
   );
+  const researchLive = $derived(
+    chats.active?.kind === "research" &&
+      (chats.active.status === "working" ||
+        chats.active.status === "needs_input"),
+  );
+
+  async function cancelResearch() {
+    if (chats.activeId) await api.cancelResearch(chats.activeId);
+  }
 
   function statusDot(row: ChatRow): string | null {
     switch (row.status) {
@@ -122,8 +131,22 @@
           ← Back to conversation
         </button>
         <span class="foot-note">You're in the real Claude terminal.</span>
-      {:else if chats.active?.kind === "ingest"}
-        <span class="foot-note">Ingest session — opens in the terminal.</span>
+        {#if researchLive}
+          <div class="chat-actions">
+            <button class="mini" onclick={cancelResearch}>Cancel research</button>
+          </div>
+        {/if}
+      {:else if chats.active?.kind === "ingest" || chats.active?.kind === "research"}
+        <span class="foot-note">
+          {chats.active.kind === "research"
+            ? "Research session — opens in the terminal; you can answer its questions there."
+            : "Ingest session — opens in the terminal."}
+        </span>
+        {#if researchLive}
+          <div class="chat-actions">
+            <button class="mini" onclick={cancelResearch}>Cancel research</button>
+          </div>
+        {/if}
       {:else}
         <div class="reply">
           <textarea

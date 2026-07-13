@@ -438,6 +438,8 @@ fi
 
 # Staging dir is announced in the prompt as: STAGING_DIR=<path>
 STAGING=$(echo "$PROMPT" | grep -o 'STAGING_DIR=[^ ]*' | head -1 | cut -d= -f2)
+# Research report path is announced as: OUTPUT_FILE=<path>
+OUTFILE=$(echo "$PROMPT" | grep -o 'OUTPUT_FILE=[^ ]*' | head -1 | cut -d= -f2-)
 HOOK_URL=""
 if [ -f .claude/settings.local.json ]; then
   HOOK_URL=$(grep -o 'http://127.0.0.1:[0-9]*/ken-hook' .claude/settings.local.json | head -1)
@@ -458,6 +460,14 @@ write_outputs() {
 
 - Priya Natarajan — owns billing cutover
 }" > "$STAGING/${FAKE_CLAUDE_OUTPUT:-knowledge/People.md}"
+  fi
+  if [ -n "$OUTFILE" ]; then
+    mkdir -p "$(dirname "$OUTFILE")" 2>/dev/null
+    printf '%s' "Fake research report [1]
+
+## Sources
+1. https://example.com — supported the main claim
+" > "$OUTFILE"
   fi
 }
 

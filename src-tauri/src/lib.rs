@@ -13,7 +13,8 @@ use ken_core::db::{
 };
 use ken_core::digest;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
-use ken_core::runner::CancelToken;
+use ken_core::research;
+use ken_core::runner::{CancelToken, RunOutcome};
 use ken_core::hooks::HookListener;
 use ken_core::project::Project;
 use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
@@ -42,6 +43,8 @@ struct ActiveProject {
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
     /// True while a digest generation thread is running for this project.
     digest_running: Arc<AtomicBool>,
+    /// Live research runs: chat/session id → cancel token.
+    research: Arc<Mutex<std::collections::HashMap<String, CancelToken>>>,
 }
 
 struct AppState {
@@ -270,6 +273,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         digest_running: Arc::new(AtomicBool::new(false)),
+        research: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
     drop(guard);
 
@@ -1542,8 +1546,11 @@ fn send_chat_message(
             .get_chat(&chat_id)
             .map_err(err)?
             .ok_or("chat not found")?;
-        if row.kind == "ingest" {
-            return Err("This is an ingest session — open it in the terminal to interact.".into());
+        if row.kind == "ingest" || row.kind == "research" {
+            return Err(format!(
+                "This is {} session — open it in the terminal to interact.",
+                if row.kind == "research" { "a research" } else { "an ingest" }
+            ));
         }
         let had_messages = !db.chat_messages(&chat_id).map_err(err)?.is_empty();
         let id = db.append_chat_message(&chat_id, "user", &text, now).map_err(err)?;
@@ -1659,7 +1666,7 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
         let had = !db.chat_messages(&chat_id).map_err(err)?.is_empty();
         let now = engine::now_epoch();
         let _ = db.append_chat_message(&chat_id, "divider", "continued in the terminal", now);
-        (had || row.kind == "ingest", row)
+        (had || row.kind == "ingest" || row.kind == "research", row)
     };
     let _ = row;
 
@@ -1749,6 +1756,165 @@ fn chat_pty_resize(state: State<SharedState>, chat_id: String, rows: u16, cols: 
     Ok(())
 }
 
+// ---------- deep research ----------
+
+/// Kick off a research run: a hidden interactive session that searches the
+/// web and writes a cited report into the project. Returns the chat id the
+/// drawer can watch (it doubles as the runner session id). The finished
+/// report lands in the project folder, so the existing watcher indexes it —
+/// no extra wiring.
+#[tauri::command]
+fn start_research(
+    app: AppHandle,
+    state: State<SharedState>,
+    question: String,
+    output_dir: String,
+) -> CmdResult<String> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Type a question first.".into());
+    }
+    let binary = ken_core::runner::discover_claude()
+        .ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?;
+
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let hooks = guard.hooks.clone().ok_or("hooks not running")?;
+    let report_rel = research::plan_report(&active.project, &output_dir, &question).map_err(err)?;
+
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    let now = engine::now_epoch();
+    let short: String = question.chars().take(40).collect();
+    let row = ChatRow {
+        id: chat_id.clone(),
+        title: format!("Research — {}", short.trim()),
+        kind: "research".into(),
+        pinned: false,
+        status: "working".into(),
+        created_at: now,
+        last_active_at: now,
+        archived: false,
+    };
+    {
+        let mut db = active.chat_db.lock().unwrap();
+        db.upsert_chat(&row).map_err(err)?;
+        let note = format!("Researching — the report will land at {report_rel}.");
+        let id = db.append_chat_message(&chat_id, "activity", &note, now).unwrap_or(0);
+        let _ = app.emit("chat-updated", row.clone());
+        let _ = app.emit("chat-message", ChatMessage {
+            id,
+            chat_id: chat_id.clone(),
+            role: "activity".into(),
+            content: note,
+            created_at: now,
+        });
+    }
+
+    let token = CancelToken::new();
+    active.research.lock().unwrap().insert(chat_id.clone(), token.clone());
+
+    let project = active.project.clone();
+    let chat_db = active.chat_db.clone();
+    let research_map = active.research.clone();
+    drop(guard);
+
+    let worker_app = app.clone();
+    let sid = chat_id.clone();
+    std::thread::spawn(move || {
+        let set_status = |status: &str, note: Option<String>| {
+            let now = engine::now_epoch();
+            let mut db = chat_db.lock().unwrap();
+            let _ = db.set_chat_field(&sid, ChatField::Status, status);
+            let _ = db.touch_chat(&sid, now);
+            if let Some(note) = note {
+                let id = db.append_chat_message(&sid, "activity", &note, now).unwrap_or(0);
+                let _ = worker_app.emit("chat-message", ChatMessage {
+                    id,
+                    chat_id: sid.clone(),
+                    role: "activity".into(),
+                    content: note,
+                    created_at: now,
+                });
+            }
+            if let Ok(Some(row)) = db.get_chat(&sid) {
+                let _ = worker_app.emit("chat-updated", row);
+            }
+        };
+
+        let outcome = research::run_research(
+            &project,
+            &binary,
+            &sid,
+            &question,
+            &report_rel,
+            &hooks,
+            research::DEFAULT_TIMEOUT,
+            &token,
+            || {
+                set_status(
+                    "needs_input",
+                    Some("The research session is waiting on something — open it here to answer, or cancel the run.".into()),
+                );
+            },
+        );
+        match outcome {
+            Ok(RunOutcome::Completed) => set_status(
+                "done",
+                Some(format!("Done — the report is at {report_rel}, ready to open in Files.")),
+            ),
+            Ok(RunOutcome::Cancelled) => {
+                set_status("done", Some("Cancelled — no report was written.".into()))
+            }
+            Ok(RunOutcome::TimedOut(_)) => set_status(
+                "error",
+                Some(format!(
+                    "The research didn't finish within {} minutes and was stopped.",
+                    research::DEFAULT_TIMEOUT.as_secs() / 60
+                )),
+            ),
+            Ok(RunOutcome::Failed(detail)) => set_status("error", Some(detail)),
+            Err(e) => set_status("error", Some(e.to_string())),
+        }
+        research_map.lock().unwrap().remove(&sid);
+    });
+    Ok(chat_id)
+}
+
+#[tauri::command]
+fn cancel_research(state: State<SharedState>, chat_id: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    if let Some(token) = active.research.lock().unwrap().get(&chat_id) {
+        token.cancel();
+    }
+    Ok(())
+}
+
+/// Where can a report go? `research` first — always, even before the
+/// folder exists — then the project's existing top-level folders.
+#[tauri::command]
+fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let mut options = vec!["research".to_string()];
+    if let Ok(entries) = std::fs::read_dir(&active.project.root) {
+        let mut dirs: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| {
+                !name.starts_with('.')
+                    && !ken_core::scan::is_junk_dir_name(name)
+                    && name != "research"
+                    && !active.project.is_excluded(name)
+            })
+            .collect();
+        dirs.sort();
+        options.extend(dirs);
+    }
+    Ok(options)
+}
+
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
@@ -1828,6 +1994,9 @@ pub fn run() {
             leave_terminal_mode,
             chat_pty_input,
             chat_pty_resize,
+            start_research,
+            cancel_research,
+            research_output_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ken");

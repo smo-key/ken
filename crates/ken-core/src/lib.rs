@@ -14,6 +14,7 @@ pub mod project;
 pub mod pty_registry;
 pub mod recipe;
 pub mod refresh;
+pub mod research;
 pub mod runner;
 pub mod registry;
 pub mod scan;
