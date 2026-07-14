@@ -21,13 +21,48 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IngestEvent {
+    /// `ingest` | `automation` — routes the event to the right UI surface.
+    pub kind: String,
     pub slug: String,
     pub run_id: i64,
     pub session_id: Option<String>,
-    /// `running` | `blocked` | `fresh` | `pending_approval` | `failed` |
-    /// `cancelled`
+    /// Persisted: `running` | `blocked` | `fresh` | `pending_approval` |
+    /// `failed` | `cancelled`. Transient (never stored): `queued` | `waiting`.
     pub status: String,
     pub detail: Option<String>,
+    /// Latest human-readable activity line for a running run (transient).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// Seconds the running run has been going (server snapshot; UI also ticks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
+    /// For `queued`: whole seconds until the debounce deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
+}
+
+impl IngestEvent {
+    /// The common case: a status transition with no live-activity payload.
+    pub fn at(
+        kind: &str,
+        slug: &str,
+        run_id: i64,
+        session_id: Option<String>,
+        status: &str,
+        detail: Option<String>,
+    ) -> IngestEvent {
+        IngestEvent {
+            kind: kind.to_string(),
+            slug: slug.to_string(),
+            run_id,
+            session_id,
+            status: status.to_string(),
+            detail,
+            activity: None,
+            elapsed_secs: None,
+            eta_secs: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -196,13 +231,7 @@ fn execute(
 ) {
     // Fresh state every run: settings and recipes may have changed on disk.
     let emit_fail = |run_id: i64, detail: String| {
-        on_event(IngestEvent {
-            slug: slug.to_string(),
-            run_id,
-            session_id: None,
-            status: "failed".into(),
-            detail: Some(detail),
-        });
+        on_event(IngestEvent::at("ingest", slug, run_id, None, "failed", Some(detail)));
     };
 
     let project = match Project::open(project_root) {
@@ -261,13 +290,14 @@ fn execute(
             return;
         }
     };
-    on_event(IngestEvent {
-        slug: slug.to_string(),
+    on_event(IngestEvent::at(
+        "ingest",
+        slug,
         run_id,
-        session_id: Some(session_id.clone()),
-        status: "running".into(),
-        detail: None,
-    });
+        Some(session_id.clone()),
+        "running",
+        None,
+    ));
 
     if mode == RunnerMode::HiddenTui {
         if let Err(e) = install_hooks(&project.root, &hooks.hook_url()) {
@@ -289,15 +319,16 @@ fn execute(
         let slug = slug.to_string();
         let sid = session_id.clone();
         move || {
-            on_event(IngestEvent {
-                slug: slug.clone(),
+            on_event(IngestEvent::at(
+                "ingest",
+                &slug,
                 run_id,
-                session_id: Some(sid.clone()),
-                status: "blocked".into(),
-                detail: Some(
+                Some(sid.clone()),
+                "blocked",
+                Some(
                     "The session is waiting on something — open it in Chats to answer (it may be a one-time setup prompt), or cancel the run.".into(),
                 ),
-            });
+            ));
         }
     };
     let outcome = runner::run_session(
@@ -313,13 +344,14 @@ fn execute(
 
     let finish = |db: &mut Db, status: &str, summary: Option<&str>, error: Option<&str>, ratio: Option<f64>| {
         let _ = db.update_run(run_id, status, Some(now_epoch()), summary, error, ratio);
-        on_event(IngestEvent {
-            slug: slug.to_string(),
+        on_event(IngestEvent::at(
+            "ingest",
+            slug,
             run_id,
-            session_id: Some(session_id.clone()),
-            status: status.into(),
-            detail: summary.or(error).map(String::from),
-        });
+            Some(session_id.clone()),
+            status,
+            summary.or(error).map(String::from),
+        ));
     };
 
     match outcome {
@@ -479,6 +511,13 @@ mod tests {
     #[test]
     fn default_debounce_is_ten_seconds() {
         assert_eq!(EngineConfig::default().debounce, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ingest_event_constructor_defaults_are_none() {
+        let ev = IngestEvent::at("ingest", "people", 5, Some("s".into()), "running", None);
+        assert_eq!(ev.kind, "ingest");
+        assert!(ev.activity.is_none() && ev.elapsed_secs.is_none() && ev.eta_secs.is_none());
     }
 
     #[test]

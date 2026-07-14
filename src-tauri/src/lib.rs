@@ -1968,13 +1968,10 @@ fn cancel_run(state: State<SharedState>, slug: String) -> CmdResult<()> {
 /// thread, so the engine never emits for them.
 fn emit_run_changed(app: &AppHandle, db: &Db, run_id: i64) {
     if let Ok(Some(run)) = db.get_run(run_id) {
-        let _ = app.emit("ingest-run-changed", IngestEvent {
-            slug: run.slug,
-            run_id,
-            session_id: run.session_id,
-            status: run.status,
-            detail: run.summary,
-        });
+        let _ = app.emit(
+            "ingest-run-changed",
+            IngestEvent::at(&run.kind, &run.slug, run_id, run.session_id, &run.status, run.summary),
+        );
     }
 }
 
