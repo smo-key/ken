@@ -2,9 +2,11 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { ingests, statusCaption } from "../lib/ingests.svelte";
+  import { automations } from "../lib/automations.svelte";
   import { liveCaption, countdownFrom, type Tone } from "../lib/liveRun";
   import { timeAgo } from "../lib/format";
   import IngestForm from "../ingests/IngestForm.svelte";
+  import AutomationsPane from "../ingests/AutomationsPane.svelte";
   import TemplateGallery from "../ingests/TemplateGallery.svelte";
   import type { IngestTemplate } from "../lib/templates";
   import type { IngestMode, IngestRefresh, RunRow } from "../lib/api";
@@ -27,8 +29,14 @@
   let editingSlug = $state<string | null>(null);
   let formPreset = $state<FormPreset | null>(null);
   let galleryOpen = $state(false);
+  // Knowledge docs (the ingests list/detail) vs. Automations. Both stores init
+  // on mount so live events keep either tab current even while it's hidden.
+  let tab = $state<"docs" | "automations">("docs");
 
-  onMount(() => void ingests.init());
+  onMount(() => {
+    void ingests.init();
+    void automations.init();
+  });
 
   const detail = $derived(ingests.detail);
   const liveForSelected = $derived(
@@ -199,6 +207,27 @@
   }
 </script>
 
+<div class="wrap">
+  <div class="tabbar">
+    <div class="tabs" role="tablist" aria-label="Ingests view">
+      <button
+        class="seg"
+        class:on={tab === "docs"}
+        role="tab"
+        aria-selected={tab === "docs"}
+        onclick={() => (tab = "docs")}
+      >Knowledge docs</button>
+      <button
+        class="seg"
+        class:on={tab === "automations"}
+        role="tab"
+        aria-selected={tab === "automations"}
+        onclick={() => (tab = "automations")}
+      >Automations</button>
+    </div>
+  </div>
+
+  {#if tab === "docs"}
 <div class="screen">
   <!-- list pane -->
   <div class="list">
@@ -379,6 +408,10 @@
     {/if}
   </div>
 </div>
+  {:else}
+    <AutomationsPane />
+  {/if}
+</div>
 
 {#if formOpen}
   <IngestForm
@@ -405,6 +438,43 @@
 <ConfirmMenu />
 
 <style>
+  .wrap {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .tabbar {
+    display: flex;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex: none;
+  }
+  .tabs {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    overflow: hidden;
+  }
+  .tabs .seg {
+    padding: 4px 12px;
+    border: none;
+    background: var(--surface);
+    color: var(--ink-secondary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .tabs .seg:hover {
+    background: var(--sunken);
+  }
+  .tabs .seg.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
+  }
   .screen {
     flex: 1;
     min-width: 0;
