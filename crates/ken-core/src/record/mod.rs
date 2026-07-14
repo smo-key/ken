@@ -151,6 +151,60 @@ pub fn read_wav_f32(path: &Path) -> Result<Vec<f32>> {
         .collect()
 }
 
+/// The base name (no extension) shared by a recording's transcript and WAVs.
+pub fn recording_stem(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> String {
+    format!("{y:04}-{mo:02}-{d:02} {h:02}.{mi:02} Recording")
+}
+
+/// `m:ss`, or `h:mm:ss` past an hour — the readable duration for the header.
+pub fn dur_hms(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// A non-colliding `<stem>.<ext>` within `dir`, appending " 2", " 3", … before
+/// the extension when needed.
+pub fn unique_name(dir: &Path, stem: &str, ext: &str) -> String {
+    let mut name = format!("{stem}.{ext}");
+    let mut n = 2;
+    while dir.join(&name).exists() {
+        name = format!("{stem} {n}.{ext}");
+        n += 1;
+    }
+    name
+}
+
+/// The transcript document's metadata header, ending in a `---` rule.
+pub fn metadata_header(
+    y: i32,
+    mo: u32,
+    d: u32,
+    h: u32,
+    mi: u32,
+    duration: Duration,
+    mic: bool,
+    system: bool,
+) -> String {
+    let sources = match (mic, system) {
+        (true, true) => "Me (microphone), Them (system audio)",
+        (true, false) => "Me (microphone)",
+        (false, true) => "Them (system audio)",
+        (false, false) => "none",
+    };
+    format!(
+        "# Recording — {y:04}-{mo:02}-{d:02} {h:02}.{mi:02}\n\n\
+         - Date: {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}\n\
+         - Duration: {}\n\
+         - Sources: {sources}\n\n---\n",
+        dur_hms(duration)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +295,36 @@ mod tests {
         for (a, b) in samples.iter().zip(back.iter()) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn stem_and_duration_formatting() {
+        assert_eq!(recording_stem(2026, 7, 14, 14, 2), "2026-07-14 14.02 Recording");
+        assert_eq!(dur_hms(Duration::from_secs(9)), "0:09");
+        assert_eq!(dur_hms(Duration::from_secs(754)), "12:34");
+        assert_eq!(dur_hms(Duration::from_secs(3_661)), "1:01:01");
+    }
+
+    #[test]
+    fn unique_name_avoids_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "2026-07-14 14.02 Recording";
+        assert_eq!(unique_name(dir.path(), stem, "md"), format!("{stem}.md"));
+        std::fs::write(dir.path().join(format!("{stem}.md")), b"x").unwrap();
+        assert_eq!(unique_name(dir.path(), stem, "md"), format!("{stem} 2.md"));
+    }
+
+    #[test]
+    fn metadata_header_lists_both_sources() {
+        let h = metadata_header(2026, 7, 14, 14, 2, Duration::from_secs(754), true, true);
+        assert!(h.starts_with("# Recording — 2026-07-14 14.02\n"));
+        assert!(h.contains("- Date: 2026-07-14 14:02"));
+        assert!(h.contains("- Duration: 12:34"));
+        assert!(h.contains("- Sources: Me (microphone), Them (system audio)"));
+        assert!(h.trim_end().ends_with("---"));
+        // Single source names only that source.
+        let mic = metadata_header(2026, 7, 14, 9, 5, Duration::from_secs(30), true, false);
+        assert!(mic.contains("- Sources: Me (microphone)"));
+        assert!(!mic.contains("Them"));
     }
 }
