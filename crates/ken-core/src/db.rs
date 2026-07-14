@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::knowledge_model;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub struct Db {
     conn: Connection,
@@ -46,6 +46,8 @@ pub struct SearchHit {
 pub struct RunRow {
     pub id: i64,
     pub slug: String,
+    /// `ingest` | `automation` — which subsystem produced this run.
+    pub kind: String,
     pub session_id: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
@@ -296,6 +298,20 @@ impl Db {
                     ON extractions(status);
                 "#,
             )?;
+        }
+        if version < 9 {
+            // Run-kind discriminator: automation runs share ingest_runs with
+            // recipe runs. Guarded ADD COLUMN (no IF NOT EXISTS; a fresh DB
+            // already has the column, and tests rewind schema_version).
+            let has_kind: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('ingest_runs') WHERE name = 'kind'")?
+                .exists([])?;
+            if !has_kind {
+                self.conn.execute_batch(
+                    "ALTER TABLE ingest_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'ingest';",
+                )?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -571,12 +587,35 @@ impl Db {
     // --- ingest run log ---
 
     pub fn insert_run(&mut self, slug: &str, session_id: Option<&str>, started_at: i64) -> Result<i64> {
+        self.insert_run_kind(slug, session_id, started_at, "ingest")
+    }
+
+    pub fn insert_run_kind(
+        &mut self,
+        slug: &str,
+        session_id: Option<&str>,
+        started_at: i64,
+        kind: &str,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO ingest_runs (slug, session_id, started_at, status)
-             VALUES (?1, ?2, ?3, 'running')",
-            params![slug, session_id, started_at],
+            "INSERT INTO ingest_runs (slug, kind, session_id, started_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![slug, kind, session_id, started_at],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_runs_of_kind(&self, slug: &str, kind: &str, limit: usize) -> Result<Vec<RunRow>> {
+        let sql = format!(
+            "SELECT {} FROM ingest_runs WHERE slug = ?1 AND kind = ?2
+             ORDER BY started_at DESC, id DESC LIMIT ?3",
+            Self::RUN_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![slug, kind, limit as i64], Self::map_run)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     pub fn update_run(
@@ -605,18 +644,19 @@ impl Db {
         Ok(RunRow {
             id: r.get(0)?,
             slug: r.get(1)?,
-            session_id: r.get(2)?,
-            started_at: r.get(3)?,
-            finished_at: r.get(4)?,
-            status: r.get(5)?,
-            summary: r.get(6)?,
-            error: r.get(7)?,
-            change_ratio: r.get(8)?,
+            kind: r.get(2)?,
+            session_id: r.get(3)?,
+            started_at: r.get(4)?,
+            finished_at: r.get(5)?,
+            status: r.get(6)?,
+            summary: r.get(7)?,
+            error: r.get(8)?,
+            change_ratio: r.get(9)?,
         })
     }
 
     const RUN_COLS: &'static str =
-        "id, slug, session_id, started_at, finished_at, status, summary, error, change_ratio";
+        "id, slug, kind, session_id, started_at, finished_at, status, summary, error, change_ratio";
 
     pub fn get_run(&self, id: i64) -> Result<Option<RunRow>> {
         let sql = format!("SELECT {} FROM ingest_runs WHERE id = ?1", Self::RUN_COLS);
@@ -1616,6 +1656,21 @@ mod tests {
             sources: Vec::new(),
             connections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runs_carry_kind_and_default_to_ingest() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Legacy insert path defaults to "ingest".
+        let a = db.insert_run("people", Some("s-a"), 100).unwrap();
+        assert_eq!(db.get_run(a).unwrap().unwrap().kind, "ingest");
+        // Explicit-kind insert records an automation run.
+        let b = db.insert_run_kind("weekly-jira", Some("s-b"), 200, "automation").unwrap();
+        assert_eq!(db.get_run(b).unwrap().unwrap().kind, "automation");
+        // list_runs_of_kind filters by kind even when slugs would otherwise mix.
+        let auto = db.list_runs_of_kind("weekly-jira", "automation", 10).unwrap();
+        assert_eq!(auto.len(), 1);
+        assert!(db.list_runs_of_kind("weekly-jira", "ingest", 10).unwrap().is_empty());
     }
 
     #[test]
