@@ -199,6 +199,13 @@ fn index_one(
         Err(e) => (STATUS_FAILED, Some(e.to_string()), String::new()),
     };
     db.upsert_file(rel, kind.as_str(), size, mtime, status, error.as_deref(), &text)?;
+    // Incremental Map: an indexed file whose content changed is queued for
+    // local-LLM extraction. The hash is over the extracted text, so mtime/size
+    // churn without a content change never re-runs extraction.
+    if status == STATUS_INDEXED {
+        let hash = crate::knowledge_model::content_hash(&text);
+        db.enqueue_extraction_if_changed(rel, &hash)?;
+    }
     Ok(status)
 }
 
@@ -276,6 +283,31 @@ mod tests {
                 fs::copy(entry.path(), &to).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn indexing_enqueues_changed_files_for_extraction() {
+        let (dir, project) = temp_project();
+        let mut db = Db::open(&PathBuf::from(dir.path()).join("idx"), project.config.id)
+            .unwrap_or_else(|_| Db::open_in_memory().unwrap());
+        // Index a real indexed file directly through index_one.
+        fs::write(project.root.join("note.md"), "Priya leads billing.").unwrap();
+        let meta = project.root.join("note.md").metadata().unwrap();
+        let status = index_one(
+            &project, &mut db, "note.md",
+            meta.len() as i64, 0, false,
+        ).unwrap();
+        assert_eq!(status, STATUS_INDEXED);
+        // The file is now queued with the hash of its extracted text.
+        assert_eq!(
+            db.next_pending_extraction().unwrap(),
+            Some(("note.md".into(), crate::knowledge_model::content_hash("Priya leads billing.").into()))
+        );
+
+        // Re-indexing identical content does NOT re-queue once it's done.
+        db.mark_extraction_done("note.md", &crate::knowledge_model::content_hash("Priya leads billing."), 1).unwrap();
+        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false).unwrap();
+        assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
     #[test]
