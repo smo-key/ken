@@ -16,6 +16,7 @@
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
   import PreviewLoading from "./previews/PreviewLoading.svelte";
+  import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isHtmlPath } from "./previews/html";
 
   let { relPath }: { relPath: string } = $props();
@@ -302,19 +303,16 @@
     <div class="error">{loadError}</div>
   {:else if resolving}
     <!-- Kind/cloud-status not yet known: no preview or editor mounts until
-         load() resolves, so an online-only file never flashes a preview. -->
-    <PreviewLoading label="Opening…" />
-  {:else if tooLarge && meta}
-    <div class="too-large">
-      <p>
-        <strong>{relPath.split("/").pop()}</strong> is
-        {(meta.size / 1048576).toFixed(1)} MB — too big to edit inside Ken
-        without slowing everything down. It's still indexed and searchable.
-      </p>
-      <button class="btn" onclick={() => api.openExternal(relPath)}>
-        Open in default app
+         load() resolves, so an online-only file never flashes a preview. The
+         Cancel returns to the notice/back-out so the app never wedges here. -->
+    <div class="opening">
+      <PreviewLoading label="Opening…" />
+      <button class="btn btn-small" onclick={() => (loadError = "Opening cancelled — try again, or open in the default app.")}>
+        Cancel
       </button>
     </div>
+  {:else if tooLarge && meta}
+    <TooLargeNotice {relPath} size={meta.size} />
   {:else if editable && content !== null}
     {#key reloadKey}
       {#if isHtml && !showSource && meta}
@@ -449,20 +447,12 @@
     flex: 1;
     line-height: 1.5;
   }
-  .too-large {
-    margin: 48px auto;
-    max-width: 420px;
-    text-align: center;
+  .opening {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 14px;
-  }
-  .too-large p {
-    margin: 0;
-    font-size: 13.5px;
-    line-height: 1.65;
-    color: var(--ink-secondary);
+    gap: 12px;
+    margin-top: 24px;
   }
   .error {
     margin: 16px 20px;

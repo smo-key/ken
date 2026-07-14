@@ -9,6 +9,8 @@
   import HtmlPreview from "./previews/HtmlPreview.svelte";
   import VideoPreview from "./previews/VideoPreview.svelte";
   import FallbackPreview from "./previews/FallbackPreview.svelte";
+  import TooLargeNotice from "./previews/TooLargeNotice.svelte";
+  import { isPreviewTooLarge } from "./previews/sizeGate";
   import { isHtmlPath } from "./previews/html";
 
   let { relPath, kind, meta }: { relPath: string; kind: string; meta: FileRow } =
@@ -19,9 +21,15 @@
   const ext = $derived(relPath.split(".").pop()?.toLowerCase() ?? "");
 
   const VIDEO_EXTS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi"]);
+
+  // Gate the heavy office/notebook parsers on the already-loaded size BEFORE any
+  // bytes are read — a 148 MB workbook would otherwise wedge the webview.
+  const tooLarge = $derived(isPreviewTooLarge(relPath, kind, meta.size));
 </script>
 
-{#if ext === "ipynb"}
+{#if tooLarge}
+  <TooLargeNotice {relPath} size={meta.size} />
+{:else if ext === "ipynb"}
   <IpynbPreview {relPath} />
 {:else if VIDEO_EXTS.has(ext)}
   <VideoPreview {relPath} />
