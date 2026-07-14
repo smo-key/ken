@@ -184,3 +184,175 @@ pub fn sck_probe() -> Result<usize> {
         .map_err(|e| Error::Other(format!("ScreenCaptureKit unavailable: {e}")))?;
     Ok(content.displays().len())
 }
+
+// ---------------------------------------------------------------------------
+// ScreenCaptureKit — system-audio capture backend (Task 14)
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
+use screencapturekit::shareable_content::SCShareableContent;
+use screencapturekit::stream::configuration::SCStreamConfiguration;
+use screencapturekit::stream::content_filter::SCContentFilter;
+use screencapturekit::stream::output_trait::SCStreamOutputTrait;
+use screencapturekit::stream::output_type::SCStreamOutputType;
+use screencapturekit::stream::sc_stream::SCStream;
+
+/// The SCK stream is configured for this rate/channel layout; the session's
+/// downmix + resample turns it into 16 kHz mono.
+const SCK_SAMPLE_RATE: u32 = 48_000;
+const SCK_CHANNELS: u16 = 2;
+
+/// The capture sink: device-native interleaved f32 frames + rate + channels.
+type Sink = Box<dyn FnMut(&[f32], u32, u16) + Send>;
+
+/// Receives audio sample buffers from SCK and forwards interleaved f32 frames to
+/// the session sink. Only `SCStreamOutputType::Audio` buffers are handled; video
+/// (`Screen`) frames are ignored (we render none). The sink is shared behind a
+/// mutex because `SCStreamOutputTrait` is `Send + Sync` and SCK may deliver on a
+/// dispatch queue thread.
+struct AudioHandler {
+    sink: Arc<Mutex<Sink>>,
+    sample_rate: u32,
+}
+
+impl SCStreamOutputTrait for AudioHandler {
+    fn did_output_sample_buffer(
+        &self,
+        sample_buffer: CMSampleBuffer,
+        of_type: SCStreamOutputType,
+    ) {
+        if of_type != SCStreamOutputType::Audio {
+            return;
+        }
+        if let Ok((frames, channels)) = extract_audio_f32(&sample_buffer) {
+            if let Ok(mut sink) = self.sink.lock() {
+                sink(&frames, self.sample_rate, channels);
+            }
+        }
+    }
+}
+
+/// System audio capture via ScreenCaptureKit (macOS 13+). Captures audio only
+/// (a display filter is required, but no video handler is registered so frames
+/// are dropped). Requires Screen Recording TCC permission. `SCStream` is
+/// `Send + Sync`, so — unlike the cpal mic path — the stream lives directly in
+/// the struct with no dedicated thread.
+pub struct SystemAudioSource {
+    stream: Option<SCStream>,
+}
+
+impl SystemAudioSource {
+    pub fn new() -> Self {
+        SystemAudioSource { stream: None }
+    }
+}
+
+impl Default for SystemAudioSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaptureSource for SystemAudioSource {
+    fn start(&mut self, sink: Box<dyn FnMut(&[f32], u32, u16) + Send>) -> Result<()> {
+        let content = SCShareableContent::get()
+            .map_err(|e| Error::Other(format!("ScreenCaptureKit unavailable: {e}")))?;
+        let display = content
+            .displays()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Other("no display to attach audio capture to".into()))?;
+
+        // Audio-only: attach to a display filter, enable audio, and register a
+        // handler for the Audio output only. (SCK 8.0.0 builders are infallible.)
+        let config = SCStreamConfiguration::new()
+            .with_captures_audio(true)
+            .with_sample_rate(SCK_SAMPLE_RATE as i32)
+            .with_channel_count(SCK_CHANNELS as i32);
+
+        let filter = SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&[])
+            .build();
+
+        let mut stream = SCStream::new(&filter, &config);
+        stream.add_output_handler(
+            AudioHandler {
+                sink: Arc::new(Mutex::new(sink)),
+                sample_rate: SCK_SAMPLE_RATE,
+            },
+            SCStreamOutputType::Audio,
+        );
+        stream
+            .start_capture()
+            .map_err(|e| Error::Other(format!("couldn't start system audio: {e}")))?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let _ = stream.stop_capture();
+        }
+    }
+}
+
+/// Pull interleaved f32 PCM out of an SCK audio `CMSampleBuffer`, returning the
+/// samples plus the frame's channel count so the session downmixes correctly.
+///
+/// SCK delivers 32-bit float PCM. The `AudioBufferList` is either interleaved
+/// (a single buffer whose `number_channels` is the channel count) or planar
+/// (one mono buffer per channel); this handles both, always returning
+/// **interleaved** f32 so the session's downmix + resample path is uniform with
+/// the mic. Malformed/empty buffers return an `Err` (the caller skips them).
+fn extract_audio_f32(sample: &CMSampleBuffer) -> Result<(Vec<f32>, u16)> {
+    let list = sample
+        .audio_buffer_list()
+        .ok_or_else(|| Error::Other("audio sample had no buffer list".into()))?;
+    let n = list.num_buffers();
+    if n == 0 {
+        return Err(Error::Other("empty audio buffer list".into()));
+    }
+
+    // Reinterpret each buffer's little-endian bytes as f32 samples.
+    let to_f32 = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    if n == 1 {
+        // Single buffer: already interleaved (or mono). Its `number_channels`
+        // is the true channel count.
+        let buf = list
+            .get(0)
+            .ok_or_else(|| Error::Other("missing audio buffer".into()))?;
+        let samples = to_f32(buf.data());
+        if samples.is_empty() {
+            return Err(Error::Other("audio buffer had no samples".into()));
+        }
+        let ch = (buf.number_channels as u16).max(1);
+        return Ok((samples, ch));
+    }
+
+    // Multiple buffers = planar (one channel each): interleave into frames.
+    let planes: Vec<Vec<f32>> = (0..n)
+        .filter_map(|i| list.get(i))
+        .map(|b| to_f32(b.data()))
+        .collect();
+    let ch = planes.len() as u16;
+    let frames = planes.iter().map(Vec::len).min().unwrap_or(0);
+    if frames == 0 {
+        return Err(Error::Other("audio buffer had no samples".into()));
+    }
+    let mut out = Vec::with_capacity(frames * planes.len());
+    for f in 0..frames {
+        for p in &planes {
+            out.push(p[f]);
+        }
+    }
+    Ok((out, ch))
+}
