@@ -2,9 +2,9 @@
 //! changes (fed by the app layer from scan results), debounces, and runs
 //! one ingest at a time through the runner + refresh pipeline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,8 +83,47 @@ impl Default for EngineConfig {
     }
 }
 
+/// Which subsystem a queued job belongs to. Automations share the engine's
+/// single-worker queue; only ingests are enqueued until the automation tasks
+/// land, but the key carries the kind so the two never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunKind {
+    Ingest,
+    #[allow(dead_code)]
+    Automation,
+}
+
+impl RunKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunKind::Ingest => "ingest",
+            RunKind::Automation => "automation",
+        }
+    }
+}
+
+/// Identity of a queued job: a run is unique per (subsystem, slug).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueueKey {
+    kind: RunKind,
+    slug: String,
+}
+
+/// A debounced unit of work waiting in the engine queue.
+#[allow(dead_code)] // `matched`/`apply` are populated once automations enqueue.
+struct PendingJob {
+    /// Earliest instant this job may start (debounce watermark).
+    deadline: Instant,
+    force_full: bool,
+    /// Source files that matched an automation's globs across the debounce
+    /// window (union). Empty for ingests.
+    matched: Vec<String>,
+    /// Phase-2 approved proposal text; `Some` only for an automation apply job.
+    apply: Option<String>,
+}
+
 enum Msg {
-    Trigger { slug: String, force_full: bool },
+    Trigger { kind: RunKind, slug: String, force_full: bool },
     SourcesChanged(Vec<String>),
     Shutdown,
 }
@@ -119,15 +158,34 @@ impl IngestEngine {
             // Shared so the streaming activity callback (which needs a `'static`
             // sink) and this loop can both emit through the same on_event.
             let on_event: Arc<dyn Fn(IngestEvent) + Send + Sync> = Arc::new(on_event);
-            let Ok(mut db) = Db::open_at(&db_path) else { return };
-            let mut pending: HashMap<String, Instant> = HashMap::new();
-            let mut force: HashMap<String, bool> = HashMap::new();
+            // Validate the DB opens up front; each run opens its own WAL
+            // connection on its worker thread (WAL allows the concurrent handles).
+            if Db::open_at(&db_path).is_err() {
+                return;
+            }
+            let mut pending: HashMap<QueueKey, PendingJob> = HashMap::new();
+            let mut announced_queued: HashSet<QueueKey> = HashSet::new();
+            let mut announced_waiting: HashSet<QueueKey> = HashSet::new();
+            // The single in-flight run's thread (concurrency stays 1). Runs are
+            // dispatched off-thread so the loop can keep servicing the queue —
+            // that's what lets a blocked second job surface a `waiting` event.
+            let mut run_handle: Option<std::thread::JoinHandle<()>> = None;
 
             loop {
                 match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Msg::Trigger { slug, force_full }) => {
-                        pending.insert(slug.clone(), Instant::now());
-                        force.insert(slug, force_full);
+                    Ok(Msg::Trigger { kind, slug, force_full }) => {
+                        // Run-now: due immediately, bypassing the debounce.
+                        let key = QueueKey { kind, slug };
+                        pending.insert(
+                            key.clone(),
+                            PendingJob {
+                                deadline: Instant::now(),
+                                force_full,
+                                matched: vec![],
+                                apply: None,
+                            },
+                        );
+                        announced_queued.remove(&key);
                     }
                     Ok(Msg::SourcesChanged(paths)) => {
                         if let Ok(project) = Project::open(&project_root) {
@@ -137,47 +195,120 @@ impl IngestEngine {
                                         if r.refresh == Refresh::OnChange
                                             && refresh::triggers(&r, &paths)
                                         {
+                                            let key = QueueKey {
+                                                kind: RunKind::Ingest,
+                                                slug: r.slug.clone(),
+                                            };
                                             // Keep the earliest deadline so a
                                             // steady stream can't postpone the
                                             // run forever.
-                                            pending
-                                                .entry(r.slug.clone())
-                                                .or_insert_with(|| Instant::now() + cfg.debounce);
-                                            force.entry(r.slug).or_insert(false);
+                                            pending.entry(key.clone()).or_insert_with(|| PendingJob {
+                                                deadline: Instant::now() + cfg.debounce,
+                                                force_full: false,
+                                                matched: vec![],
+                                                apply: None,
+                                            });
+                                            maybe_announce_queued(
+                                                &mut announced_queued,
+                                                &pending,
+                                                &key,
+                                                &on_event,
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    Ok(Msg::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                         break;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
                 }
 
                 let running = current_thread.lock().unwrap().is_some();
-                if !running {
-                    let due: Option<String> = pending
-                        .iter()
-                        .filter(|(_, at)| **at <= Instant::now())
-                        .map(|(slug, _)| slug.clone())
-                        .next();
-                    if let Some(slug) = due {
-                        pending.remove(&slug);
-                        let force_full = force.remove(&slug).unwrap_or(false);
-                        execute(
-                            &project_root,
-                            &mut db,
-                            &hooks,
-                            &cfg,
-                            &current_thread,
-                            &slug,
-                            force_full,
-                            &on_event,
-                        );
+                // Earliest-due job across the unified queue.
+                let due: Option<QueueKey> = pending
+                    .iter()
+                    .filter(|(_, j)| j.deadline <= Instant::now())
+                    .min_by_key(|(_, j)| j.deadline)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = due {
+                    if running {
+                        // Something's due but the single worker is busy: surface
+                        // it once so the UI can show "waiting for <name>".
+                        if !announced_waiting.contains(&key) {
+                            let current_name = current_thread
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|(s, _)| s.clone())
+                                .unwrap_or_default();
+                            let mut ev = IngestEvent::at(
+                                key.kind.as_str(),
+                                &key.slug,
+                                0,
+                                None,
+                                "waiting",
+                                None,
+                            );
+                            ev.detail = Some(format!("waiting for {current_name}"));
+                            on_event(ev);
+                            announced_waiting.insert(key.clone());
+                        }
+                    } else {
+                        // The previous run's thread has cleared `current`; reap it.
+                        if let Some(h) = run_handle.take() {
+                            let _ = h.join();
+                        }
+                        let job = pending.remove(&key).unwrap();
+                        announced_queued.remove(&key);
+                        announced_waiting.remove(&key);
+                        match key.kind {
+                            RunKind::Ingest => {
+                                // Claim the worker synchronously (before the loop
+                                // spins again) so the next iteration sees it busy.
+                                let token = CancelToken::new();
+                                *current_thread.lock().unwrap() =
+                                    Some((key.slug.clone(), token.clone()));
+                                let project_root = project_root.clone();
+                                let db_path = db_path.clone();
+                                let hooks = hooks.clone();
+                                let cfg = cfg.clone();
+                                let on_event = on_event.clone();
+                                let current = current_thread.clone();
+                                let slug = key.slug.clone();
+                                let force_full = job.force_full;
+                                run_handle = Some(std::thread::spawn(move || {
+                                    if let Ok(mut db) = Db::open_at(&db_path) {
+                                        execute_ingest(
+                                            &project_root,
+                                            &mut db,
+                                            &hooks,
+                                            &cfg,
+                                            &slug,
+                                            force_full,
+                                            &on_event,
+                                            &token,
+                                        );
+                                    }
+                                    // Always release the worker, even on the
+                                    // no-op early return inside execute_ingest.
+                                    *current.lock().unwrap() = None;
+                                }));
+                            }
+                            RunKind::Automation => {
+                                // Automation dispatch lands with the automation
+                                // tasks; no automation job is enqueued yet.
+                                unreachable!("automation jobs are not enqueued yet");
+                            }
+                        }
                     }
                 }
+            }
+            // Drain the in-flight run on shutdown (Drop cancels its token first).
+            if let Some(h) = run_handle.take() {
+                let _ = h.join();
             }
         });
 
@@ -190,6 +321,7 @@ impl IngestEngine {
 
     pub fn trigger(&self, slug: &str, force_full: bool) {
         let _ = self.tx.send(Msg::Trigger {
+            kind: RunKind::Ingest,
             slug: slug.to_string(),
             force_full,
         });
@@ -221,16 +353,37 @@ impl Drop for IngestEngine {
     }
 }
 
+/// Emit a `queued` event with a whole-second ETA once per key, so the UI can
+/// show a countdown to the debounce deadline.
+fn maybe_announce_queued(
+    announced: &mut HashSet<QueueKey>,
+    pending: &HashMap<QueueKey, PendingJob>,
+    key: &QueueKey,
+    on_event: &Arc<dyn Fn(IngestEvent) + Send + Sync>,
+) {
+    if announced.contains(key) {
+        return;
+    }
+    let Some(job) = pending.get(key) else { return };
+    let dur = job.deadline.saturating_duration_since(Instant::now());
+    // Round up so a sub-second debounce still reads as "~1s", not "0s".
+    let eta = dur.as_secs() + u64::from(dur.subsec_millis() > 0);
+    let mut ev = IngestEvent::at(key.kind.as_str(), &key.slug, 0, None, "queued", None);
+    ev.eta_secs = Some(eta);
+    on_event(ev);
+    announced.insert(key.clone());
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute(
+fn execute_ingest(
     project_root: &PathBuf,
     db: &mut Db,
     hooks: &HookListener,
     cfg: &EngineConfig,
-    current: &Arc<Mutex<Option<(String, CancelToken)>>>,
     slug: &str,
     force_full: bool,
     on_event: &Arc<dyn Fn(IngestEvent) + Send + Sync>,
+    token: &CancelToken,
 ) {
     // Fresh state every run: settings and recipes may have changed on disk.
     let emit_fail = |run_id: i64, detail: String| {
@@ -323,9 +476,6 @@ fn execute(
         }
     }
 
-    let token = CancelToken::new();
-    *current.lock().unwrap() = Some((slug.to_string(), token.clone()));
-
     let runner_cfg = RunnerConfig {
         binary,
         mode,
@@ -361,7 +511,7 @@ fn execute(
             &session_id,
             &plan.prompt,
             hooks,
-            &token,
+            token,
             // Blocked detection is only live under hidden-TUI; the headless
             // streaming branch ignores on_blocked by design (no startup gates).
             blocked_event,
@@ -374,7 +524,6 @@ fn execute(
             },
         )
     };
-    *current.lock().unwrap() = None;
 
     let finish = |db: &mut Db, status: &str, summary: Option<&str>, error: Option<&str>, ratio: Option<f64>| {
         let _ = db.update_run(run_id, status, Some(now_epoch()), summary, error, ratio);
@@ -477,6 +626,10 @@ mod tests {
     }
 
     fn rig(behavior: &str) -> Rig {
+        rig_debounce(behavior, 200)
+    }
+
+    fn rig_debounce(behavior: &str, debounce_ms: u64) -> Rig {
         let project_dir = tempfile::tempdir().unwrap();
         let app_dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(project_dir.path().join("notes")).unwrap();
@@ -497,6 +650,21 @@ mod tests {
         };
         recipe::save(&project, &recipe).unwrap();
 
+        // A second recipe so two ingests can contend for the single worker.
+        let places = Recipe {
+            slug: "places".into(),
+            name: "Places".into(),
+            description: String::new(),
+            sources: vec!["notes".into()],
+            output: "knowledge/Places.md".into(),
+            mode: Mode::Single,
+            refresh: Refresh::OnChange,
+            rules: None,
+            instruction: "Extract places.".into(),
+            extra: Default::default(),
+        };
+        recipe::save(&project, &places).unwrap();
+
         let db_path = app_dir.path().join("test.db");
         let mut db = Db::open_at(&db_path).unwrap();
         scan::scan(&project, &mut db).unwrap();
@@ -512,7 +680,7 @@ mod tests {
             EngineConfig {
                 binary: Some(bin),
                 timeout: Duration::from_secs(30),
-                debounce: Duration::from_millis(200),
+                debounce: Duration::from_millis(debounce_ms),
             },
             move |ev| {
                 let _ = etx.send(ev);
@@ -545,6 +713,18 @@ mod tests {
     #[test]
     fn default_debounce_is_ten_seconds() {
         assert_eq!(EngineConfig::default().debounce, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn source_change_emits_queued_with_eta() {
+        let r = rig_debounce("complete", 800);
+        r.engine.sources_changed(vec!["notes/a.md".into()]);
+        let q = wait_status(&r.events, "queued", 5);
+        assert_eq!(q.kind, "ingest");
+        assert_eq!(q.slug, "people");
+        assert!(q.eta_secs.unwrap_or(0) >= 1, "eta should be ~1s for an 800ms debounce");
+        // And it still runs after the debounce.
+        wait_status(&r.events, "fresh", 20);
     }
 
     #[test]
