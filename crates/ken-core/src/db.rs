@@ -9,6 +9,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::knowledge_model;
 use crate::{Error, Result};
 
 pub const SCHEMA_VERSION: i64 = 8;
@@ -1005,13 +1006,18 @@ impl Db {
         &mut self,
         rel_path: &str,
         message: &str,
-        at: i64,
+        _at: i64,
     ) -> Result<()> {
+        // Deliberately do NOT stamp `extracted_at` — it must reflect the LAST
+        // SUCCESS only. Stamping it here would let an errored-then-changed file
+        // (re-enqueued to `pending`, keeping this timestamp) count toward
+        // `extraction_coverage`, inflating "N of M analyzed" for a file that
+        // never actually succeeded.
         self.conn.execute(
             "UPDATE extractions
-             SET status = 'error', error = ?2, extracted_at = ?3
+             SET status = 'error', error = ?2
              WHERE rel_path = ?1",
-            params![rel_path, message, at],
+            params![rel_path, message],
         )?;
         Ok(())
     }
@@ -1088,6 +1094,153 @@ impl Db {
              VALUES ('knowledge_model_built_at', ?1)",
             params![built_at.to_string()],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Merge one file's extraction delta into the persisted model. This is the
+    /// convergence guarantee: it first strips the file's PRIOR contribution
+    /// (so a rewrite replaces rather than accretes), then applies the delta
+    /// with entity dedup (kind + normalized name), source union, longer-summary
+    /// wins, unordered-pair edge dedup (first label wins), and (date,text)
+    /// event dedup. Every entity/event is attributed to `rel_path`.
+    pub fn merge_knowledge_delta(
+        &mut self,
+        rel_path: &str,
+        delta: &knowledge_model::Extraction,
+        at: i64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        strip_file(&tx, rel_path)?;
+
+        // 1. Existing entity identity → row id (over what survived the strip).
+        let mut by_key: std::collections::HashMap<String, i64> = Default::default();
+        {
+            let mut stmt = tx.prepare("SELECT id, kind, name FROM entities")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (id, kind, name) = row?;
+                by_key.insert(entity_key(&kind, &name), id);
+            }
+        }
+
+        // 2. Upsert delta entities; record batch index → row id for edges.
+        let mut ids: Vec<i64> = Vec::with_capacity(delta.entities.len());
+        for e in &delta.entities {
+            let key = entity_key(&e.kind, &e.name);
+            if let Some(&id) = by_key.get(&key) {
+                // Union sources (add this file), keep the longer summary.
+                let existing_sources: String = tx.query_row(
+                    "SELECT sources FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let mut sources: Vec<String> =
+                    serde_json::from_str(&existing_sources).unwrap_or_default();
+                if !sources.iter().any(|s| s == rel_path) {
+                    sources.push(rel_path.to_string());
+                }
+                let existing_summary: String = tx.query_row(
+                    "SELECT summary FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let summary = if e.summary.chars().count() > existing_summary.chars().count() {
+                    e.summary.clone()
+                } else {
+                    existing_summary
+                };
+                tx.execute(
+                    "UPDATE entities SET summary = ?2, sources = ?3 WHERE id = ?1",
+                    params![id, summary, serde_json::to_string(&sources).unwrap()],
+                )?;
+                ids.push(id);
+            } else {
+                let sources = serde_json::to_string(&vec![rel_path.to_string()]).unwrap();
+                tx.execute(
+                    "INSERT INTO entities (kind, name, summary, sources)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![e.kind, e.name, e.summary, sources],
+                )?;
+                let id = tx.last_insert_rowid();
+                by_key.insert(key, id);
+                ids.push(id);
+            }
+        }
+
+        // 3. Edges: dedup by unordered pair across the WHOLE model, first wins.
+        let mut pairs: std::collections::HashSet<(i64, i64)> = Default::default();
+        {
+            let mut stmt = tx.prepare("SELECT a, b FROM entity_edges")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (a, b) = row?;
+                pairs.insert((a.min(b), a.max(b)));
+            }
+        }
+        for (from, e) in delta.entities.iter().enumerate() {
+            for (to, label) in &e.connections {
+                let (Some(&a), Some(&b)) = (ids.get(from), ids.get(*to)) else {
+                    continue;
+                };
+                if a == b {
+                    continue;
+                }
+                let pair = (a.min(b), a.max(b));
+                if !pairs.insert(pair) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO entity_edges (a, b, label) VALUES (?1, ?2, ?3)",
+                    params![a, b, label],
+                )?;
+            }
+        }
+
+        // 4. Events: dedup by (date, text) across the whole model.
+        let mut event_keys: std::collections::HashSet<(String, String)> = Default::default();
+        {
+            let mut stmt = tx.prepare("SELECT date, text FROM events")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                event_keys.insert(row?);
+            }
+        }
+        for ev in &delta.events {
+            let key = (ev.date.clone(), ev.text.clone());
+            if !event_keys.insert(key) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO events (date, category, text, source)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![ev.date, ev.category, ev.text, rel_path],
+            )?;
+        }
+
+        // Stamp the model timestamp so the Map treats the growing model as
+        // "built" (the frontend's empty check also honours entity presence).
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value)
+             VALUES ('knowledge_model_built_at', ?1)",
+            params![at.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove a file's entire contribution from the model (used when the file
+    /// is deleted or excluded). Entities grounded elsewhere survive; orphans
+    /// and their edges are GC'd.
+    pub fn purge_file_knowledge(&mut self, rel_path: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        strip_file(&tx, rel_path)?;
         tx.commit()?;
         Ok(())
     }
@@ -1286,6 +1439,47 @@ pub struct EventInput {
     pub source: String,
 }
 
+/// The entity identity used by incremental merge: kind plus a
+/// whitespace-normalized, case-folded name. `\u{1}` can't occur in a real
+/// name, so it's a safe key separator.
+fn entity_key(kind: &str, name: &str) -> String {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    format!("{kind}\u{1}{name}")
+}
+
+/// Strip one file's prior contribution to the knowledge model, in the caller's
+/// transaction: delete its events, remove it from every entity's `sources`,
+/// and delete entities left with no sources (their edges cascade via the
+/// `entity_edges` FK `ON DELETE CASCADE`).
+fn strip_file(conn: &Connection, rel_path: &str) -> Result<()> {
+    conn.execute("DELETE FROM events WHERE source = ?1", params![rel_path])?;
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, sources FROM entities")?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        mapped.collect::<std::result::Result<_, _>>()?
+    };
+    for (id, sources_json) in rows {
+        let mut sources: Vec<String> =
+            serde_json::from_str(&sources_json).unwrap_or_default();
+        if !sources.iter().any(|s| s == rel_path) {
+            continue;
+        }
+        sources.retain(|s| s != rel_path);
+        if sources.is_empty() {
+            conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        } else {
+            conn.execute(
+                "UPDATE entities SET sources = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&sources).unwrap()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Filename tokens for the `name` FTS column: stem + extension with
 /// separators spaced out ("Meeting-Notes_Jul8.md" → "Meeting Notes Jul8 md").
 fn name_tokens(rel_path: &str) -> String {
@@ -1392,6 +1586,147 @@ fn name_snippet(rel_path: &str, lowered_tokens: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge_model::Extraction;
+
+    /// Build a one-entity delta quickly (connections empty).
+    fn ent(kind: &str, name: &str, summary: &str) -> EntityInput {
+        EntityInput {
+            kind: kind.into(),
+            name: name.into(),
+            summary: summary.into(),
+            sources: Vec::new(),
+            connections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_dedups_entities_unions_sources_keeps_longer_summary() {
+        let mut db = Db::open_in_memory().unwrap();
+        // File 1: Priya (short summary), edge Priya→Billing.
+        let mut a = ent("person", "Priya N.", "Owns it.");
+        a.connections = vec![(1, "owns".into())];
+        let d1 = Extraction {
+            entities: vec![a, ent("topic", "Billing cutover", "")],
+            events: vec![],
+        };
+        db.merge_knowledge_delta("f1.md", &d1, 10).unwrap();
+
+        // File 2: same Priya (normalized name, longer summary), different file.
+        let d2 = Extraction {
+            entities: vec![ent("person", "priya   n.", "Owns the whole billing cutover programme.")],
+            events: vec![],
+        };
+        db.merge_knowledge_delta("f2.md", &d2, 20).unwrap();
+
+        let (entities, edges) = db.list_entities_with_edges().unwrap();
+        assert_eq!(entities.len(), 2, "Priya deduped across files");
+        let priya = entities.iter().find(|e| e.kind == "person").unwrap();
+        assert_eq!(priya.summary, "Owns the whole billing cutover programme.");
+        let mut srcs = priya.sources.clone();
+        srcs.sort();
+        assert_eq!(srcs, vec!["f1.md".to_string(), "f2.md".to_string()]);
+        assert_eq!(edges.len(), 1, "edge preserved, not duplicated");
+    }
+
+    #[test]
+    fn merge_dedups_edges_first_label_wins() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mk = |label: &str| {
+            let mut a = ent("person", "A", "");
+            a.connections = vec![(1, label.into())];
+            Extraction { entities: vec![a, ent("person", "B", "")], events: vec![] }
+        };
+        db.merge_knowledge_delta("f1.md", &mk("knows"), 10).unwrap();
+        db.merge_knowledge_delta("f2.md", &mk("later label"), 20).unwrap();
+        let (_, edges) = db.list_entities_with_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].label, "knows", "first label wins");
+    }
+
+    #[test]
+    fn merge_dedups_events_by_date_and_text() {
+        let mut db = Db::open_in_memory().unwrap();
+        let ev = || Extraction {
+            entities: vec![],
+            events: vec![EventInput {
+                date: "2026-07-11".into(),
+                category: "decision".into(),
+                text: "Sign-off.".into(),
+                source: String::new(),
+            }],
+        };
+        db.merge_knowledge_delta("f1.md", &ev(), 10).unwrap();
+        db.merge_knowledge_delta("f2.md", &ev(), 20).unwrap();
+        let events = db.list_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "f1.md", "first occurrence kept");
+    }
+
+    #[test]
+    fn re_extraction_removes_the_file_then_gcs_orphans() {
+        let mut db = Db::open_in_memory().unwrap();
+        // f1 grounds Priya + Billing + their edge + an event.
+        let mut a = ent("person", "Priya N.", "Owns it.");
+        a.connections = vec![(1, "owns".into())];
+        db.merge_knowledge_delta("f1.md", &Extraction {
+            entities: vec![a, ent("topic", "Billing cutover", "")],
+            events: vec![EventInput {
+                date: "2026-07-11".into(), category: "decision".into(),
+                text: "Sign-off.".into(), source: String::new(),
+            }],
+        }, 10).unwrap();
+        // f2 also grounds Priya (so she survives) but not Billing.
+        db.merge_knowledge_delta("f2.md", &Extraction {
+            entities: vec![ent("person", "Priya N.", "Owns it.")],
+            events: vec![],
+        }, 20).unwrap();
+
+        // Re-extract f1 with an EMPTY delta (the file lost all its content).
+        db.merge_knowledge_delta("f1.md", &Extraction::default(), 30).unwrap();
+
+        let (entities, edges) = db.list_entities_with_edges().unwrap();
+        // Priya survives (grounded by f2); Billing GC'd (only f1 grounded it);
+        // the edge cascades away with Billing; the event (only f1) is gone.
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Priya N.");
+        assert_eq!(entities[0].sources, vec!["f2.md".to_string()]);
+        assert!(edges.is_empty(), "orphaned edge cascaded");
+        assert!(db.list_events().unwrap().is_empty(), "f1's event removed");
+    }
+
+    #[test]
+    fn purge_file_knowledge_strips_a_removed_file() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.merge_knowledge_delta("gone.md", &Extraction {
+            entities: vec![ent("person", "Solo", "Only here.")],
+            events: vec![EventInput {
+                date: "2026-07-11".into(), category: "x".into(),
+                text: "e".into(), source: String::new(),
+            }],
+        }, 10).unwrap();
+        db.purge_file_knowledge("gone.md").unwrap();
+        let (entities, _) = db.list_entities_with_edges().unwrap();
+        assert!(entities.is_empty());
+        assert!(db.list_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn errored_then_changed_file_is_not_counted_as_analyzed() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.enqueue_extraction_if_changed("b.md", "h1").unwrap();
+        // Extraction fails — the file was never successfully analyzed.
+        db.mark_extraction_error("b.md", "boom", 101).unwrap();
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
+        // Content changes and re-enqueues; still never succeeded → still not
+        // counted (extracted_at must reflect last SUCCESS only, never an error).
+        assert!(db.enqueue_extraction_if_changed("b.md", "h2").unwrap());
+        assert_eq!(
+            db.extraction_coverage().unwrap(),
+            (0, 1),
+            "a file that only ever errored must not count as analyzed after re-enqueue"
+        );
+    }
 
     #[test]
     fn extraction_queue_tracks_pending_done_and_coverage() {
