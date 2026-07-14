@@ -258,32 +258,24 @@
   {#if knowledge.empty}
     <div class="empty">
       {#if knowledge.error}
-        <div class="error">Last refresh didn't finish — {knowledge.error}</div>
+        <div class="error">Last rebuild didn't finish — {knowledge.error}</div>
       {/if}
       <div class="empty-card">
         <h2>
-          {knowledge.building
-            ? "Ken is mapping this project…"
-            : "Ken hasn't mapped this project yet"}
+          {knowledge.llmPaused
+            ? "Ken hasn't mapped this project yet"
+            : "Ken is mapping this project…"}
         </h2>
         <p>
-          One pass over your documents finds the people, organizations,
+          As Ken reads each document, it finds the people, organizations,
           topics, and decisions — and how they connect.
         </p>
-        {#if knowledge.building}
-          <p class="pulse">
-            This runs on its own after a project opens — a few minutes.
-          </p>
-        {:else if knowledge.claudeFound}
-          <p class="note">
-            Ken maps this automatically once indexing settles — and keeps
-            the map current as your documents change.
-          </p>
+        {#if knowledge.llmPaused}
+          <p class="note">{knowledge.llmNotice}</p>
         {:else}
-          <p class="note">
-            The map needs Claude Code — install with
-            <span class="mono">npm i -g @anthropic-ai/claude-code</span>, then
-            log in once with <span class="mono">claude</span>.
+          <p class="pulse">
+            This happens on your Mac, a file at a time — the map fills in as it
+            goes.
           </p>
         {/if}
       </div>
@@ -387,11 +379,28 @@
         <button class="btn btn-small" title="Fit to view" aria-label="Fit to view" onclick={zoomToFit}>Fit</button>
       </div>
 
-      {#if knowledge.building}
-        <div class="status-overlay pulse">Mapping this project…</div>
+      {#if knowledge.llmPaused}
+        <div class="status-overlay">{knowledge.llmNotice}</div>
+      {:else if knowledge.coverage}
+        <div class="status-overlay pulse">
+          {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed
+        </div>
+      {:else if knowledge.building}
+        <div class="status-overlay pulse">Deep rebuild in progress…</div>
       {:else if knowledge.error}
-        <div class="status-overlay error">Last map update didn't finish — {knowledge.error}</div>
+        <div class="status-overlay error">Last rebuild didn't finish — {knowledge.error}</div>
       {/if}
+
+      <div class="rebuild">
+        <button
+          class="btn btn-small"
+          title="Rebuild the whole map with a deeper, curated pass (uses Claude)"
+          disabled={knowledge.building || !knowledge.claudeFound}
+          onclick={() => void knowledge.refresh()}
+        >
+          Deep rebuild
+        </button>
+      </div>
 
       {#if selectedEntity}
         <div class="detail">
@@ -620,9 +629,16 @@
     justify-content: center;
   }
 
+  .rebuild {
+    position: absolute;
+    left: 16px;
+    top: 16px;
+  }
+
   .status-overlay {
     position: absolute;
-    top: 16px;
+    /* Sits below the Deep rebuild button, which shares the top-left corner. */
+    top: 56px;
     left: 16px;
     font-size: 12.5px;
     color: var(--accent);

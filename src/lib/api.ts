@@ -304,8 +304,14 @@ export interface KnowledgeModel {
   events: EventRow[];
   /** Epoch seconds of the last build; null before the first one. */
   builtAt: number | null;
-  /** A build (automatic or manual) is running right now. */
+  /** A manual Deep rebuild is running right now. */
   building: boolean;
+  /** Files extracted so far / indexed files — the coverage line. */
+  analyzed: number;
+  total: number;
+  /** `ready` | `notInstalled` | `error`. */
+  llmStatus: "ready" | "notInstalled" | "error";
+  llmError: string | null;
 }
 
 export interface KnowledgeModelState {
@@ -570,6 +576,8 @@ export const api = {
     fn: (ev: KnowledgeModelState) => void,
   ): Promise<UnlistenFn> =>
     listen<KnowledgeModelState>("knowledge-model-state", (e) => fn(e.payload)),
+  onKnowledgeUpdated: (fn: () => void): Promise<UnlistenFn> =>
+    listen<null>("knowledge-updated", () => fn()),
   onModelDownloadProgress: (
     fn: (ev: ModelProgress) => void,
   ): Promise<UnlistenFn> =>
