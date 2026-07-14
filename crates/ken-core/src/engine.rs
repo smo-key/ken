@@ -252,7 +252,20 @@ fn execute(
 
     let plan = match refresh::plan(&project, db, &recipe, &rules, force_full) {
         Ok(Some(p)) => p,
-        Ok(None) => return, // nothing changed; auto-trigger quietly skips
+        Ok(None) => {
+            // Not silent anymore: record a "checked, nothing to do" run so the
+            // user sees the engine looked. Marking it `fresh` advances the
+            // last-success watermark harmlessly — nothing changed, so no source
+            // file is skipped by the next incremental plan.
+            let run_id = match db.insert_run(slug, None, now_epoch()) {
+                Ok(id) => id,
+                Err(e) => { emit_fail(0, e.to_string()); return; }
+            };
+            let summary = "Checked — nothing to update.";
+            let _ = db.update_run(run_id, "fresh", Some(now_epoch()), Some(summary), None, None);
+            on_event(IngestEvent::at("ingest", slug, run_id, None, "fresh", Some(summary.into())));
+            return;
+        }
         Err(e) => {
             emit_fail(0, e.to_string());
             return;
@@ -518,6 +531,24 @@ mod tests {
         let ev = IngestEvent::at("ingest", "people", 5, Some("s".into()), "running", None);
         assert_eq!(ev.kind, "ingest");
         assert!(ev.activity.is_none() && ev.elapsed_secs.is_none() && ev.eta_secs.is_none());
+    }
+
+    #[test]
+    fn noop_run_is_recorded_not_silent() {
+        let r = rig("complete");
+        {
+            // A prior success in the far future so plan() finds nothing changed.
+            let mut db = Db::open_at(&r.db_path).unwrap();
+            let id = db.insert_run("people", None, now_epoch() + 10_000).unwrap();
+            db.update_run(id, "fresh", Some(now_epoch()), None, None, None).unwrap();
+        }
+        // force_full = false: incremental, nothing newer than last success.
+        r.engine.trigger("people", false);
+        let done = wait_status(&r.events, "fresh", 20);
+        assert_eq!(done.detail.as_deref(), Some("Checked — nothing to update."));
+        let db = Db::open_at(&r.db_path).unwrap();
+        // Two runs now exist: the seeded success and the recorded no-op.
+        assert!(db.list_runs("people", 5).unwrap().len() >= 2);
     }
 
     #[test]
