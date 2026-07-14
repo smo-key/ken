@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { digestMarkdown, isQuestionQuery } from "./assist";
+import { digestMarkdown, isQuestionQuery, stripStreamingBody } from "./assist";
+
+describe("stripStreamingBody", () => {
+  it("returns body unchanged when no SOURCES line has started", () => {
+    expect(stripStreamingBody("The cutover is Sept 12.")).toBe("The cutover is Sept 12.");
+  });
+  it("drops a complete trailing SOURCES line", () => {
+    expect(stripStreamingBody("Answer here.\nSOURCES: People.md, Plan.md")).toBe("Answer here.");
+  });
+  it("drops a partial SOURCES line mid-stream", () => {
+    expect(stripStreamingBody("Answer here.\nSOUR")).toBe("Answer here.");
+    expect(stripStreamingBody("Answer here.\nSOURCES:")).toBe("Answer here.");
+  });
+  it("trims trailing whitespace left behind", () => {
+    expect(stripStreamingBody("Answer.\n\nSOURCES: a")).toBe("Answer.");
+  });
+});
 
 describe("isQuestionQuery", () => {
   it("accepts three or more words", () => {
