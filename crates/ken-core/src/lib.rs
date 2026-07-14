@@ -3,6 +3,7 @@
 //! and the `ken-mcp` sidecar so both operate on the same data the same way.
 
 pub mod assistant;
+pub mod automation;
 pub mod bg_hydrate;
 pub mod chat;
 pub mod cloud;
