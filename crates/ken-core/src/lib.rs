@@ -11,6 +11,7 @@ pub mod digest;
 pub mod engine;
 pub mod error;
 pub mod extract;
+pub mod fsops;
 pub mod hooks;
 pub mod import;
 pub mod knowledge_model;
