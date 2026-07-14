@@ -482,10 +482,9 @@ pub fn extract_audio_f32(ffmpeg: &Path, video: &Path) -> Result<Vec<f32>> {
 pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-    let model_str = model
-        .to_str()
-        .ok_or_else(|| Error::Other("model path isn't valid UTF-8".into()))?;
-    let ctx = WhisperContext::new_with_params(model_str, WhisperContextParameters::default())
+    // whisper-rs 0.16 accepts any `AsRef<Path>`, so the model path passes through
+    // directly (no UTF-8 round-trip needed).
+    let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
         .map_err(|e| Error::Other(format!("couldn't load the Whisper model: {e}")))?;
     let mut state = ctx
         .create_state()
@@ -502,21 +501,21 @@ pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
         .full(params, samples)
         .map_err(|e| Error::Other(format!("transcription failed: {e}")))?;
 
-    let n = state
-        .full_n_segments()
-        .map_err(|e| Error::Other(e.to_string()))?;
+    // whisper-rs 0.16 exposes segments through an iterator of `WhisperSegment`
+    // (the old `full_get_segment_*` index getters are gone). Times are still
+    // reported in centiseconds; `to_str_lossy` tolerates the odd invalid byte.
     let mut cues = Vec::new();
-    for i in 0..n {
-        let text = state
-            .full_get_segment_text(i)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        // whisper.cpp reports segment times in centiseconds.
-        let t0 = state.full_get_segment_t0(i).map_err(|e| Error::Other(e.to_string()))?;
-        let t1 = state.full_get_segment_t1(i).map_err(|e| Error::Other(e.to_string()))?;
-        let text = text.trim().to_string();
+    for seg in state.as_iter() {
+        let text = seg
+            .to_str_lossy()
+            .map_err(|e| Error::Other(e.to_string()))?
+            .trim()
+            .to_string();
         if text.is_empty() {
             continue;
         }
+        let t0 = seg.start_timestamp();
+        let t1 = seg.end_timestamp();
         cues.push(Cue {
             start: Duration::from_millis((t0.max(0) as u64) * 10),
             end: Duration::from_millis((t1.max(0) as u64) * 10),

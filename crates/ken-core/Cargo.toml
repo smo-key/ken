@@ -30,7 +30,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # builds it from source (needs cmake + a C/C++ toolchain), so it is gated
 # behind a default feature: everything else in ken-core still builds if the
 # native toolchain is unavailable (`--no-default-features`).
-whisper-rs = { version = "0.14", optional = true }
+whisper-rs = { version = "0.16", optional = true }
 # Embedded on-device LLM (llama.cpp) for instant quick answers and Map entity
 # extraction. Bundles llama.cpp and builds it from source with Metal GPU
 # offload (needs cmake + a C/C++ toolchain), so it is gated behind a default
