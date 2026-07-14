@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 use crate::assistant::{self, ParsedOutput};
+use crate::chat::{parse_event, ParsedEvent};
 use crate::hooks::HookListener;
 use crate::{Error, Result};
 
@@ -339,6 +340,118 @@ fn run_headless(
         DriveResult::TimedOut(tail) => RunOutcome::TimedOut(truncate(&tail, 2000).to_string()),
         DriveResult::WaitFailed(e) => RunOutcome::Failed(format!("wait failed: {e}")),
     };
+    Ok(outcome)
+}
+
+/// Run one ingest/automation session, streaming a live activity line. Headless
+/// mode uses `--output-format stream-json --verbose` and reports each tool /
+/// assistant line through `on_activity`; hidden-TUI keeps its PTY-broadcast
+/// behaviour and ignores `on_activity`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_ingest_session(
+    cfg: &RunnerConfig,
+    project_root: &Path,
+    session_id: &str,
+    prompt: &str,
+    hooks: &HookListener,
+    cancel: &CancelToken,
+    mut on_blocked: impl FnMut(),
+    on_activity: impl FnMut(&str) + Send + 'static,
+) -> Result<RunOutcome> {
+    if !is_executable(&cfg.binary) {
+        return Ok(RunOutcome::Failed(MISSING_CLAUDE_HELP.to_string()));
+    }
+    match cfg.mode {
+        RunnerMode::HiddenTui => {
+            run_hidden_tui(cfg, project_root, session_id, prompt, hooks, cancel, &mut on_blocked)
+        }
+        RunnerMode::Headless => {
+            run_headless_streaming(cfg, project_root, session_id, prompt, cancel, on_activity)
+        }
+    }
+}
+
+fn run_headless_streaming(
+    cfg: &RunnerConfig,
+    project_root: &Path,
+    session_id: &str,
+    prompt: &str,
+    cancel: &CancelToken,
+    mut on_activity: impl FnMut(&str) + Send + 'static,
+) -> Result<RunOutcome> {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(&cfg.binary)
+        .args([
+            "-p", prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "acceptEdits",
+            "--session-id", session_id,
+        ])
+        .current_dir(project_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
+    // Terminal-result signal shared with the reader thread: Some(is_error)
+    // once a `result` event is seen.
+    let result_seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let result_w = result_seen.clone();
+    let reader = std::thread::spawn(move || {
+        let buf = std::io::BufReader::new(stdout);
+        for line in buf.lines().map_while(|l| l.ok()) {
+            match parse_event(&line) {
+                ParsedEvent::AssistantText(t) => {
+                    let one = t.lines().next().unwrap_or("").trim();
+                    if !one.is_empty() {
+                        on_activity(&truncate(one, 120).to_string());
+                    }
+                }
+                ParsedEvent::Activity(s) => on_activity(&s),
+                ParsedEvent::TurnResult { is_error } => {
+                    *result_w.lock().unwrap() = Some(is_error);
+                }
+                ParsedEvent::Init | ParsedEvent::Other => {}
+            }
+        }
+    });
+
+    // Drain stderr so a flood can't wedge the child (same reason as assistant).
+    let (err_buf, err_thread) = crate::assistant::drain_pipe(child.stderr.take());
+
+    let deadline = Instant::now() + cfg.timeout;
+    let outcome = loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            break RunOutcome::Cancelled;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let is_error = *result_seen.lock().unwrap();
+                let stderr = err_buf.lock().unwrap().clone();
+                break match (status.success(), is_error) {
+                    (true, Some(false)) | (true, None) => RunOutcome::Completed,
+                    _ => RunOutcome::Failed(crate::assistant::with_stderr(
+                        format!("the run exited with status {status:?}"),
+                        &stderr,
+                    )),
+                };
+            }
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    break RunOutcome::TimedOut(err_buf.lock().unwrap().clone());
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => break RunOutcome::Failed(format!("wait failed: {e}")),
+        }
+    };
+    let _ = reader.join();
+    let _ = err_thread.join();
     Ok(outcome)
 }
 
@@ -744,6 +857,47 @@ mod tests {
             &hooks,
             &CancelToken::new(),
             || {},
+        )
+        .unwrap();
+        assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn headless_streaming_reports_activity_and_completes() {
+        let (dir, bin, hooks) = setup("complete");
+        let staging = dir.path().join(".ken/.staging/people");
+        let prompt = format!("Extract. STAGING_DIR={}", staging.display());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let outcome = run_ingest_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-stream",
+            &prompt,
+            &hooks,
+            &CancelToken::new(),
+            || {},
+            move |line: &str| seen2.lock().unwrap().push(line.to_string()),
+        )
+        .unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert!(staging.join("knowledge/People.md").is_file());
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines.iter().any(|l| l.contains("Read notes/a.md")), "{lines:?}");
+    }
+
+    #[test]
+    fn headless_streaming_maps_error_result_to_failure() {
+        let (dir, bin, hooks) = setup("stream-fail");
+        let outcome = run_ingest_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-stream-fail",
+            "prompt",
+            &hooks,
+            &CancelToken::new(),
+            || {},
+            |_l: &str| {},
         )
         .unwrap();
         assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
