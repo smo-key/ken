@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,6 +98,9 @@ struct AppState {
     /// model ids downloading right now (guards a second concurrent download of
     /// the same id).
     model_downloads: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Monotonic id for ⌘K quick answers; a newer query bumps it so the
+    /// in-flight generation's token callback sees a mismatch and cancels.
+    qa_gen: Arc<AtomicU64>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -2795,6 +2798,32 @@ struct QuickAnswerEvent {
     sources: Vec<String>,
 }
 
+/// One streamed chunk of a local quick answer, tied to its query so the
+/// overlay can drop deltas from a superseded query.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QuickAnswerDelta {
+    query: String,
+    delta: String,
+}
+
+/// Build the local-model quick-answer prompt: the same FTS grounding as the
+/// Claude path, wrapped in Qwen3 ChatML, ending with the `SOURCES:` convention
+/// `digest::parse_digest` already understands.
+fn local_quick_answer_prompt(query: &str, hits: &[SearchHit]) -> String {
+    let mut material = String::new();
+    for hit in hits {
+        let snippet = hit.snippet.replace("<mark>", "").replace("</mark>", "");
+        material.push_str(&format!("- {}: {}\n", hit.rel_path, snippet));
+    }
+    let system = "You answer questions using only the provided project material. \
+Answer in one or two sentences. If the material doesn't answer it, say you don't \
+know. End with a final line `SOURCES: path1, path2` listing the project-relative \
+paths you used (omit the line if none).";
+    let user = format!("Question: {query}\n\nMaterial:\n\n{material}");
+    ken_core::local_llm::chatml_prompt(system, &user)
+}
+
 fn quick_answer_prompt(query: &str, hits: &[SearchHit]) -> String {
     let mut p = format!(
         "Question: {query}\n\nMaterial from the project's search index:\n\n"
@@ -2812,40 +2841,122 @@ listing the project-relative paths you used (omit the line if none).\n",
     p
 }
 
-/// Kick off a background quick answer for a ⌘K query. Returns false when
-/// Claude Code is missing (the overlay stops asking); the answer arrives
-/// later as a `quick-answer` event and never blocks the match list.
+/// Kick off a background quick answer for a ⌘K query. Prefers the on-device
+/// model — streaming `quick-answer-delta` chunks and a final `quick-answer` —
+/// and falls back silently to the Claude oneshot when the local model isn't
+/// ready or hits a runtime error. Returns false only when neither the local
+/// model nor Claude is available (the overlay then stops asking); the answer
+/// arrives later as events and never blocks the match list. A newer query
+/// bumps `qa_gen`, cancelling any in-flight generation so a stale answer never
+/// lands in the card.
 #[tauri::command]
 fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> CmdResult<bool> {
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return Ok(false);
+    let (hits, root, qa_gen, claude) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        let hits = active.db.search(&query, 8).map_err(err)?;
+        (
+            hits,
+            active.project.root.clone(),
+            guard.qa_gen.clone(),
+            ken_core::runner::discover_claude(),
+        )
     };
-    let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
-    let hits = active.db.search(&query, 8).map_err(err)?;
-    let root = active.project.root.clone();
-    drop(guard);
     if hits.is_empty() {
-        return Ok(true); // nothing to ground an answer on — no card
+        return Ok(true); // nothing to ground on — no card, but AI is "available"
     }
-    let prompt = quick_answer_prompt(&query, &hits);
+
+    let my_gen = qa_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let local_ready = matches!(
+        ken_core::local_llm::llm_status(),
+        ken_core::local_llm::LlmStatus::Ready
+    );
+
+    if local_ready {
+        let prompt = local_quick_answer_prompt(&query, &hits);
+        std::thread::spawn(move || {
+            let mut on_token = |piece: &str| -> bool {
+                if qa_gen.load(Ordering::SeqCst) != my_gen {
+                    return false; // superseded by a newer query
+                }
+                let _ = app.emit(
+                    "quick-answer-delta",
+                    QuickAnswerDelta { query: query.clone(), delta: piece.to_string() },
+                );
+                true
+            };
+            match ken_core::local_llm::generate_stream(
+                &prompt,
+                ken_core::local_llm::Priority::Interactive,
+                &mut on_token,
+            ) {
+                Ok(text) if qa_gen.load(Ordering::SeqCst) == my_gen => {
+                    let parsed = digest::parse_digest(&text);
+                    let _ = app.emit(
+                        "quick-answer",
+                        QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
+                    );
+                }
+                Ok(_) => {} // superseded — a newer generation owns the card
+                Err(_) => {
+                    // Runtime load/inference failure → fall back to Claude,
+                    // still honouring the generation id.
+                    run_claude_quick_answer(app, root, claude, query, hits, qa_gen, my_gen);
+                }
+            }
+        });
+        return Ok(true);
+    }
+
+    // Local model not ready → the existing Claude oneshot path (unchanged output).
+    let Some(binary) = claude else {
+        return Ok(false); // neither local nor Claude — stop asking
+    };
     std::thread::spawn(move || {
-        if let Ok(OneshotOutcome::Completed(text)) = assistant::oneshot(
-            &binary,
-            &root,
-            &prompt,
-            Duration::from_secs(60),
-            &CancelToken::new(),
-        ) {
-            let parsed = digest::parse_digest(&text);
-            let _ = app.emit("quick-answer", QuickAnswerEvent {
-                query,
-                body: parsed.body,
-                sources: parsed.sources,
-            });
-        }
+        run_claude_quick_answer(app, root, Some(binary), query, hits, qa_gen, my_gen);
     });
     Ok(true)
+}
+
+/// Shared Claude-oneshot quick-answer path (the fallback), honouring the
+/// supersede generation id so a stale answer never lands in the card.
+fn run_claude_quick_answer(
+    app: AppHandle,
+    root: std::path::PathBuf,
+    claude: Option<std::path::PathBuf>,
+    query: String,
+    hits: Vec<SearchHit>,
+    qa_gen: Arc<AtomicU64>,
+    my_gen: u64,
+) {
+    let Some(binary) = claude else { return };
+    let prompt = quick_answer_prompt(&query, &hits);
+    if let Ok(OneshotOutcome::Completed(text)) = assistant::oneshot(
+        &binary,
+        &root,
+        &prompt,
+        Duration::from_secs(60),
+        &CancelToken::new(),
+    ) {
+        if qa_gen.load(Ordering::SeqCst) != my_gen {
+            return; // superseded
+        }
+        let parsed = digest::parse_digest(&text);
+        let _ = app.emit(
+            "quick-answer",
+            QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
+        );
+    }
+}
+
+/// The on-device language model's state, for the ⌘K "not installed" hint.
+#[tauri::command]
+fn llm_status() -> &'static str {
+    match ken_core::local_llm::llm_status() {
+        ken_core::local_llm::LlmStatus::Ready => "ready",
+        ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
+        ken_core::local_llm::LlmStatus::Error(_) => "error",
+    }
 }
 
 // ---------- knowledge model (Map & Timeline) ----------
@@ -3504,11 +3615,15 @@ fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> 
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
+    // Hand the app-data dir to the on-device LLM so it can resolve/load the
+    // installed model; this is the only wiring that activates the local path.
+    ken_core::local_llm::init(base_dir.clone());
     let state: SharedState = Arc::new(Mutex::new(AppState {
         base_dir,
         hooks: None,
         active: None,
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        qa_gen: Arc::new(AtomicU64::new(0)),
     }));
 
     tauri::Builder::default()
@@ -3614,7 +3729,29 @@ pub fn run() {
             start_research,
             cancel_research,
             research_output_options,
+            llm_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ken");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_quick_answer_prompt_grounds_and_uses_chatml() {
+        let hits = vec![SearchHit {
+            rel_path: "People.md".into(),
+            kind: "note".into(),
+            status: String::new(),
+            snippet: "Priya owns <mark>billing</mark>".into(),
+            rank: 0.0,
+        }];
+        let p = local_quick_answer_prompt("who owns billing?", &hits);
+        assert!(p.contains("<|im_start|>system"));
+        assert!(p.contains("who owns billing?"));
+        assert!(p.contains("People.md: Priya owns billing")); // marks stripped
+        assert!(p.contains("<|im_start|>assistant"));
+    }
 }
