@@ -15,6 +15,7 @@ pub mod fsops;
 pub mod hooks;
 pub mod import;
 pub mod knowledge_model;
+pub mod local_llm;
 pub mod model;
 pub mod project;
 pub mod pty_registry;

@@ -31,10 +31,18 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # behind a default feature: everything else in ken-core still builds if the
 # native toolchain is unavailable (`--no-default-features`).
 whisper-rs = { version = "0.14", optional = true }
+# Embedded on-device LLM (llama.cpp) for instant quick answers and Map entity
+# extraction. Bundles llama.cpp and builds it from source with Metal GPU
+# offload (needs cmake + a C/C++ toolchain), so it is gated behind a default
+# feature — like `whisper`, everything else still builds with
+# `--no-default-features`. default-features off drops the crate's own default
+# backends; we opt into just `metal`.
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["metal"], optional = true }
 
 [features]
-default = ["whisper"]
+default = ["whisper", "local-llm"]
 whisper = ["dep:whisper-rs"]
+local-llm = ["dep:llama-cpp-2"]
 
 [dev-dependencies]
 tempfile = "3"
