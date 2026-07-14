@@ -205,6 +205,15 @@ pub fn metadata_header(
     )
 }
 
+/// Body used when the storage choice is "audio" (WAVs kept, no transcription).
+pub const AUDIO_ONLY_NOTE: &str =
+    "_This recording's audio was saved without a transcript._\n";
+
+/// Concatenate the metadata header (ends with `---\n`) and the transcript body.
+pub fn build_document(header: &str, body: &str) -> String {
+    format!("{header}\n{body}")
+}
+
 /// One channel's timed cues with an optional speaker label (`None` suppresses
 /// labels for a single-source recording).
 #[derive(Debug, Clone, Copy)]
@@ -481,6 +490,17 @@ mod tests {
             merge_transcript(&[LabeledChannel { label: Some("Me"), cues: &empty }]),
             ""
         );
+    }
+
+    #[test]
+    fn build_document_joins_header_and_body() {
+        let header = metadata_header(2026, 7, 14, 14, 2, Duration::from_secs(5), true, false);
+        let doc = build_document(&header, "[0:00] hello\n");
+        assert!(doc.contains("# Recording — 2026-07-14 14.02"));
+        assert!(doc.trim_end().ends_with("[0:00] hello"));
+        // Audio-only note stands in for an absent transcript.
+        let audio = build_document(&header, AUDIO_ONLY_NOTE);
+        assert!(audio.contains("audio was saved without a transcript"));
     }
 
     #[test]
