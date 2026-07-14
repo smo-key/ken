@@ -262,6 +262,12 @@ export interface QuickAnswer {
   sources: string[];
 }
 
+/** One streamed chunk of a quick answer, tied to its query. */
+export interface QuickAnswerDelta {
+  query: string;
+  delta: string;
+}
+
 /** A knowledge-model entity (Map node). */
 export interface EntityRow {
   id: number;
@@ -493,6 +499,7 @@ export const api = {
   currentDigest: () => invoke<DigestDto | null>("current_digest"),
   refreshDigest: () => invoke<void>("refresh_digest"),
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
+  llmStatus: () => invoke<"ready" | "notInstalled" | "error">("llm_status"),
 
   knowledgeModel: () => invoke<KnowledgeModel>("knowledge_model"),
   refreshKnowledgeModel: () => invoke<void>("refresh_knowledge_model"),
@@ -557,6 +564,8 @@ export const api = {
     listen<string>("digest-error", (e) => fn(e.payload)),
   onQuickAnswer: (fn: (answer: QuickAnswer) => void): Promise<UnlistenFn> =>
     listen<QuickAnswer>("quick-answer", (e) => fn(e.payload)),
+  onQuickAnswerDelta: (fn: (ev: QuickAnswerDelta) => void): Promise<UnlistenFn> =>
+    listen<QuickAnswerDelta>("quick-answer-delta", (e) => fn(e.payload)),
   onKnowledgeModelState: (
     fn: (ev: KnowledgeModelState) => void,
   ): Promise<UnlistenFn> =>

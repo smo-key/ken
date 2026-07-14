@@ -4,7 +4,7 @@
   import { api, type QuickAnswer, type SearchHit } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
-  import { isQuestionQuery } from "../lib/assist";
+  import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
@@ -23,18 +23,37 @@
   let aiAvailable = true;
   const answerCache = new Map<string, QuickAnswer>();
   let aiTimer: ReturnType<typeof setTimeout> | undefined;
+  // Live streaming buffer for the query currently being answered.
+  let streaming = $state<{ query: string; text: string } | null>(null);
+  let modelInstalled = $state(true);
 
   onMount(() => {
     input.focus();
-    let unlisten: UnlistenFn | undefined;
+    void api.llmStatus().then((s) => (modelInstalled = s !== "notInstalled"));
+    let unlistenFinal: UnlistenFn | undefined;
+    let unlistenDelta: UnlistenFn | undefined;
     void api
       .onQuickAnswer((qa) => {
         answerCache.set(qa.query, qa);
-        if (qa.query === query.trim()) answer = qa;
+        if (qa.query === query.trim()) {
+          answer = qa;
+          streaming = null; // final replaces the live buffer
+        }
       })
-      .then((un) => (unlisten = un));
+      .then((un) => (unlistenFinal = un));
+    void api
+      .onQuickAnswerDelta((ev) => {
+        if (ev.query !== query.trim()) return; // stale
+        if (!streaming || streaming.query !== ev.query) {
+          streaming = { query: ev.query, text: ev.delta };
+        } else {
+          streaming = { query: ev.query, text: streaming.text + ev.delta };
+        }
+      })
+      .then((un) => (unlistenDelta = un));
     return () => {
-      unlisten?.();
+      unlistenFinal?.();
+      unlistenDelta?.();
       if (aiTimer) clearTimeout(aiTimer);
       if (timer) clearTimeout(timer);
     };
@@ -49,6 +68,9 @@
     const q = query.trim();
     const cached = answerCache.get(q);
     answer = cached ?? null;
+    // Clear the live buffer when the query changes so an old stream doesn't
+    // bleed into a new query.
+    if (!streaming || streaming.query !== q) streaming = null;
     if (!cached && aiAvailable && isQuestionQuery(q)) {
       aiTimer = setTimeout(() => void ask(q), 800);
     }
@@ -135,6 +157,20 @@
         {/each}
         <button class="qa-dig" onclick={continueInChat}>
           ⌘↵ dig deeper in chat
+        </button>
+      </div>
+    </div>
+  {:else if streaming && streaming.query === query.trim() && stripStreamingBody(streaming.text)}
+    <div class="qa">
+      <div class="qa-head">Quick answer</div>
+      <div class="qa-body">{@html renderMarkdown(stripStreamingBody(streaming.text))}</div>
+    </div>
+  {:else if !modelInstalled && isQuestionQuery(query.trim())}
+    <div class="qa qa-hint">
+      <div class="qa-body">
+        Instant answers run on your Mac.
+        <button class="qa-dig" onclick={() => app.openSettings()}>
+          Download the answers model in Settings
         </button>
       </div>
     </div>

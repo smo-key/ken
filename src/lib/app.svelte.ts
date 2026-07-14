@@ -424,6 +424,11 @@ class AppStore {
     this.searchOpen = false;
   }
 
+  openSettings() {
+    this.screen = "settings";
+    this.searchOpen = false;
+  }
+
   /** Move a file or folder: update open tabs, favorites, and the selection.
    *  Folder moves rewrite every tab/favorite under the old prefix. */
   async moveFile(fromRel: string, toRel: string) {
