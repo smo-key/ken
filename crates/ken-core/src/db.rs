@@ -991,6 +991,14 @@ impl Db {
         }
     }
 
+    /// Mark a file's extraction `done`, stamping the hash the worker actually
+    /// extracted — but ONLY while that hash is still the one on the row. The
+    /// worker pops a hash, drops the DB lock for the (slow) generation, and marks
+    /// done on its own connection; meanwhile the scanner may re-index the file and
+    /// re-enqueue it under a NEW hash. Guarding on `content_hash` keeps this call
+    /// from clobbering that fresher `pending` row back to `done` (which would lose
+    /// the change until the next scan) — a mismatch is a harmless no-op and the
+    /// newer hash stays queued for a re-run.
     pub fn mark_extraction_done(
         &mut self,
         rel_path: &str,
@@ -998,10 +1006,9 @@ impl Db {
         at: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO extractions (rel_path, content_hash, extracted_at, status)
-             VALUES (?1, ?2, ?3, 'done')
-             ON CONFLICT(rel_path) DO UPDATE SET
-               content_hash = ?2, extracted_at = ?3, status = 'done', error = NULL",
+            "UPDATE extractions
+             SET extracted_at = ?3, status = 'done', error = NULL
+             WHERE rel_path = ?1 AND content_hash = ?2",
             params![rel_path, content_hash, at],
         )?;
         Ok(())
@@ -1788,6 +1795,33 @@ mod tests {
         // Removing an extraction row drops it entirely.
         db.remove_extraction("a.md").unwrap();
         assert_eq!(db.extraction_coverage().unwrap(), (0, 2));
+    }
+
+    #[test]
+    fn mark_extraction_done_does_not_clobber_a_re_enqueued_hash() {
+        // The worker pops hash "h1", drops the DB lock, and generates. Meanwhile
+        // the scanner re-indexes the file and re-enqueues it under a NEW hash
+        // "h2". When the (stale) worker finally marks "h1" done, it must NOT flip
+        // the fresher "h2" row to done — the change would be lost until the next
+        // scan. The mismatch is a harmless no-op; "h2" stays pending for a re-run.
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
+        // Scanner re-enqueues under the new hash while the worker is generating.
+        assert!(db.enqueue_extraction_if_changed("a.md", "h2").unwrap());
+        // The stale worker marks the OLD hash done.
+        db.mark_extraction_done("a.md", "h1", 100).unwrap();
+        // No-op: the newer hash is still pending and still uncounted.
+        assert_eq!(
+            db.next_pending_extraction().unwrap(),
+            Some(("a.md".into(), "h2".into())),
+            "the re-enqueued hash must survive a stale worker's mark-done"
+        );
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
+        // Marking the CURRENT hash done does advance it.
+        db.mark_extraction_done("a.md", "h2", 101).unwrap();
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
+        assert_eq!(db.extraction_coverage().unwrap(), (1, 1));
     }
 
     fn seeded() -> Db {

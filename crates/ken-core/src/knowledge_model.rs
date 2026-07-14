@@ -378,6 +378,14 @@ where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
     let text = db.get_text(rel_path)?.unwrap_or_default();
+    // An empty (or whitespace-only) file has nothing to extract — mark it done
+    // and skip the generation. A blank `.md`, a stub, or a file whose extractor
+    // produced no text would otherwise burn a full LLM call to yield an empty
+    // delta every time it's (re)enqueued.
+    if text.trim().is_empty() {
+        db.mark_extraction_done(rel_path, content_hash, at)?;
+        return Ok(());
+    }
     let prompt = compose_file_prompt(rel_path, &text, today);
     match generate(&prompt) {
         Ok(value) => {
@@ -717,6 +725,24 @@ mod tests {
         };
         assert!(process_next_pending(&mut db, "2026-07-14", 100, &generate).is_err());
         // Model untouched; the row is 'error', not 'pending' (no retry storm).
+        assert!(db.list_entities_with_edges().unwrap().0.is_empty());
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
+    }
+
+    #[test]
+    fn empty_file_is_marked_done_without_generating() {
+        let mut db = Db::open_in_memory().unwrap();
+        // A blank file: whitespace-only extracted text.
+        db.upsert_file("blank.md", "md", 1, 1, "indexed", None, "   \n\t").unwrap();
+        db.enqueue_extraction_if_changed("blank.md", &content_hash("   \n\t")).unwrap();
+        // The generator must never run for an empty file.
+        let generate = |_: &str| -> Result<serde_json::Value> {
+            panic!("generate() called for an empty file");
+        };
+        let done = process_next_pending(&mut db, "2026-07-14", 100, &generate).unwrap();
+        assert_eq!(done, Some("blank.md".to_string()));
+        // Counted as analyzed, no entities, queue drained.
+        assert_eq!(db.extraction_coverage().unwrap(), (1, 1));
         assert!(db.list_entities_with_edges().unwrap().0.is_empty());
         assert_eq!(db.next_pending_extraction().unwrap(), None);
     }

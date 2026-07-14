@@ -14,7 +14,7 @@ use ken_core::db::{
     EventRow, FileRow, RunRow, SearchHit,
 };
 use ken_core::digest;
-use ken_core::knowledge_model::{self, AutoBuildContext, AutoBuildTracker};
+use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
 use ken_core::research;
@@ -58,8 +58,8 @@ struct ActiveProject {
     knowledge_running: Arc<AtomicBool>,
     /// Change/scan/build bookkeeping behind automatic Map & Timeline builds.
     auto_knowledge: Arc<AutoBuildTracker>,
-    /// Stops the auto-build tick when this project closes.
-    _knowledge_ticker: StopOnDrop,
+    /// Stops the per-project extraction worker when this project closes.
+    _extraction_worker: StopOnDrop,
     /// Stops the background cloud-hydration worker when this project closes.
     _bg_hydrate: StopOnDrop,
     /// Live research runs: chat/session id → cancel token.
@@ -366,7 +366,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         digest_running: Arc::new(AtomicBool::new(false)),
         knowledge_running: Arc::new(AtomicBool::new(false)),
         auto_knowledge: auto_knowledge.clone(),
-        _knowledge_ticker: StopOnDrop(stop.clone()),
+        _extraction_worker: StopOnDrop(stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
         transcripts: Arc::new(Mutex::new(TranscriptJobs::default())),
@@ -405,20 +405,17 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         scan_knowledge.scan_finished();
     });
 
-    // One tick per project decides whether the Map & Timeline model needs
-    // (re)building — no thread per change, and the decision itself is the
-    // pure policy in ken-core.
-    let tick_app = app.clone();
-    let tick_state = state.clone();
-    let tick_id = project.config.id;
+    // One background extraction worker per open project: it drains the
+    // `extractions` queue at the local model's background priority, one file
+    // per generation, merging each delta into the Map/Timeline model and
+    // emitting a throttled `knowledge-updated` after each merged file. When the
+    // local model isn't ready it idles quietly (the Map shows a plain notice).
+    let worker_app = app.clone();
+    let worker_state = state.clone();
+    let worker_id = project.config.id;
+    let worker_stop = stop.clone();
     std::thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(KNOWLEDGE_TICK);
-            if stop.load(Ordering::SeqCst) {
-                return;
-            }
-            maybe_auto_build_knowledge(&tick_app, &tick_state, tick_id);
-        }
+        extraction_worker(worker_app, worker_state, worker_id, worker_stop);
     });
 
     // A low-priority worker that downloads cloud-offline DOCUMENTS in the
@@ -2961,10 +2958,6 @@ fn llm_status() -> &'static str {
 
 // ---------- knowledge model (Map & Timeline) ----------
 
-/// How often the auto-build policy is consulted. Far shorter than any of
-/// its thresholds — the tick only asks a question; the thresholds decide.
-const KNOWLEDGE_TICK: Duration = Duration::from_secs(30);
-
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeModelDto {
@@ -2973,10 +2966,17 @@ struct KnowledgeModelDto {
     events: Vec<EventRow>,
     /// Epoch seconds of the last build; null before the first one.
     built_at: Option<i64>,
-    /// A build is running right now — the Map/Timeline screens may open
-    /// mid-build (an automatic one starts before they're ever visited),
-    /// so the state has to come back with the model, not only as an event.
+    /// A manual Deep rebuild is running right now — the Map/Timeline screens
+    /// may open mid-build, so the state has to come back with the model, not
+    /// only as an event.
     building: bool,
+    /// Incremental coverage: files extracted / indexed files.
+    analyzed: i64,
+    total: i64,
+    /// `ready` | `notInstalled` | `error` — drives the Map's paused notice.
+    llm_status: String,
+    /// The model's error message when `llm_status == "error"`, else null.
+    llm_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2999,12 +2999,22 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
     let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
+    let (analyzed, total) = active.db.extraction_coverage().map_err(err)?;
+    let (llm_status, llm_error) = match ken_core::local_llm::llm_status() {
+        ken_core::local_llm::LlmStatus::Ready => ("ready".to_string(), None),
+        ken_core::local_llm::LlmStatus::NotInstalled => ("notInstalled".to_string(), None),
+        ken_core::local_llm::LlmStatus::Error(e) => ("error".to_string(), Some(e)),
+    };
     Ok(KnowledgeModelDto {
         entities,
         edges,
         events: active.db.list_events().map_err(err)?,
         built_at: active.db.knowledge_model_built_at().map_err(err)?,
         building: active.knowledge_running.load(Ordering::SeqCst),
+        analyzed,
+        total,
+        llm_status,
+        llm_error,
     })
 }
 
@@ -3095,8 +3105,8 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
             },
         };
         let _ = thread_app.emit("knowledge-model-state", event);
-        // Stamp the attempt BEFORE clearing the guard: the next tick must
-        // never see "not running" together with a stale attempt clock, or
+        // Stamp the attempt BEFORE clearing the guard: a later manual rebuild
+        // must never see "not running" together with a stale attempt clock, or
         // a failing build could restart immediately.
         job.tracker.build_finished(Instant::now());
         job.running.store(false, Ordering::SeqCst);
@@ -3104,52 +3114,86 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
     true
 }
 
-/// The automatic side of the same build: consult the policy, and start a
-/// build only if it says so. Runs on `KNOWLEDGE_TICK`; every early return
-/// here is silent by design (this is work nobody asked for).
-fn maybe_auto_build_knowledge(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) {
-    // discover_claude() walks every PATH entry and stats candidates; a slow
-    // or networked PATH entry can block for seconds. Resolve it BEFORE taking
-    // the global lock so the stat never blocks every other IPC command each
-    // tick. No CLI, no AI features — and no error either: Ken's other screens
-    // work fine without it, and the manual button explains the install.
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return;
-    };
-    let guard = state.lock().unwrap();
-    let Some(active) = guard.active.as_ref() else {
-        return;
-    };
-    if active.project.config.id != project_id {
-        return; // a different project is open now; this tick is stale
+/// The incremental-Map worker: one per open project. Loops draining the
+/// extraction queue while the local model is ready, emitting a throttled
+/// `knowledge-updated` after each merged file. Every wait is short so a newly
+/// indexed file is picked up promptly; the model's own queue (background
+/// priority) yields to interactive quick answers upstream, and the worker also
+/// steps aside between files while a quick answer is in flight. When the local
+/// model isn't ready — no model installed, a load error — the worker idles
+/// quietly (polling with a sleep), never erroring rows and never spinning CPU.
+fn extraction_worker(
+    app: AppHandle,
+    state: SharedState,
+    project_id: uuid::Uuid,
+    stop: Arc<AtomicBool>,
+) {
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut pending_emit = false;
+    while !stop.load(Ordering::SeqCst) {
+        // Pause quietly unless the local model is ready.
+        if !matches!(
+            ken_core::local_llm::llm_status(),
+            ken_core::local_llm::LlmStatus::Ready
+        ) {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        // Yield to interactive quick answers: while one is queued or running,
+        // step aside briefly rather than occupying the single inference worker
+        // with a background generation.
+        if ken_core::local_llm::interactive_pending() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        // Resolve base + project id under the lock, then drop it before the
+        // (slow) generation so IPC stays responsive.
+        let base = {
+            let guard = state.lock().unwrap();
+            match guard.active.as_ref() {
+                Some(active) if active.project.config.id == project_id => {
+                    guard.base_dir.clone()
+                }
+                _ => return, // project closed or switched — this worker is done
+            }
+        };
+        let Ok(mut db) = Db::open(&base, project_id) else {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        let today = local_date_today();
+        let at = engine::now_epoch();
+        let generate = |prompt: &str| {
+            ken_core::local_llm::generate_json(prompt, ken_core::local_llm::Priority::Background)
+        };
+        match knowledge_model::process_next_pending(&mut db, &today, at, &generate) {
+            Ok(Some(_)) => {
+                pending_emit = true;
+                // Throttle: coalesce a burst into at most one event / 750ms.
+                if last_emit.elapsed() >= Duration::from_millis(750) {
+                    let _ = app.emit("knowledge-updated", ());
+                    last_emit = Instant::now();
+                    pending_emit = false;
+                }
+                // Immediately loop for the next pending file.
+            }
+            Ok(None) => {
+                // Queue empty: flush any trailing throttled emit, then idle.
+                if pending_emit {
+                    let _ = app.emit("knowledge-updated", ());
+                    last_emit = Instant::now();
+                    pending_emit = false;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(_) => {
+                // A generation failed (already recorded on the row, which is now
+                // `error` and won't be re-popped). Continue the loop past it —
+                // a brief backoff so a bad model state doesn't spin.
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
     }
-    let ctx = AutoBuildContext {
-        claude_available: true,
-        in_flight: active.knowledge_running.load(Ordering::SeqCst),
-        // Only status='indexed' rows have readable content; a folder of
-        // image / failed / cloud-only files has file_count() > 0 but nothing
-        // to build from, and must not trip the tick into a paid empty run.
-        indexed_files: active.db.indexed_file_count().unwrap_or(0) as usize,
-        never_built: active
-            .db
-            .knowledge_model_built_at()
-            .ok()
-            .flatten()
-            .is_none(),
-    };
-    if !active.auto_knowledge.should_build(ctx, Instant::now()) {
-        return;
-    }
-    let job = KnowledgeBuild {
-        base: guard.base_dir.clone(),
-        project: active.project.clone(),
-        binary,
-        running: active.knowledge_running.clone(),
-        tracker: active.auto_knowledge.clone(),
-        quiet_failure: true,
-    };
-    drop(guard);
-    start_knowledge_build(app, job);
 }
 
 // ---------- chat commands ----------
