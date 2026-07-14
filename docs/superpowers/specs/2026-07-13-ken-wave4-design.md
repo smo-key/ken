@@ -1,10 +1,10 @@
 # Ken wave 4 — local model, denser Map, Record, automations, ingest visibility
 
 Date: 2026-07-13. Status: approved by Arthur (this session); §9 (chat
-usability), §10 (Settings simplification), and §11 (large-file preview hang)
+usability), §10 (Settings simplification), §11 (large-file preview hang), and §12 (file operations)
 added after approval at Arthur's request.
 
-Ten work items. Items 1 and 4 share one new subsystem (the embedded local
+Eleven work items. Items 1 and 4 share one new subsystem (the embedded local
 LLM); the rest are independent.
 
 User decisions (recorded from the clarifying round):
@@ -322,6 +322,31 @@ nothing yields).
   "Opening…" state always renders a working Cancel (back to the notice) —
   the tab strip and rest of the app must stay responsive while a preview
   loads. Regression test with a synthesized many-row workbook fixture.
+
+## 12. Files tree — basic file operations
+
+Requested after §10-11. What already exists: drag-and-drop file moves
+(`src/files/dnd.svelte.ts`, drop targets in `TreeNodeRow.svelte`, root drop
+zone in `FileTree.svelte`, backend `move_file` in `src-tauri/src/lib.rs:918`
+with cross-device fallback) and right-click context menus on tree rows. Gaps
+this section closes:
+
+- **Context menu additions** (tree rows and the tree's empty/root area):
+  *New folder*, *New document* (creates a markdown text file), and *Rename*
+  (files and folders), alongside the existing entries. Folder rows' menus get
+  New folder/New document scoped inside that folder.
+- **Inline editing**: rename and both create actions edit the name in place
+  in the tree row (autofocused input, Enter commits, Esc cancels). New
+  documents default to `Untitled.md` (deduped `Untitled 2.md`, …) and open in
+  a tab on create. Validation (no `/`, no duplicate sibling name) surfaces
+  through the tree's existing non-blocking move-error notice.
+- **Backends**: `create_folder(rel_path)`, `create_document(rel_path) ->
+  final rel_path` (dedupe + empty file + index), and rename reuses
+  `move_file`, extended to accept directories (same-parent rename and full
+  moves); child index paths reconcile via the existing rescan/watcher path.
+- **Folder drag-and-drop**: folders become draggable like files, with a
+  guard against dropping a folder into itself or its own subtree; drop onto
+  a collapsed folder targets that folder.
 
 ## Execution note
 
