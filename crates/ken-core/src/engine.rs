@@ -728,6 +728,20 @@ mod tests {
     }
 
     #[test]
+    fn second_due_job_reports_waiting() {
+        // A slow first run so the second stays blocked long enough to observe.
+        let r = rig("stream-hang"); // fake sleeps 300s in streamed headless
+        r.engine.trigger("people", true);
+        wait_status(&r.events, "running", 15);
+        // A second run-now can't start while the single worker is busy: expect
+        // a `waiting` event that names the running job.
+        r.engine.trigger("places", true);
+        let w = wait_status(&r.events, "waiting", 8);
+        assert!(w.detail.unwrap_or_default().contains("people"));
+        r.engine.cancel("people");
+    }
+
+    #[test]
     fn ingest_event_constructor_defaults_are_none() {
         let ev = IngestEvent::at("ingest", "people", 5, Some("s".into()), "running", None);
         assert_eq!(ev.kind, "ingest");
