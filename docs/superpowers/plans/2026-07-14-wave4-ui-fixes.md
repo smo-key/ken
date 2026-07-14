@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the four UI-fix work items of Ken wave 4 — §3 (Files header pinning + relocated Import/filter), §9 (chat usability: first-message echo, focus-on-open, audit fixes), §10 (Settings simplification: curated offline-models catalog, tri-state watched-folders tree, page rhythm, one-row Appearance), and §11 (large-file preview hang) — **excluding** the "Answers & Map" language-model catalog entries, which a separate plan appends onto the catalog structure built here.
+**Goal:** Ship the five UI-fix work items of Ken wave 4 — §3 (Files header pinning + relocated Import/filter), §9 (chat usability: first-message echo, focus-on-open, audit fixes), §10 (Settings simplification: curated offline-models catalog, tri-state watched-folders tree, page rhythm, one-row Appearance), §11 (large-file preview hang), and §12 (Files tree basic file operations: New folder / New document / Rename with inline editing, folder drag-and-drop) — **excluding** the "Answers & Map" language-model catalog entries, which a separate plan appends onto the catalog structure built here.
 
 **Architecture:** Ken is a Svelte 5 (runes) + Tauri 2 desktop app. Business logic that can be unit-tested is extracted into **pure `.ts` modules** tested with vitest (mirroring `src/files/tabs.test.ts`); Svelte components stay thin and are verified by hand (the repo has no component-render testing-library). Rust logic in `crates/ken-core` is tested with `cargo test`. This plan **retires runtime Hugging-Face model discovery** (`crates/ken-core/src/model.rs`) and replaces it with a curated, category-tagged catalog whose download/verify/install plumbing is unchanged, so the language-model plan only appends entries.
 
@@ -26,6 +26,8 @@
 
 **Chat (§9):** Enter sends, Shift+Enter inserts a newline (`ChatDrawer.svelte:123-128`, already correct — audit confirms and locks it with a test-backed pure helper). Optimistic user-message echo carries a **pending marker** and reconciles against the backend `chat-message` echo by id/content so it is never duplicated or dropped.
 
+**Files tree operations (§12):** New documents default to `Untitled.md`, deduped `Untitled 2.md`, `Untitled 3.md`, … (space + counter, before the extension). Inline editing: autofocused input in place, **Enter commits, Esc cancels**; validation rejects empty names, names containing `/`, and duplicate sibling names — surfaced through the tree's existing non-blocking move-error notice (`drag.error`). `move_file` keeps its refuse-overwrite guard and gains directories; a folder may never move into itself or its own subtree. New documents open in a tab on create.
+
 **Design (`.impeccable.md` — Paper & Ink):** plain human copy, accent (clay) rare, quiet motion (no bounce), editorial rhythm through varied spacing. Do not introduce new fonts/hues. Segmented controls, tri-state tree transitions, and the sticky header must feel calm.
 
 ---
@@ -45,6 +47,12 @@
 - `src/lib/keySend.test.ts` — vitest for the key helper.
 - `src/lib/folderTree.ts` — pure watched-folders tree build + tri-state + toggle logic (§10).
 - `src/lib/folderTree.test.ts` — vitest for the folder-tree logic.
+- `crates/ken-core/src/fsops.rs` — pure name-dedup (`Untitled 2.md`) + folder-into-own-subtree guard, cargo-tested (§12).
+- `src/files/naming.ts` — pure inline-edit name validation + deduped default document name + sibling listing (§12).
+- `src/files/naming.test.ts` — vitest for the naming policy.
+- `src/files/dnd.svelte.test.ts` — vitest for the extended drag guards (§12).
+- `src/files/treeEdit.svelte.ts` — inline-edit state store (rename / new-document / new-folder) + commit flow (§12).
+- `src/files/InlineNameRow.svelte` — the in-place autofocused name input row (Enter commits, Esc cancels) (§12).
 
 **Modified:**
 - `src/files/PreviewPane.svelte` — gate office/ipynb previews on `meta.size` before mounting the parser; show `TooLargeNotice` over cap (§11).
@@ -58,7 +66,15 @@
 - `crates/ken-core/src/model.rs` — retire discovery; add `ModelCategory`/`ModelTier`/`CatalogEntry`/`catalog()`/`selected*`/`ModelSelection` (§10).
 - `crates/ken-core/src/transcript.rs` — resolve the transcription model from the selection with installed fallback (§10).
 - `src-tauri/src/lib.rs` — rewire `list_models`/`download_model`/`model_status` to the catalog; add `set_model_selection`; extend `ModelStatusDto`; use the selected model at transcription call sites (§10).
-- `src/lib/api.ts` — extend `ModelStatus` (category/tier/blurb/selected); add `setModelSelection` (§10).
+- `src/lib/api.ts` — extend `ModelStatus` (category/tier/blurb/selected); add `setModelSelection` (§10); add `createFolder`/`createDocument` (§12).
+- `crates/ken-core/src/lib.rs` — register the new `fsops` module (§12).
+- `src-tauri/src/lib.rs` (additionally, §12) — `create_folder`, `create_document` commands; `move_file` extended to directories (subtree guard, dir rescan reconcile, cross-device dir refusal).
+- `src/files/dnd.svelte.ts` — `fromKind` on the drag state; `canDrop` folder-subtree guard (§12).
+- `src/files/tabs.ts` — `renameTabsForMove` prefix-aware tab rename (§12); `src/files/tabs.test.ts` gains its cases.
+- `src/lib/favorites.ts` — `renameFavoritesForMove` prefix-aware favorite rename (§12); `src/lib/favorites.test.ts` gains its cases.
+- `src/lib/app.svelte.ts` — `moveFile` handles folder moves (prefix-renames tabs + favorites) (§12).
+- `src/files/TreeNodeRow.svelte` — Rename/New-document/New-folder menu entries, inline-edit rendering, folder rows draggable (§12).
+- `src/files/FileTree.svelte` (additionally, §12) — root-area context menu + root inline-create row.
 
 ---
 
@@ -2018,19 +2034,979 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-## Final verification
+## Task 13 — §12 ken-core `fsops`: name dedup + subtree guard (pure Rust + tests)
 
-- [ ] **Full test suites:** `pnpm vitest run` (all TS/Svelte pure modules pass) and `cargo test -p ken-core` (model catalog, selection, transcript, chat persistence pass).
-- [ ] **Type + build:** `pnpm exec svelte-check --tsconfig ./tsconfig.json` clean; the tauri crate builds.
-- [ ] **Live pass (per the `verify` skill):** exercise §3 (pinned header, moved Import/filter), §9 (first message, focus, autoscroll, send-failure, archive), §10 (settings rhythm, segmented Appearance, offline models select/download/remove, tri-state folders), §11 (148 MB xlsx notice, responsive app). Recording/TCC flows are out of this plan's scope.
+The naming policy ("Untitled.md" → "Untitled 2.md") and the folder-into-own-subtree safety check are pure functions in a new `fsops` module, so the Tauri commands (Task 14) stay thin shells. Note: `import.rs` has a *different* collision style (`report (2).pdf`, `disambiguate_name` at `import.rs:173`) which stays as-is for imports; §12 specifies the space-counter style for new documents, hence a separate function (the tiny `split_stem_ext` helper is duplicated rather than widening `import.rs` visibility).
+
+**Files:** Create `crates/ken-core/src/fsops.rs`; modify `crates/ken-core/src/lib.rs` (add `pub mod fsops;` to the module list at `:5-29`, alphabetically after `extract`).
+
+**Interfaces (consumed by `src-tauri/src/lib.rs`):**
+```rust
+pub fn numbered_name(desired: &str, exists: impl Fn(&str) -> bool) -> String;
+pub fn is_into_own_subtree(from_rel: &str, to_rel: &str) -> bool;
+```
+
+### Steps
+
+- [ ] **Write the failing tests.** Create `crates/ken-core/src/fsops.rs` with the tests first (module body below makes them compile in the next step):
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn taken(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn numbered_name_returns_the_desired_name_when_free() {
+        let t = taken(&[]);
+        assert_eq!(numbered_name("Untitled.md", |c| t.contains(c)), "Untitled.md");
+    }
+
+    #[test]
+    fn numbered_name_counts_up_past_collisions() {
+        let t = taken(&["Untitled.md"]);
+        assert_eq!(numbered_name("Untitled.md", |c| t.contains(c)), "Untitled 2.md");
+        let t = taken(&["Untitled.md", "Untitled 2.md"]);
+        assert_eq!(numbered_name("Untitled.md", |c| t.contains(c)), "Untitled 3.md");
+    }
+
+    #[test]
+    fn numbered_name_keeps_dotfiles_and_multi_dot_names_sane() {
+        let t = taken(&[".env"]);
+        assert_eq!(numbered_name(".env", |c| t.contains(c)), ".env 2");
+        let t = taken(&["a.tar.gz"]);
+        assert_eq!(numbered_name("a.tar.gz", |c| t.contains(c)), "a.tar 2.gz");
+    }
+
+    #[test]
+    fn subtree_guard_blocks_self_and_descendants_only() {
+        assert!(is_into_own_subtree("A", "A"));
+        assert!(is_into_own_subtree("A", "A/B"));
+        assert!(is_into_own_subtree("Meetings/2026", "Meetings/2026/Q1"));
+        assert!(!is_into_own_subtree("A", "AB")); // sibling sharing a name prefix
+        assert!(!is_into_own_subtree("A/B", "A")); // moving OUT of a subtree is fine
+        assert!(!is_into_own_subtree("A", "B/A"));
+    }
+}
+```
+
+- [ ] **Run & see them fail:** `cargo test -p ken-core fsops::` → compile error (functions missing / module unregistered).
+
+- [ ] **Implement.** Fill in `fsops.rs` above the tests:
+```rust
+//! Small pure helpers for user-driven file operations in the Files tree
+//! (create / rename / move, §12). Pure so the naming and safety policies are
+//! unit-tested without a filesystem; the Tauri commands are thin shells.
+
+/// Pick a document name that doesn't collide: `Untitled.md` → `Untitled 2.md`
+/// → `Untitled 3.md` (space + counter, before the extension — the §12 style;
+/// imports keep their own `report (2).pdf` style in `import.rs`). `exists` is
+/// injected so the policy tests without disk.
+pub fn numbered_name(desired: &str, exists: impl Fn(&str) -> bool) -> String {
+    if !exists(desired) {
+        return desired.to_string();
+    }
+    let (stem, ext) = split_stem_ext(desired);
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{stem} {n}{ext}");
+        if !exists(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Split a file name into (stem, extension-including-dot). The extension is the
+/// final `.suffix` only when a non-empty stem precedes it, so a dotfile like
+/// `.env` stays whole and the counter appends after it.
+fn split_stem_ext(file_name: &str) -> (&str, &str) {
+    match file_name.rfind('.') {
+        Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
+        _ => (file_name, ""),
+    }
+}
+
+/// Whether moving `from_rel` to `to_rel` would put a folder onto itself or
+/// inside its own subtree. Rel paths use '/' separators (the project-relative
+/// convention everywhere in Ken).
+pub fn is_into_own_subtree(from_rel: &str, to_rel: &str) -> bool {
+    to_rel == from_rel || to_rel.starts_with(&format!("{from_rel}/"))
+}
+```
+  Register the module in `crates/ken-core/src/lib.rs`: insert `pub mod fsops;` after `pub mod extract;` (`:13`).
+
+- [ ] **Run & pass:** `cargo test -p ken-core fsops::` → 4 tests pass.
+
+- [ ] **Commit:**
+```bash
+git add crates/ken-core/src/fsops.rs crates/ken-core/src/lib.rs
+git commit -m "feat(fsops): pure numbered-name dedup + folder-subtree move guard (§12)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
 
 ---
 
-## Coverage self-review (spec §3 / §9 / §10 / §11)
+## Task 14 — §12 Backend commands: `create_folder`, `create_document`, directory-aware `move_file`
+
+Add the two create commands and extend `move_file` (`src-tauri/src/lib.rs:918`) to accept directories. Current guards to preserve (read at `:927-939`): identical from/to is an Ok no-op; missing source is a friendly error; **an existing destination is refused** (never overwrite). Cross-device `EXDEV` fallback (`:944-952`) stays for files; a directory move across devices is refused with a friendly error (recursive copy is out of scope). Child index paths for a moved folder reconcile through the existing rescan path (`db.remove_folder` drops the old prefix rows — `db.rs:352` — then `scan::reindex` re-adds them at the new paths, exactly what the watcher would eventually do, but synchronously so the tree refresh that follows sees it).
+
+**Files:** Modify `src-tauri/src/lib.rs` (move_file `:918-959`; new commands after it; register in `invoke_handler!` beside `move_file`), `src/lib/api.ts` (after `moveFile` at `:400-401`).
+
+**Interfaces:**
+- `create_folder(rel_path: String) -> ()` — fails if anything with that name exists (UI validates first; this is the race backstop).
+- `create_document(rel_path: String) -> String` — dedupes the name via `fsops::numbered_name`, creates an empty file (`create_new`, never clobbers), indexes it via `scan::refresh_path`, returns the **final** project-relative path.
+- `move_file(from_rel, to_rel)` — unchanged signature plus a new `app: AppHandle` first parameter (Tauri injects it; the TS call site is unchanged); now accepts directories.
+
+### Steps
+
+- [ ] **Replace `move_file`** (`:907-959`, keeping the `EXDEV` const) with:
+```rust
+/// Move a file OR folder within the project. Both paths are validated to stay
+/// inside the project root (`resolve` rejects `..`/absolute escapes); overwriting
+/// an existing destination is refused. Folder moves (same-parent rename or a
+/// full move) rename the directory, then reconcile child index rows through the
+/// standard rescan — the same reconciliation the watcher does, but synchronous
+/// so the caller's tree refresh already sees it.
+#[tauri::command]
+fn move_file(
+    app: AppHandle,
+    state: State<SharedState>,
+    from_rel: String,
+    to_rel: String,
+) -> CmdResult<()> {
+    let (from_abs, to_abs) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        let from_abs = active.project.resolve(&from_rel).map_err(err)?;
+        let to_abs = active.project.resolve(&to_rel).map_err(err)?;
+        (from_abs, to_abs)
+    };
+
+    if from_abs == to_abs {
+        return Ok(());
+    }
+    if ken_core::fsops::is_into_own_subtree(&from_rel, &to_rel) {
+        return Err("A folder can't be moved into itself.".to_string());
+    }
+    let from_is_dir = from_abs.is_dir();
+    if !from_abs.is_file() && !from_is_dir {
+        return Err("That file or folder no longer exists.".to_string());
+    }
+    if to_abs.exists() {
+        let name = to_abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to_rel.clone());
+        return Err(format!("\u{201c}{name}\u{201d} already exists in that folder."));
+    }
+    if let Some(parent) = to_abs.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+
+    match std::fs::rename(&from_abs, &to_abs) {
+        Ok(()) => {}
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            if from_is_dir {
+                return Err(
+                    "That folder can't be moved across drives from here — move it in Finder instead."
+                        .to_string(),
+                );
+            }
+            std::fs::copy(&from_abs, &to_abs).map_err(err)?;
+            std::fs::remove_file(&from_abs).map_err(err)?;
+        }
+        Err(e) => return Err(err(e)),
+    }
+
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    if from_is_dir {
+        // Drop the old subtree's rows, then rescan so every child re-indexes at
+        // its new path (unchanged files elsewhere are skipped by the scanner).
+        active.db.remove_folder(&from_rel).map_err(err)?;
+        let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
+        let videos = stats.videos_needing_transcript.clone();
+        drop(guard);
+        enqueue_transcriptions(&app, state.inner(), &videos);
+        let _ = app.emit("index-updated", stats);
+    } else {
+        scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
+        scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
+    }
+    Ok(())
+}
+```
+
+- [ ] **Add the create commands** directly after `move_file`:
+```rust
+/// Create a folder. Fails when something with that name already exists (the UI
+/// validates sibling names first; this is the race-safety backstop). Folders
+/// aren't index rows — the tree walks them off disk — so no refresh is needed;
+/// the caller's tree refresh picks it up.
+#[tauri::command]
+fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    if abs.exists() {
+        let name = rel_path.rsplit('/').next().unwrap_or(&rel_path);
+        return Err(format!("\u{201c}{name}\u{201d} already exists here."));
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::create_dir(&abs).map_err(err)?;
+    Ok(())
+}
+
+/// Create an empty markdown document. `rel_path` names the desired location
+/// (e.g. "Meetings/Untitled.md"); a collision dedupes with a counter
+/// ("Untitled 2.md", …) rather than failing, and the FINAL project-relative
+/// path is returned so the UI opens the tab it actually created. The new file
+/// is indexed immediately so search and the tree stay correct before the
+/// watcher fires.
+#[tauri::command]
+fn create_document(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let desired_abs = active.project.resolve(&rel_path).map_err(err)?;
+    let dir = desired_abs
+        .parent()
+        .ok_or_else(|| "invalid document path".to_string())?
+        .to_path_buf();
+    let name = desired_abs
+        .file_name()
+        .ok_or_else(|| "invalid document name".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let final_name = ken_core::fsops::numbered_name(&name, |c| dir.join(c).exists());
+    let abs = dir.join(&final_name);
+    // create_new: never clobber a file that appeared between the dedupe and now.
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&abs)
+        .map_err(err)?;
+    let folder = match rel_path.rfind('/') {
+        Some(i) => &rel_path[..i],
+        None => "",
+    };
+    let final_rel = if folder.is_empty() {
+        final_name
+    } else {
+        format!("{folder}/{final_name}")
+    };
+    scan::refresh_path(&active.project, &mut active.db, &final_rel).map_err(err)?;
+    Ok(final_rel)
+}
+```
+  Register both in the `invoke_handler!` list next to `move_file`: add `create_folder,` and `create_document,`.
+
+- [ ] **api.ts.** After `moveFile` (`:400-401`) add:
+```ts
+  createFolder: (relPath: string) => invoke<void>("create_folder", { relPath }),
+  /** Returns the FINAL rel path (the name may have been deduped). */
+  createDocument: (relPath: string) =>
+    invoke<string>("create_document", { relPath }),
+```
+
+- [ ] **Build & test:** `cargo build` in `src-tauri` compiles (the fsops tests from Task 13 cover the pure logic; command shells follow the repo convention of live-test verification, same as `move_file` today). `cargo test -p ken-core` still green.
+
+- [ ] **Commit:**
+```bash
+git add src-tauri/src/lib.rs src/lib/api.ts
+git commit -m "feat(files): create_folder/create_document commands; move_file accepts directories (§12)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 15 — §12 Frontend naming policy + folder drag guards (pure modules + tests)
+
+The inline-edit validation/dedup-display logic and the extended `canDrop` are pure and vitest-tested (the repo already tests a runes `.svelte.ts` module — see `src/lib/find.svelte.test.ts` — so `dnd.svelte.test.ts` follows that pattern).
+
+**Files:** Create `src/files/naming.ts`, `src/files/naming.test.ts`, `src/files/dnd.svelte.test.ts`; modify `src/files/dnd.svelte.ts`.
+
+**Interfaces (consumed by `treeEdit.svelte.ts`, `TreeNodeRow.svelte`, `FileTree.svelte`):**
+```ts
+// naming.ts
+export function siblingNames(paths: string[], folder: string): string[];
+export function validateName(name: string, siblings: Iterable<string>): string | null; // message or null
+export function dedupedDocName(siblings: Iterable<string>): string; // "Untitled.md" | "Untitled 2.md" | …
+// dnd.svelte.ts
+drag.fromKind: "file" | "folder"; // NEW field, default "file"
+export function canDrop(folder: string): boolean; // now refuses folder → itself/own subtree
+```
+
+### Steps
+
+- [ ] **Write the failing naming test.** `src/files/naming.test.ts`:
+```ts
+import { describe, expect, it } from "vitest";
+import { dedupedDocName, siblingNames, validateName } from "./naming";
+
+describe("sibling listing", () => {
+  const paths = ["a.md", "Meetings/notes.md", "Meetings/2026", "Meetings/2026/deep.md", "Research"];
+  it("lists direct children of the root", () => {
+    expect(siblingNames(paths, "").sort()).toEqual(["Meetings", "Research", "a.md"]);
+  });
+  it("lists direct children of a folder, not grandchildren", () => {
+    expect(siblingNames(paths, "Meetings").sort()).toEqual(["2026", "notes.md"]);
+  });
+});
+
+describe("name validation", () => {
+  it("rejects empty and whitespace-only names", () => {
+    expect(validateName("", [])).toBe("Give it a name.");
+    expect(validateName("   ", [])).toBe("Give it a name.");
+  });
+  it("rejects slashes", () => {
+    expect(validateName("a/b.md", [])).toBe("Names can't contain “/”.");
+  });
+  it("rejects duplicate sibling names, case-insensitively", () => {
+    expect(validateName("Notes.md", ["notes.md"])).toBe("“Notes.md” already exists here.");
+  });
+  it("accepts a fresh name", () => {
+    expect(validateName("Plan.md", ["notes.md"])).toBeNull();
+  });
+});
+
+describe("default document name", () => {
+  it("starts at Untitled.md", () => {
+    expect(dedupedDocName([])).toBe("Untitled.md");
+  });
+  it("counts up past collisions (space + counter, per spec)", () => {
+    expect(dedupedDocName(["Untitled.md"])).toBe("Untitled 2.md");
+    expect(dedupedDocName(["Untitled.md", "Untitled 2.md"])).toBe("Untitled 3.md");
+  });
+});
+```
+
+- [ ] **Run & see it fail:** `pnpm vitest run src/files/naming.test.ts` → `Cannot find module './naming'`.
+
+- [ ] **Implement.** `src/files/naming.ts`:
+```ts
+// Naming rules for inline tree edits (§12): what a valid new name is, and the
+// deduped default a new document gets. Pure so vitest covers the policy; the
+// backend re-checks (move_file refuses overwrites, create_document dedupes) as
+// the race-safety layer.
+
+/** Names (last path segment) of the entries directly inside `folder` ("" = root). */
+export function siblingNames(paths: string[], folder: string): string[] {
+  const prefix = folder === "" ? "" : folder + "/";
+  const out: string[] = [];
+  for (const p of paths) {
+    if (!p.startsWith(prefix)) continue;
+    const rest = p.slice(prefix.length);
+    if (rest.length === 0 || rest.includes("/")) continue;
+    out.push(rest);
+  }
+  return out;
+}
+
+/** Human message for an invalid name, or null when valid. The duplicate check
+ *  is case-insensitive — projects live on case-insensitive filesystems (macOS
+ *  default, Dropbox/OneDrive). */
+export function validateName(name: string, siblings: Iterable<string>): string | null {
+  const trimmed = name.trim();
+  if (trimmed.length === 0) return "Give it a name.";
+  if (trimmed.includes("/")) return "Names can't contain “/”.";
+  const lower = trimmed.toLowerCase();
+  for (const s of siblings) {
+    if (s.toLowerCase() === lower) return `“${trimmed}” already exists here.`;
+  }
+  return null;
+}
+
+/** The prefilled name for a new document: "Untitled.md", counting up past
+ *  collisions ("Untitled 2.md", …) so the default is already committable.
+ *  Mirrors ken-core fsops::numbered_name, which the backend applies again. */
+export function dedupedDocName(siblings: Iterable<string>): string {
+  const taken = new Set([...siblings].map((s) => s.toLowerCase()));
+  if (!taken.has("untitled.md")) return "Untitled.md";
+  for (let n = 2; ; n++) {
+    const candidate = `Untitled ${n}.md`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+}
+```
+
+- [ ] **Run & pass:** `pnpm vitest run src/files/naming.test.ts`.
+
+- [ ] **Write the failing drag-guard test.** `src/files/dnd.svelte.test.ts`:
+```ts
+import { afterEach, describe, expect, it } from "vitest";
+import { canDrop, drag, parentOf } from "./dnd.svelte";
+
+afterEach(() => {
+  drag.reset();
+  drag.fromKind = "file";
+});
+
+describe("drag-and-drop guards", () => {
+  it("parentOf handles nested and top-level paths", () => {
+    expect(parentOf("a/b/c.md")).toBe("a/b");
+    expect(parentOf("c.md")).toBe("");
+  });
+
+  it("refuses drops when nothing is dragged", () => {
+    expect(canDrop("Meetings")).toBe(false);
+  });
+
+  it("refuses a no-op drop into the current parent", () => {
+    drag.from = "Meetings/notes.md";
+    expect(canDrop("Meetings")).toBe(false);
+    expect(canDrop("")).toBe(true);
+  });
+
+  it("lets a folder move to a different parent", () => {
+    drag.from = "Meetings";
+    drag.fromKind = "folder";
+    expect(canDrop("Research")).toBe(true);
+  });
+
+  it("refuses dropping a folder into itself or its own subtree", () => {
+    drag.from = "Meetings";
+    drag.fromKind = "folder";
+    expect(canDrop("Meetings")).toBe(false);
+    expect(canDrop("Meetings/2026")).toBe(false);
+    // A sibling merely sharing the name prefix is fine.
+    expect(canDrop("Meetings Archive")).toBe(true);
+  });
+});
+```
+
+- [ ] **Run & see it fail:** `pnpm vitest run src/files/dnd.svelte.test.ts` → `fromKind` missing / subtree cases fail.
+
+- [ ] **Implement.** In `src/files/dnd.svelte.ts`, add the field to `DragState` (after `from`, `:6`):
+```ts
+  /** What's being dragged — folders get the into-own-subtree drop guard. */
+  fromKind = $state<"file" | "folder">("file");
+```
+  and replace `canDrop` (`:27-29`):
+```ts
+/** Whether the dragged entry may drop into `folder` ("" = root). A dragged
+ *  folder may never drop into itself or its own subtree. */
+export function canDrop(folder: string): boolean {
+  if (drag.from === null) return false;
+  if (parentOf(drag.from) === folder) return false;
+  if (
+    drag.fromKind === "folder" &&
+    (folder === drag.from || folder.startsWith(drag.from + "/"))
+  ) {
+    return false;
+  }
+  return true;
+}
+```
+
+- [ ] **Run & pass:** `pnpm vitest run src/files/dnd.svelte.test.ts`.
+
+- [ ] **Commit:**
+```bash
+git add src/files/naming.ts src/files/naming.test.ts src/files/dnd.svelte.ts src/files/dnd.svelte.test.ts
+git commit -m "feat(files): inline-edit naming policy + folder drag subtree guard (§12)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 16 — §12 Prefix-aware tab/favorite renames on folder moves
+
+`app.moveFile` (`src/lib/app.svelte.ts:427-438`) rewrites only exact-path tabs (`renameTab`) and favorites (`renameFavorite`). A folder move must rewrite every open tab and favorite *under* the old prefix, or they dangle (tabs 404, favorites get pruned).
+
+**Files:** Modify `src/files/tabs.ts` (+ `src/files/tabs.test.ts`), `src/lib/favorites.ts` (+ `src/lib/favorites.test.ts`), `src/lib/app.svelte.ts` (`:37-46` imports, `:427-438` moveFile).
+
+**Interfaces:**
+```ts
+// tabs.ts
+export function renameTabsForMove(state: TabState, from: string, to: string): TabState;
+// favorites.ts
+export function renameFavoritesForMove(list: Favorite[], from: string, to: string): Favorite[];
+```
+
+### Steps
+
+- [ ] **Write the failing tests.** Append to `src/files/tabs.test.ts` (import `renameTabsForMove` in the header import block):
+```ts
+describe("renameTabsForMove", () => {
+  it("renames an exact file move, including the active path", () => {
+    let s = openTab(empty, "a.md", true);
+    s = renameTabsForMove(s, "a.md", "sub/a.md");
+    expect(s.tabs.map((t) => t.path)).toEqual(["sub/a.md"]);
+    expect(s.active).toBe("sub/a.md");
+  });
+
+  it("renames every tab under a moved folder's prefix", () => {
+    let s = openTab(empty, "Meetings/a.md", true);
+    s = openTab(s, "Meetings/2026/b.md", true);
+    s = openTab(s, "Research/c.md", true);
+    s = renameTabsForMove(s, "Meetings", "Archive/Meetings");
+    expect(s.tabs.map((t) => t.path)).toEqual([
+      "Archive/Meetings/a.md",
+      "Archive/Meetings/2026/b.md",
+      "Research/c.md",
+    ]);
+    expect(s.active).toBe("Research/c.md");
+  });
+
+  it("does not touch a sibling sharing the name prefix", () => {
+    let s = openTab(empty, "Meetings Archive/x.md", true);
+    s = renameTabsForMove(s, "Meetings", "Old");
+    expect(s.tabs[0].path).toBe("Meetings Archive/x.md");
+  });
+});
+```
+  Append to `src/lib/favorites.test.ts` (import `renameFavoritesForMove`):
+```ts
+describe("renameFavoritesForMove", () => {
+  it("renames exact and prefixed favorite paths on a folder move", () => {
+    const list = [
+      { path: "Meetings", kind: "folder" as const },
+      { path: "Meetings/notes.md", kind: "file" as const },
+      { path: "Research", kind: "folder" as const },
+    ];
+    const out = renameFavoritesForMove(list, "Meetings", "Archive/Meetings");
+    expect(out.map((f) => f.path)).toEqual([
+      "Archive/Meetings",
+      "Archive/Meetings/notes.md",
+      "Research",
+    ]);
+  });
+});
+```
+
+- [ ] **Run & see them fail:** `pnpm vitest run src/files/tabs.test.ts src/lib/favorites.test.ts` → missing exports.
+
+- [ ] **Implement.** Append to `src/files/tabs.ts` (after `renameTab`):
+```ts
+/** Rewrite tab paths after a move: an exact file move renames one tab; a folder
+ *  move renames every tab under the old prefix. */
+export function renameTabsForMove(state: TabState, from: string, to: string): TabState {
+  const map = (p: string) =>
+    p === from ? to : p.startsWith(from + "/") ? to + p.slice(from.length) : p;
+  return {
+    tabs: state.tabs.map((t) => ({ ...t, path: map(t.path) })),
+    active: state.active === null ? null : map(state.active),
+  };
+}
+```
+  Append to `src/lib/favorites.ts` (after `renameFavorite`):
+```ts
+/** Rewrite favorite paths after a move (file or folder — prefix-aware). */
+export function renameFavoritesForMove(
+  list: Favorite[],
+  from: string,
+  to: string,
+): Favorite[] {
+  return list.map((f) =>
+    f.path === from
+      ? { ...f, path: to }
+      : f.path.startsWith(from + "/")
+        ? { ...f, path: to + f.path.slice(from.length) }
+        : f,
+  );
+}
+```
+
+- [ ] **Run & pass:** `pnpm vitest run src/files/tabs.test.ts src/lib/favorites.test.ts`.
+
+- [ ] **Wire `app.moveFile`.** In `src/lib/app.svelte.ts`: add `renameFavoritesForMove` to the favorites import block (`:11-19`), add `renameTabsForMove` to the tabs import block (`:37-46`) and drop the now-unused `renameTab as reduceRenameTab`. Replace `moveFile` (`:427-438`):
+```ts
+  /** Move a file or folder: update open tabs, favorites, and the selection.
+   *  Folder moves rewrite every tab/favorite under the old prefix. */
+  async moveFile(fromRel: string, toRel: string) {
+    await api.moveFile(fromRel, toRel);
+    this.applyTabState(
+      renameTabsForMove({ tabs: this.fileTabs, active: this.activeTab }, fromRel, toRel),
+    );
+    this.favorites = renameFavoritesForMove(this.favorites, fromRel, toRel);
+    if (this.project) saveFavorites(this.project.id, this.favorites);
+    await this.refreshTree();
+  }
+```
+
+- [ ] **Type-check:** `pnpm exec svelte-check --tsconfig ./tsconfig.json` → clean.
+
+- [ ] **Commit:**
+```bash
+git add src/files/tabs.ts src/files/tabs.test.ts src/lib/favorites.ts src/lib/favorites.test.ts src/lib/app.svelte.ts
+git commit -m "feat(files): prefix-aware tab/favorite renames for folder moves (§12)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 17 — §12 Tree UI: inline editing, context-menu entries, folder drag
+
+The visible layer: an inline-edit store + input row, Rename/New-document/New-folder context-menu entries (rows and root area), and draggable folder rows. Keeps the existing ContextMenu idiom (ConfirmMenu stays reserved for destructive confirms — nothing here deletes). **Interaction with Tasks 3–5 (sticky header):** the root inline-create row renders *inside* `.nodes`, below the sticky `.files-head` (z-index 5), so it scrolls with the tree and never collides with the pinned header or its controls.
+
+**Files:** Create `src/files/treeEdit.svelte.ts`, `src/files/InlineNameRow.svelte`; modify `src/files/TreeNodeRow.svelte` (menu `:45-85`, folder button `:119-144`, file button `:145-179`), `src/files/FileTree.svelte` (`.nodes` block `:125-146` as renumbered after Task 5).
+
+**Interfaces:**
+```ts
+// treeEdit.svelte.ts
+export type TreeEditMode = "rename" | "new-document" | "new-folder";
+treeEdit.mode: TreeEditMode | null;
+treeEdit.target: string;   // rename: the relPath being renamed; creates: parent folder ("" = root)
+treeEdit.initial: string;  // prefill ("Untitled.md" deduped for new documents)
+treeEdit.beginRename(relPath: string): void;
+treeEdit.beginCreate(mode: "new-document" | "new-folder", folder: string): void;
+treeEdit.cancel(): void;
+treeEdit.commit(name: string): Promise<void>;
+// InlineNameRow.svelte props
+{ indent: number } // left padding in px, matching the row it replaces/joins
+```
+
+### Steps
+
+- [ ] **Create `src/files/treeEdit.svelte.ts`:**
+```ts
+// Inline-edit state for the Files tree (§12): one edit at a time — a rename of
+// an existing row, or a new-document/new-folder row inside a target folder
+// ("" = project root). Commit talks to the backend; validation errors surface
+// through the tree's existing non-blocking notice (drag.error), and the editor
+// stays open so the user can fix the name.
+import { api } from "../lib/api";
+import { app } from "../lib/app.svelte";
+import { drag, parentOf } from "./dnd.svelte";
+import { dedupedDocName, siblingNames, validateName } from "./naming";
+
+export type TreeEditMode = "rename" | "new-document" | "new-folder";
+
+class TreeEditState {
+  mode = $state<TreeEditMode | null>(null);
+  /** rename: the relPath being renamed; creates: the parent folder ("" = root). */
+  target = $state("");
+  initial = $state("");
+
+  private siblings(folder: string): string[] {
+    return siblingNames(
+      [...app.files.map((f) => f.relPath), ...app.folders.map((f) => f.relPath)],
+      folder,
+    );
+  }
+
+  beginRename(relPath: string) {
+    this.mode = "rename";
+    this.target = relPath;
+    this.initial = relPath.split("/").pop() ?? relPath;
+    drag.error = null;
+  }
+
+  beginCreate(mode: "new-document" | "new-folder", folder: string) {
+    this.mode = mode;
+    this.target = folder;
+    this.initial = mode === "new-document" ? dedupedDocName(this.siblings(folder)) : "";
+    drag.error = null;
+  }
+
+  cancel() {
+    this.mode = null;
+  }
+
+  async commit(name: string) {
+    const mode = this.mode;
+    if (!mode) return;
+    const trimmed = name.trim();
+    const folder = mode === "rename" ? parentOf(this.target) : this.target;
+    const currentName = mode === "rename" ? (this.target.split("/").pop() ?? "") : null;
+    if (mode === "rename" && trimmed === currentName) {
+      this.cancel(); // unchanged — nothing to do
+      return;
+    }
+    const siblings = this.siblings(folder).filter((s) => s !== currentName);
+    const invalid = validateName(trimmed, siblings);
+    if (invalid) {
+      drag.error = invalid; // the tree's non-blocking notice
+      return; // keep editing
+    }
+    const path = folder === "" ? trimmed : `${folder}/${trimmed}`;
+    const renameFrom = this.target;
+    this.mode = null;
+    drag.error = null;
+    try {
+      if (mode === "rename") {
+        await app.moveFile(renameFrom, path);
+      } else if (mode === "new-folder") {
+        await api.createFolder(path);
+        await app.refreshTree();
+      } else {
+        // The backend may dedupe further (race safety) — open what it made.
+        const finalRel = await api.createDocument(path);
+        await app.refreshTree();
+        app.openTab(finalRel, true);
+      }
+    } catch (e) {
+      drag.error = String(e);
+    }
+  }
+}
+
+export const treeEdit = new TreeEditState();
+```
+
+- [ ] **Create `src/files/InlineNameRow.svelte`:**
+```svelte
+<script lang="ts">
+  import { treeEdit } from "./treeEdit.svelte";
+
+  let { indent }: { indent: number } = $props();
+  let value = $state(treeEdit.initial);
+
+  // Autofocus and select the stem (not the extension) so typing replaces the
+  // interesting part of "Untitled.md". Runs once, on mount.
+  function setup(el: HTMLInputElement) {
+    el.focus();
+    const dot = treeEdit.initial.lastIndexOf(".");
+    el.setSelectionRange(0, dot > 0 ? dot : treeEdit.initial.length);
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void treeEdit.commit(value);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      treeEdit.cancel();
+    }
+  }
+</script>
+
+<div class="edit-row" style:padding-left={`${indent}px`}>
+  <input
+    use:setup
+    bind:value
+    spellcheck="false"
+    aria-label="Name"
+    onkeydown={onKeydown}
+    onblur={() => treeEdit.cancel()}
+  />
+</div>
+
+<style>
+  .edit-row {
+    display: flex;
+    align-items: center;
+    padding-top: 2px;
+    padding-bottom: 2px;
+    padding-right: 8px;
+  }
+  input {
+    width: 100%;
+    min-width: 0;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 3px 7px;
+    outline: none;
+  }
+</style>
+```
+  (Blur cancels quietly; Enter/Esc are the explicit verbs per spec. `treeEdit.cancel()` after a successful commit is a harmless no-op because `mode` is already null.)
+
+- [ ] **TreeNodeRow.svelte — imports.** Add:
+```ts
+  import Pencil from "@lucide/svelte/icons/pencil";
+  import FilePlus from "@lucide/svelte/icons/file-plus";
+  import FolderPlus from "@lucide/svelte/icons/folder-plus";
+  import { treeEdit } from "./treeEdit.svelte";
+  import InlineNameRow from "./InlineNameRow.svelte";
+```
+
+- [ ] **TreeNodeRow.svelte — menu entries.** In `rowMenu` (`:45-85`), insert after the "Open in default app" entry (and before the unread block):
+```ts
+      "separator",
+      ...(isFolder
+        ? ([
+            {
+              label: "New document",
+              icon: FilePlus,
+              onSelect: () => {
+                open = true; // creation happens inside this folder — show it
+                treeEdit.beginCreate("new-document", node.relPath);
+              },
+            },
+            {
+              label: "New folder",
+              icon: FolderPlus,
+              onSelect: () => {
+                open = true;
+                treeEdit.beginCreate("new-folder", node.relPath);
+              },
+            },
+          ] as MenuEntry[])
+        : []),
+      {
+        label: "Rename",
+        icon: Pencil,
+        onSelect: () => treeEdit.beginRename(node.relPath),
+      },
+```
+  All existing entries (Open/Expand, Open in default app, Mark as viewed, favorites) stay.
+
+- [ ] **TreeNodeRow.svelte — rename-in-place + create-inside rendering.** Replace the whole markup section (`:119-180`) with the following (the only changes from today's markup: the outer rename branch, `draggable` + drag handlers on the folder button, `drag.fromKind = "file"` in the file button's existing `ondragstart`, and the create row ahead of the children):
+```svelte
+{#if treeEdit.mode === "rename" && treeEdit.target === node.relPath}
+  <InlineNameRow indent={8 + depth * 18 + (isFolder ? 0 : 10)} />
+{:else if isFolder}
+  <button
+    class="row folder"
+    class:excluded={node.excluded}
+    class:drop-target={isDropTarget}
+    style:padding-left={`${8 + depth * 18}px`}
+    draggable="true"
+    onclick={() => (open = !open)}
+    oncontextmenu={rowMenu}
+    ondragstart={(e) => {
+      drag.from = node.relPath;
+      drag.fromKind = "folder";
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", node.relPath);
+      }
+    }}
+    ondragend={() => drag.reset()}
+    ondragover={onDragOver}
+    ondragleave={onDragLeave}
+    ondrop={onDrop}
+  >
+    <span class="chev">
+      {#if open}<ChevronDown size={14} strokeWidth={1.75} />{:else}<ChevronRight size={14} strokeWidth={1.75} />{/if}
+    </span>
+    <FileGlyph kind={open ? "folder-open" : "folder"} size="sm" />
+    <span class="name">{node.name}</span>
+    {#if node.excluded}
+      <span class="tag">excluded</span>
+    {/if}
+  </button>
+  {#if open && !node.excluded}
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
+      <InlineNameRow indent={8 + (depth + 1) * 18} />
+    {/if}
+    {#each node.children as child (child.relPath)}
+      <TreeNodeRow node={child} depth={depth + 1} {expandAll} />
+    {/each}
+  {/if}
+{:else}
+  <button
+    class="row file"
+    class:selected={app.openFile === node.relPath}
+    class:failed={node.file?.status === "failed"}
+    class:unread={isUnread}
+    style:padding-left={`${8 + depth * 18 + 10}px`}
+    draggable="true"
+    onclick={() => app.openTab(node.relPath, false)}
+    ondblclick={() => app.makeTabPersistent(node.relPath)}
+    oncontextmenu={rowMenu}
+    ondragstart={(e) => {
+      drag.from = node.relPath;
+      drag.fromKind = "file";
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", node.relPath);
+      }
+    }}
+    ondragend={() => drag.reset()}
+    title={node.file?.status === "failed"
+      ? `Not indexed — ${node.file.error ?? "unknown reason"}`
+      : node.file?.status === "cloud_only"
+        ? "Stored online only — open it and Ken will download it"
+        : node.relPath}
+  >
+    <FileGlyph kind={node.file?.kind ?? "binary"} size="sm" />
+    <span class="name">{node.name}</span>
+    {#if node.file?.status === "failed"}
+      <span class="fail-dot" title={node.file.error ?? "not indexed"}></span>
+    {:else if node.file?.status === "cloud_only"}
+      <CloudIcon class="cloud-dot" size={12} strokeWidth={1.75} />
+    {:else if isUnread}
+      <span class="unread-dot" title="Changed since you last looked"></span>
+    {/if}
+  </button>
+{/if}
+```
+  (The folder drop handlers `onDragOver`/`onDrop` already call `canDrop(node.relPath)`, which now refuses self/subtree targets from Task 15, and they fire on collapsed folders too — drop onto a collapsed folder targets that folder, per spec. The `<style>` block is unchanged.)
+
+- [ ] **FileTree.svelte — root menu + root create row.** Add imports:
+```ts
+  import FilePlus from "@lucide/svelte/icons/file-plus";
+  import FolderPlus from "@lucide/svelte/icons/folder-plus";
+  import { treeEdit } from "./treeEdit.svelte";
+  import InlineNameRow from "./InlineNameRow.svelte";
+```
+  Add the handler beside the root drag handlers:
+```ts
+  // Right-click on the tree's empty/root area (not a row — rows own their menus).
+  function onRootMenu(e: MouseEvent) {
+    if (e.target !== e.currentTarget) return;
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, [
+      {
+        label: "New document",
+        icon: FilePlus,
+        onSelect: () => treeEdit.beginCreate("new-document", ""),
+      },
+      {
+        label: "New folder",
+        icon: FolderPlus,
+        onSelect: () => treeEdit.beginCreate("new-folder", ""),
+      },
+    ]);
+  }
+```
+  Wire it on the `.nodes` div (`oncontextmenu={onRootMenu}` next to the existing `ondragover`/`ondrop`), and render the root create row as the first child of `.nodes`:
+```svelte
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === ""}
+      <InlineNameRow indent={8} />
+    {/if}
+```
+
+- [ ] **Type-check & manual verify (per `verify`).** `pnpm exec svelte-check` clean. In the live app:
+  - Right-click a **file** → Rename appears (plus existing entries); Rename swaps the row for an autofocused input with the stem selected; Enter renames (tab + favorite follow), Esc restores; a duplicate or `/`-containing name shows the notice near the tree and keeps editing.
+  - Right-click a **folder** → New document / New folder / Rename; creates open the inline row *inside* that folder (folder expands if collapsed); the new document is created with its (deduped) name and opens in a tab; the new folder appears in the tree.
+  - Right-click the **empty area** below the tree → New document / New folder at the root; the inline row appears at the top of the node list, under the pinned header (no overlap with the sticky "Files" row or its Import/filter controls).
+  - Renaming to the same name is a quiet no-op; renaming over an existing name is refused with "already exists" (backend guard) shown in the notice.
+  - **Folder drag:** drag a folder onto another folder (expanded or collapsed) → it moves, children re-appear under the new path, open tabs/favorites for its children follow; dragging a folder onto itself or into its own subtree shows no drop target and does nothing; dragging onto its current parent is a no-op; the root area accepts folder drops.
+  - Cross-check §3: the pinned header still pins during all of the above.
+
+- [ ] **Commit:**
+```bash
+git add src/files/treeEdit.svelte.ts src/files/InlineNameRow.svelte src/files/TreeNodeRow.svelte src/files/FileTree.svelte
+git commit -m "feat(files): inline rename/create in the tree + folder drag-and-drop (§12)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Final verification
+
+- [ ] **Full test suites:** `pnpm vitest run` (all TS/Svelte pure modules pass — including sizeGate, filesHeader, chatEcho, keySend, folderTree, naming, dnd guards, tabs/favorites move renames) and `cargo test -p ken-core` (model catalog, selection, transcript, chat persistence, fsops pass).
+- [ ] **Type + build:** `pnpm exec svelte-check --tsconfig ./tsconfig.json` clean; the tauri crate builds.
+- [ ] **Live pass (per the `verify` skill):** exercise §3 (pinned header, moved Import/filter), §9 (first message, focus, autoscroll, send-failure, archive), §10 (settings rhythm, segmented Appearance, offline models select/download/remove, tri-state folders), §11 (148 MB xlsx notice, responsive app), §12 (inline rename/create from row + root context menus, deduped Untitled names, new document opens in a tab, validation notices, folder drag with subtree guard, tabs/favorites following a folder move). Recording/TCC flows are out of this plan's scope.
+
+---
+
+## Coverage self-review (spec §3 / §9 / §10 / §11 / §12)
 
 - **§3** — header pinned (Task 5 sticky), "Manage folders" removed (Task 5), icon-only Import + compact All/Unread in header (Tasks 3–5), toolbar drops Import+filter keeps tab strip + Mark-all (Task 5). ✔
 - **§9** — first-message optimistic echo + reconcile (Tasks 6–7), focus on open/newChat/select/exit-terminal (Task 7c), backend persistence diagnosed + pinned (Tasks 6, 9). Audit items each a verify-and-fix task with acceptance criteria: send-failure visibility (drop pending + sendError, Task 7b + verify), autoscroll near-bottom (Task 7d), Enter/Shift+Enter (Task 7a keySend + test), suggested prompts (Task 7 verify), archive-active-chat state (Task 7b). ✔
 - **§10** — Offline Models card with Recommended/Advanced pair, inline download, quiet Remove, promise copy (Task 12); curated catalog with `category` field replacing discovery, download/verify plumbing kept, Transcription pair with exact files/sizes, persisted selection, Language variant appendable (Task 8); `transcript.rs` uses the selected model with installed fallback (Task 9); watched-folders tri-state tree (Tasks 11–12); three section headings + rhythm (Task 12); one-row segmented Appearance (Task 12). ✔
 - **§11** — per-format caps checked against `meta.size` before reading bytes, "too large" notice with open-external, app stays responsive, big-workbook regression as the pure `isPreviewTooLarge` test (Tasks 1–2). ✔
+- **§12** — context-menu additions on rows AND the root area, folder rows scoping creation inside (Task 17); inline editing with autofocus/Enter/Esc, `Untitled.md` dedupe, open-in-tab on create, validation via the `drag.error` notice (Tasks 15, 17); backends `create_folder` / `create_document -> final rel` with pure Rust dedup, `move_file` extended to directories keeping the refuse-overwrite guard, children reconciled via the existing rescan (Tasks 13–14); folders draggable with the into-own-subtree guard as a pure vitest-tested `canDrop` extension, collapsed folders as drop targets (Tasks 15, 17); tabs/favorites follow folder moves (Task 16). Interaction with §3 noted: the root inline row lives inside `.nodes` under the sticky header — no conflict. ✔
 
-No `TBD`/"similar to Task N"/"add error handling" placeholders. Interface names match the prompt: `ModelCategory { Transcription, Language }`, `ModelTier { Recommended, Advanced }`, `CatalogEntry { category, tier, blurb, spec }`, `catalog()`, `selected(base_dir, category)`. Deviations noted inline: `selected`/`set_selected` take `base_dir` and persist in a machine-level `models/selection.json` (not per-project `user_state`) because models are machine-wide; `blurb` lives on `CatalogEntry` (not `ModelSpec`) to keep the download identity untouched.
+No `TBD`/"similar to Task N"/"add error handling" placeholders. Interface names match the prompt: `ModelCategory { Transcription, Language }`, `ModelTier { Recommended, Advanced }`, `CatalogEntry { category, tier, blurb, spec }`, `catalog()`, `selected(base_dir, category)`. Deviations noted inline: `selected`/`set_selected` take `base_dir` and persist in a machine-level `models/selection.json` (not per-project `user_state`) because models are machine-wide; `blurb` lives on `CatalogEntry` (not `ModelSpec`) to keep the download identity untouched. §12 decisions: document dedup uses the spec's space-counter style (`Untitled 2.md`) in a new `fsops::numbered_name`, distinct from import's `report (2).pdf` style which is unchanged; directory moves reconcile via `db.remove_folder` + a synchronous `scan::reindex` (the "existing rescan" the spec names) and refuse cross-device directory moves rather than deep-copying; `create_document` dedupes server-side (race safety) while typed duplicate names are rejected client-side per the validation rule.
