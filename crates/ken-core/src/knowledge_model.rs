@@ -269,6 +269,98 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
     Ok(Extraction { entities, events })
 }
 
+/// Parse an already-decoded per-file extraction `Value` into a delta. Same
+/// hygiene as `parse_extraction` (name-required, kind coercion, dangling/self
+/// edge drops, unordered-pair dedup, date validation) but with per-file caps,
+/// a top-level `relations` array (a/b name entities), and no sources/source in
+/// the JSON — the merge attributes everything to the file being extracted.
+/// Infallible: a malformed value yields an empty delta.
+pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
+    let empty = Vec::new();
+    let mut entities: Vec<EntityInput> = Vec::new();
+    for item in value["entities"].as_array().unwrap_or(&empty) {
+        if entities.len() >= FILE_MAX_ENTITIES {
+            break;
+        }
+        let Some(name) = non_empty_str(&item["name"]) else {
+            continue;
+        };
+        let kind = item["kind"]
+            .as_str()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| ENTITY_KINDS.contains(&k.as_str()))
+            .unwrap_or_else(|| "other".into());
+        entities.push(EntityInput {
+            kind,
+            name,
+            summary: item["summary"].as_str().unwrap_or("").trim().to_string(),
+            sources: Vec::new(),
+            connections: Vec::new(),
+        });
+    }
+
+    // Resolve relations by case-insensitive name; drop dangling/self; collapse
+    // duplicate unordered pairs (first label wins); cap total relations.
+    let mut by_name: std::collections::HashMap<String, usize> = Default::default();
+    for (i, e) in entities.iter().enumerate() {
+        by_name.entry(e.name.to_lowercase()).or_insert(i);
+    }
+    let mut seen: std::collections::HashSet<(usize, usize)> = Default::default();
+    let mut relation_count = 0usize;
+    for rel in value["relations"].as_array().unwrap_or(&empty) {
+        if relation_count >= FILE_MAX_RELATIONS {
+            break;
+        }
+        let (Some(a_name), Some(b_name)) =
+            (non_empty_str(&rel["a"]), non_empty_str(&rel["b"]))
+        else {
+            continue;
+        };
+        let (Some(&a), Some(&b)) = (
+            by_name.get(&a_name.to_lowercase()),
+            by_name.get(&b_name.to_lowercase()),
+        ) else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let pair = (a.min(b), a.max(b));
+        if !seen.insert(pair) {
+            continue;
+        }
+        let label = rel["label"].as_str().unwrap_or("").trim().to_string();
+        entities[a].connections.push((b, label));
+        relation_count += 1;
+    }
+
+    let mut events: Vec<EventInput> = Vec::new();
+    for item in value["events"].as_array().unwrap_or(&empty) {
+        if events.len() >= FILE_MAX_EVENTS {
+            break;
+        }
+        let Some(text) = non_empty_str(&item["text"]) else {
+            continue;
+        };
+        let Some(date) = item["date"].as_str().map(str::trim).filter(|d| valid_date(d))
+        else {
+            continue;
+        };
+        let category = item["category"]
+            .as_str()
+            .and_then(|c| c.to_lowercase().split_whitespace().next().map(String::from))
+            .unwrap_or_else(|| "other".into());
+        events.push(EventInput {
+            date: date.to_string(),
+            category,
+            text,
+            source: String::new(),
+        });
+    }
+
+    Extraction { entities, events }
+}
+
 /// Build (or rebuild) the knowledge model: compose from the DB's
 /// indexed files, run one headless session, parse, store. A failed
 /// build returns an error and leaves the previous model untouched.
@@ -560,6 +652,62 @@ mod tests {
         let p = compose_file_prompt("big.md", &big, "2026-07-14");
         // The document body is capped; the surrounding instructions are small.
         assert!(p.matches('x').count() <= EXTRACT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn parse_delta_resolves_relations_and_enforces_caps() {
+        let v: serde_json::Value = serde_json::from_str(r#"{
+            "entities": [
+                {"kind": "person", "name": "Priya N.", "summary": "Owns billing."},
+                {"kind": "topic", "name": "Billing cutover", "summary": "The migration."},
+                {"kind": "person"},
+                {"kind": "sorcerer", "name": "LangdonSoft", "summary": "Vendor."}
+            ],
+            "relations": [
+                {"a": "priya n.", "b": "BILLING CUTOVER", "label": "owns"},
+                {"a": "Billing cutover", "b": "Priya N.", "label": "dup pair"},
+                {"a": "Priya N.", "b": "Priya N.", "label": "self"},
+                {"a": "Priya N.", "b": "Nobody", "label": "dangling"}
+            ],
+            "events": [
+                {"date": "2026-07-11", "category": "Decision Made", "text": "Sign-off."},
+                {"date": "sometime", "category": "x", "text": "bad date dropped"},
+                {"date": "2026-06-01", "text": ""}
+            ]
+        }"#).unwrap();
+        let ex = parse_delta_value(&v);
+        assert_eq!(ex.entities.len(), 3, "nameless dropped");
+        assert_eq!(ex.entities[2].kind, "other", "unknown kind coerced");
+        assert!(ex.entities[0].sources.is_empty(), "sources injected at merge");
+        // Relation resolved once (reverse duplicate + self + dangling dropped).
+        assert_eq!(ex.entities[0].connections, vec![(1, "owns".to_string())]);
+        assert!(ex.entities[1].connections.is_empty());
+        assert_eq!(ex.events.len(), 1);
+        assert_eq!(ex.events[0].category, "decision");
+        assert!(ex.events[0].source.is_empty());
+    }
+
+    #[test]
+    fn parse_delta_caps_are_per_file() {
+        let entities: Vec<String> = (0..60)
+            .map(|i| format!(r#"{{"kind":"topic","name":"E{i}","summary":""}}"#))
+            .collect();
+        let events: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{"date":"2026-01-{:02}","category":"x","text":"e{i}"}}"#, i % 28 + 1))
+            .collect();
+        let v: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"entities":[{}],"events":[{}]}}"#,
+            entities.join(","), events.join(",")
+        )).unwrap();
+        let ex = parse_delta_value(&v);
+        assert_eq!(ex.entities.len(), FILE_MAX_ENTITIES);
+        assert_eq!(ex.events.len(), FILE_MAX_EVENTS);
+    }
+
+    #[test]
+    fn parse_delta_empty_is_empty() {
+        let ex = parse_delta_value(&serde_json::json!({}));
+        assert!(ex.entities.is_empty() && ex.events.is_empty());
     }
 
     // ---------- auto-build policy ----------
