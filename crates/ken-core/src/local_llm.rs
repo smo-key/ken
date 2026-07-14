@@ -105,15 +105,10 @@ pub enum LlmStatus {
     Error(String),
 }
 
-/// Current availability of the on-device LLM. Stub for Task 1; later tasks
-/// resolve the selected model path and probe the engine.
-pub fn llm_status() -> LlmStatus {
-    LlmStatus::NotInstalled
-}
-
 // --- Task 3: the inference scheduler ---
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -227,15 +222,25 @@ impl LlmService {
         }
     }
 
-    /// Greedy generation parsed as JSON, retried once on a parse failure.
+    /// Greedy generation parsed as JSON, retried once on a parse failure. The
+    /// retry appends a short nudge to the prompt: with a deterministic (greedy)
+    /// sampler, resending the *identical* prompt would reproduce the same
+    /// non-JSON output, so the second attempt must perturb the input to have a
+    /// chance at succeeding.
     pub fn generate_json_via(
         &self,
         prompt: &str,
         priority: Priority,
     ) -> Result<serde_json::Value> {
+        const NUDGE: &str = "\n\nReturn ONLY valid JSON.";
         let mut last_err = None;
-        for _ in 0..2 {
-            let text = self.run(prompt, true, priority, &mut |_| true)?;
+        for attempt in 0..2 {
+            let this_prompt = if attempt == 0 {
+                prompt.to_string()
+            } else {
+                format!("{prompt}{NUDGE}")
+            };
+            let text = self.run(&this_prompt, true, priority, &mut |_| true)?;
             match parse_json_lenient(&text) {
                 Ok(v) => return Ok(v),
                 Err(e) => last_err = Some(e),
@@ -353,6 +358,224 @@ fn cached_load_status() -> Option<LlmStatus> {
         .clone()
 }
 
+// --- Task 4: process-global wiring + the real engine ---
+
+/// Process-global app-data dir, recorded once at startup by [`init`].
+static BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+/// The single process-wide service, spawned on first use.
+static SERVICE: OnceLock<LlmService> = OnceLock::new();
+
+/// Record the app-data base dir. Called once from the Tauri app's `run()`.
+pub fn init(base_dir: PathBuf) {
+    let cell = BASE_DIR.get_or_init(|| Mutex::new(None));
+    *cell.lock().unwrap() = Some(base_dir);
+}
+
+#[allow(dead_code)]
+fn base_dir() -> Option<PathBuf> {
+    BASE_DIR.get()?.lock().unwrap().clone()
+}
+
+/// Absolute path of the Language model file to load, if the app-data dir is
+/// known and one is installed. Delegates entirely to the catalog's resolver
+/// (installed selection → any installed in category → None), which goes through
+/// the same `model::target_path` the downloader writes to — load path and
+/// download path can never disagree.
+#[allow(dead_code)]
+fn installed_language_model() -> Option<PathBuf> {
+    let base = base_dir()?;
+    crate::model::selected_model_path(&base, crate::model::ModelCategory::Language)
+}
+
+fn service() -> &'static LlmService {
+    SERVICE.get_or_init(|| LlmService::spawn(make_real_engine))
+}
+
+/// Stream a completion at the given priority. See the trait contract: returns
+/// the full text; `on_token` returning `false` cancels.
+pub fn generate_stream(
+    prompt: &str,
+    priority: Priority,
+    on_token: &mut dyn FnMut(&str) -> bool,
+) -> Result<String> {
+    service().run(prompt, false, priority, on_token)
+}
+
+/// Greedy JSON generation, retried once (with a nudged prompt) on a parse failure.
+pub fn generate_json(prompt: &str, priority: Priority) -> Result<serde_json::Value> {
+    service().generate_json_via(prompt, priority)
+}
+
+/// True while an Interactive job is queued or running (the Background yield
+/// flag). Cheap; safe to poll frequently.
+pub fn interactive_pending() -> bool {
+    match SERVICE.get() {
+        Some(svc) => svc.interactive_pending(),
+        None => false,
+    }
+}
+
+/// Pure status precedence, factored out so it is testable without the process
+/// globals: a recorded load `Error` outranks the file check (a present-but-broken
+/// model must not read as `Ready`); otherwise an installed file is `Ready`, and
+/// nothing installed is `NotInstalled`.
+#[allow(dead_code)]
+fn status_from(cached: Option<LlmStatus>, installed: Option<PathBuf>) -> LlmStatus {
+    if let Some(LlmStatus::Error(e)) = cached {
+        return LlmStatus::Error(e);
+    }
+    match installed {
+        Some(_) => LlmStatus::Ready, // resolver only returns installed files
+        None => LlmStatus::NotInstalled,
+    }
+}
+
+/// Current status. Cheap: the catalog's installed-file resolution plus any
+/// cached load result.
+#[cfg(feature = "local-llm")]
+pub fn llm_status() -> LlmStatus {
+    status_from(cached_load_status(), installed_language_model())
+}
+
+/// Feature-off builds have no on-device model — the contract still exists so
+/// every caller falls back cleanly. (Same-signature pair, like `transcribe`.)
+#[cfg(not(feature = "local-llm"))]
+pub fn llm_status() -> LlmStatus {
+    LlmStatus::NotInstalled
+}
+
+/// Build the real llama.cpp engine from the installed Language model.
+#[cfg(feature = "local-llm")]
+fn make_real_engine() -> Result<Box<dyn Engine>> {
+    let path = installed_language_model()
+        .ok_or_else(|| Error::Other("the answers model isn't installed".into()))?;
+    Ok(Box::new(llama::LlamaEngine::load(&path)?))
+}
+
+/// Feature-off stub: no engine, and the error tells the scheduler to report it.
+#[cfg(not(feature = "local-llm"))]
+fn make_real_engine() -> Result<Box<dyn Engine>> {
+    Err(Error::Other(
+        "this build of Ken has no on-device language model".into(),
+    ))
+}
+
+/// The real llama.cpp engine, copying Task 1's VERIFIED llama-cpp-2 0.1.151 call
+/// sequence verbatim. `token_to_bytes`/`Special` are deprecated convenience
+/// wrappers (they run the `token_to_piece_bytes` buffer-resize loop internally);
+/// kept deliberately per the Task 1 report.
+#[cfg(feature = "local-llm")]
+#[allow(deprecated)]
+mod llama {
+    use std::num::NonZeroU32;
+    use std::path::Path;
+
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+    use llama_cpp_2::sampling::LlamaSampler;
+
+    use super::{Engine, Utf8Streamer};
+    use crate::{Error, Result};
+
+    /// The real llama.cpp engine. Holds the backend + weights for the process
+    /// lifetime; a fresh context is created per generation (cheap next to load).
+    pub struct LlamaEngine {
+        backend: LlamaBackend,
+        model: LlamaModel,
+        n_ctx: u32,
+        max_tokens: usize,
+    }
+
+    impl LlamaEngine {
+        pub fn load(path: &Path) -> Result<Self> {
+            let backend = LlamaBackend::init()
+                .map_err(|e| Error::Other(format!("couldn't start llama.cpp: {e}")))?;
+            let params = LlamaModelParams::default().with_n_gpu_layers(1000); // Metal: offload all
+            let model = LlamaModel::load_from_file(&backend, path, &params)
+                .map_err(|e| Error::Other(format!("couldn't load the answers model: {e}")))?;
+            Ok(LlamaEngine { backend, model, n_ctx: 8192, max_tokens: 1024 })
+        }
+    }
+
+    impl Engine for LlamaEngine {
+        fn generate(
+            &mut self,
+            prompt: &str,
+            greedy: bool,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<String> {
+            let ctx_params =
+                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.n_ctx));
+            let mut ctx = self
+                .model
+                .new_context(&self.backend, ctx_params)
+                .map_err(|e| Error::Other(format!("llama context failed: {e}")))?;
+
+            let tokens = self
+                .model
+                .str_to_token(prompt, AddBos::Always)
+                .map_err(|e| Error::Other(format!("tokenize failed: {e}")))?;
+
+            let mut batch = LlamaBatch::new(512, 1);
+            let last = tokens.len().saturating_sub(1);
+            for (i, tok) in tokens.iter().enumerate() {
+                batch
+                    .add(*tok, i as i32, &[0], i == last)
+                    .map_err(|e| Error::Other(format!("batch add failed: {e}")))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| Error::Other(format!("decode failed: {e}")))?;
+
+            let mut sampler = if greedy {
+                LlamaSampler::chain_simple([LlamaSampler::greedy()])
+            } else {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::temp(0.7),
+                    LlamaSampler::top_p(0.8, 1),
+                    LlamaSampler::dist(1234),
+                ])
+            };
+
+            let mut out = String::new();
+            // The byte→piece boundary: llama.cpp emits raw token bytes and a
+            // multi-byte char can straddle two tokens, so reassemble here.
+            let mut streamer = Utf8Streamer::new();
+            let mut n_cur = batch.n_tokens();
+
+            for _ in 0..self.max_tokens {
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+                if self.model.is_eog_token(token) {
+                    break;
+                }
+                let bytes = self
+                    .model
+                    .token_to_bytes(token, Special::Plaintext)
+                    .map_err(|e| Error::Other(format!("detokenize failed: {e}")))?;
+                let piece = streamer.push(&bytes);
+                if !piece.is_empty() {
+                    out.push_str(&piece);
+                    if !on_token(&piece) {
+                        break;
+                    }
+                }
+
+                batch.clear();
+                batch
+                    .add(token, n_cur, &[0], true)
+                    .map_err(|e| Error::Other(format!("batch add failed: {e}")))?;
+                n_cur += 1;
+                ctx.decode(&mut batch)
+                    .map_err(|e| Error::Other(format!("decode failed: {e}")))?;
+            }
+            Ok(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +625,41 @@ mod tests {
     #[test]
     fn json_errors_when_there_is_no_object() {
         assert!(parse_json_lenient("no json here at all").is_err());
+    }
+
+    #[test]
+    fn status_precedence_error_outranks_present_file() {
+        use std::path::PathBuf;
+        // A cached load Error wins even when a model file is present on disk.
+        let s = status_from(
+            Some(LlmStatus::Error("boom".into())),
+            Some(PathBuf::from("/models/x.gguf")),
+        );
+        assert_eq!(s, LlmStatus::Error("boom".into()));
+    }
+
+    #[test]
+    fn status_ready_when_installed_and_no_load_error() {
+        use std::path::PathBuf;
+        assert_eq!(
+            status_from(None, Some(PathBuf::from("/models/x.gguf"))),
+            LlmStatus::Ready
+        );
+        // A cached Ready doesn't override a genuine install check either way.
+        assert_eq!(
+            status_from(Some(LlmStatus::Ready), Some(PathBuf::from("/models/x.gguf"))),
+            LlmStatus::Ready
+        );
+    }
+
+    #[test]
+    fn status_not_installed_when_nothing_on_disk() {
+        assert_eq!(status_from(None, None), LlmStatus::NotInstalled);
+        // No cached error, nothing installed → NotInstalled (not Ready).
+        assert_eq!(
+            status_from(Some(LlmStatus::Ready), None),
+            LlmStatus::NotInstalled
+        );
     }
 
     // --- Task 3: LlmService scheduler (fake engine) ---
@@ -507,6 +765,39 @@ mod tests {
         });
         let v = svc.generate_json_via("x", Priority::Background).unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn json_retry_nudges_the_prompt() {
+        // First generation is bad JSON → retry. With a deterministic sampler the
+        // retry must NOT resend the identical prompt (that would reproduce the
+        // same bad output); it appends a "return only JSON" nudge.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = {
+            let order = order.clone();
+            LlmService::spawn(move || {
+                let mut scripts = VecDeque::new();
+                scripts.push_back(vec!["not json".to_string()]);
+                scripts.push_back(vec!["{\"ok\":true}".to_string()]);
+                Ok(Box::new(FakeEngine {
+                    scripts,
+                    gate: None,
+                    started: Arc::new(AtomicUsize::new(0)),
+                    order: Some(order),
+                }) as Box<dyn Engine>)
+            })
+        };
+        let v = svc.generate_json_via("base prompt", Priority::Background).unwrap();
+        assert_eq!(v["ok"], true);
+        let log = order.lock().unwrap().clone();
+        assert_eq!(log.len(), 2, "one initial attempt + one retry");
+        assert_eq!(log[0], "base prompt");
+        assert_ne!(log[1], log[0], "retry prompt differs from the first");
+        assert!(
+            log[1].starts_with("base prompt") && log[1].contains("valid JSON"),
+            "retry appends a JSON nudge: {:?}",
+            log[1]
+        );
     }
 
     #[test]
