@@ -145,3 +145,42 @@ impl CaptureSource for MicSource {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ScreenCaptureKit — compile-probe (Task 13)
+//
+// Confirmed screencapturekit 8.0.0 API surface (verified against the crate
+// source), for the system-audio backend below:
+//   - screencapturekit::shareable_content::SCShareableContent::get()
+//         -> Result<SCShareableContent, SCError>
+//   - SCShareableContent::displays()                 -> Vec<SCDisplay>
+//   - SCContentFilter::create()
+//         .with_display(&SCDisplay)
+//         .with_excluding_windows(&[&SCWindow])       // empty slice ok
+//         .build()                                     -> SCContentFilter
+//   - SCStreamConfiguration::new()
+//         .with_captures_audio(true)                   // infallible builder
+//         .with_sample_rate(impl Into<i32>)
+//         .with_channel_count(impl Into<i32>)          -> Self
+//   - SCStream::new(&filter, &config)                  -> SCStream
+//   - SCStream::add_output_handler(handler, SCStreamOutputType::Audio) (&mut self)
+//   - SCStream::start_capture() / stop_capture()       -> Result<(), SCError> (&self)
+//   - trait SCStreamOutputTrait::did_output_sample_buffer(
+//         &self, sample: CMSampleBuffer, of_type: SCStreamOutputType)
+//   - SCStreamOutputType::{Screen, Audio, Microphone}
+//   - CMSampleBufferExt::audio_buffer_list(&self) -> Option<AudioBufferList>
+//   - AudioBufferList::{num_buffers(), get(i) -> Option<&AudioBuffer>}
+//   - AudioBuffer::{data() -> &[u8], number_channels: u32}   (32-bit float PCM)
+// ---------------------------------------------------------------------------
+
+/// Compile-probe: confirm the pinned ScreenCaptureKit v8 API by listing
+/// shareable displays synchronously. Its only purpose is to lock the exact
+/// module paths / method names before the capture backend below (the crate's
+/// API churns across majors). Kept as a hand-run sanity check.
+#[allow(dead_code)]
+pub fn sck_probe() -> Result<usize> {
+    use screencapturekit::shareable_content::SCShareableContent;
+    let content = SCShareableContent::get()
+        .map_err(|e| Error::Other(format!("ScreenCaptureKit unavailable: {e}")))?;
+    Ok(content.displays().len())
+}
