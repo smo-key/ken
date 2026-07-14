@@ -1,19 +1,21 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use ken_core::assistant::{self, OneshotOutcome};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
+use ken_core::cloud;
 use ken_core::db::{
     db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, DigestRow, EdgeRow, EntityRow,
     EventRow, FileRow, RunRow, SearchHit,
 };
 use ken_core::digest;
-use ken_core::knowledge_model;
+use ken_core::knowledge_model::{self, AutoBuildContext, AutoBuildTracker};
+use ken_core::model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
 use ken_core::research;
 use ken_core::runner::{CancelToken, RunOutcome};
@@ -24,6 +26,8 @@ use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::scan::{self, ScanStats};
 use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
+use ken_core::transcript;
+use ken_core::user_state::{self, UserState};
 use ken_core::watch::{self, WatchHandle};
 
 enum TerminalHandle {
@@ -36,6 +40,11 @@ enum TerminalHandle {
 struct ActiveProject {
     project: Project,
     db: Db,
+    /// Dedicated read-only connection for `search`, on its OWN mutex so a
+    /// keystroke's query never contends on the global `AppState` lock (which
+    /// every other command and the background workers hold). WAL lets this
+    /// reader run concurrently with the writers and still see their commits.
+    search_db: Arc<Mutex<Db>>,
     _watch: WatchHandle,
     engine: Arc<IngestEngine>,
     chat_engine: Option<Arc<ChatEngine>>,
@@ -47,14 +56,50 @@ struct ActiveProject {
     digest_running: Arc<AtomicBool>,
     /// True while a knowledge-model build thread is running.
     knowledge_running: Arc<AtomicBool>,
+    /// Change/scan/build bookkeeping behind automatic Map & Timeline builds.
+    auto_knowledge: Arc<AutoBuildTracker>,
+    /// Stops the auto-build tick when this project closes.
+    _knowledge_ticker: StopOnDrop,
+    /// Stops the background cloud-hydration worker when this project closes.
+    _bg_hydrate: StopOnDrop,
     /// Live research runs: chat/session id → cancel token.
     research: Arc<Mutex<std::collections::HashMap<String, CancelToken>>>,
+    /// Video transcription bookkeeping shared by the manual command and the
+    /// automatic ingest enqueue.
+    transcripts: Arc<Mutex<TranscriptJobs>>,
+}
+
+/// Which videos are being transcribed now, and which have already been tried
+/// this session. `attempted` stops an automatic transcription that failed
+/// (bad audio, a Whisper error) from being retried on every scan — the same
+/// converge-don't-thrash discipline the cloud retry rule follows.
+#[derive(Default)]
+struct TranscriptJobs {
+    in_flight: std::collections::HashSet<String>,
+    attempted: std::collections::HashSet<String>,
+}
+
+/// A long-lived worker thread's stop signal, flipped when the project it
+/// belongs to is dropped (project switch or shutdown).
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 struct AppState {
     base_dir: PathBuf,
     hooks: Option<Arc<HookListener>>,
     active: Option<ActiveProject>,
+    /// Model downloads are app-global (they live under the app-data dir, not a
+    /// project), so their bookkeeping hangs off the top-level state: the set of
+    /// model ids downloading right now (guards a second concurrent download of
+    /// the same id) and a cache of the runtime-discovered model listing so we
+    /// don't re-hit the network on every status/download call.
+    model_downloads: Arc<Mutex<std::collections::HashSet<String>>>,
+    model_cache: Arc<Mutex<Option<Vec<model::ModelSpec>>>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -118,6 +163,14 @@ fn err(e: impl std::fmt::Display) -> String {
 /// Activate a project: register it, open its DB, start the watcher, and
 /// kick off a background scan that reports through events.
 fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult<ProjectInfo> {
+    // The asset protocol streams this project's videos to the webview with
+    // range support and no JS memory copy. Grant its root at runtime — project
+    // roots are chosen by the user, so the static config scope can't name them.
+    {
+        use tauri::Manager as _;
+        let _ = app.asset_protocol_scope().allow_directory(&project.root, true);
+    }
+
     let mut guard = state.lock().unwrap();
 
     let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
@@ -128,7 +181,27 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
     let watch_db_path = db_path(&guard.base_dir, project.config.id);
 
+    // One-time unread baseline: snapshot the already-indexed files (this DB
+    // persists across sessions, so an existing project has them here) as "seen"
+    // so opening a project for the first time under this feature doesn't flag
+    // every file. Only files that change or are added AFTER this point count as
+    // unread. No-op once the project has been baselined before.
+    {
+        let mut us = UserState::load(&guard.base_dir, project.config.id);
+        if !us.baselined {
+            if let Ok(files) = db.list_files() {
+                us.baseline(&index_versions(&files));
+                let _ = us.save(&guard.base_dir, project.config.id);
+            }
+        }
+    }
+
     let chat_db = Arc::new(Mutex::new(Db::open(&guard.base_dir, project.config.id).map_err(err)?));
+
+    // Opened after `Db::open` above created and migrated the file, so the
+    // read-only handle is guaranteed something to attach to.
+    let search_db =
+        Arc::new(Mutex::new(Db::open_read_only(&guard.base_dir, project.config.id).map_err(err)?));
 
     let hooks = match &guard.hooks {
         Some(h) => h.clone(),
@@ -166,6 +239,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                         created_at: now,
                         last_active_at: now,
                         archived: false,
+                        model: None,
                     });
                     let _ = db.upsert_chat(&ChatRow {
                         status: status.into(),
@@ -250,9 +324,13 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         .map_err(err)?,
     );
 
+    let auto_knowledge = Arc::new(AutoBuildTracker::new());
+
     let emit_app = app.clone();
     let watch_engine = engine.clone();
     let watch_sync = sync_engine.clone();
+    let watch_knowledge = auto_knowledge.clone();
+    let watch_state = state.clone();
     let watch = watch::start(
         project.clone(),
         watch_db_path,
@@ -261,16 +339,23 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
             if !stats.changed_paths.is_empty() {
                 watch_engine.sources_changed(stats.changed_paths.clone());
                 watch_sync.changed(stats.changed_paths.clone());
+                // Same signal, slower consumer: the knowledge model is
+                // rebuilt only once the changes stop coming.
+                watch_knowledge.changed();
             }
+            enqueue_transcriptions(&emit_app, &watch_state, &stats.videos_needing_transcript);
             let _ = emit_app.emit("index-updated", stats.clone());
         },
     )
     .map_err(err)?;
 
+    let stop = Arc::new(AtomicBool::new(false));
+    let bg_stop = Arc::new(AtomicBool::new(false));
     let info = ProjectInfo::of(&project);
     guard.active = Some(ActiveProject {
         project: project.clone(),
         db,
+        search_db,
         _watch: watch,
         engine,
         chat_engine,
@@ -279,7 +364,11 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         digest_running: Arc::new(AtomicBool::new(false)),
         knowledge_running: Arc::new(AtomicBool::new(false)),
+        auto_knowledge: auto_knowledge.clone(),
+        _knowledge_ticker: StopOnDrop(stop.clone()),
+        _bg_hydrate: StopOnDrop(bg_stop.clone()),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        transcripts: Arc::new(Mutex::new(TranscriptJobs::default())),
     });
     drop(guard);
 
@@ -289,15 +378,20 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     // Initial scan in the background so opening stays instant.
     let scan_app = app.clone();
     let scan_sync = sync_engine.clone();
+    let scan_knowledge = auto_knowledge.clone();
+    let scan_state = state.clone();
     let base = { state.lock().unwrap().base_dir.clone() };
+    let scan_project = project.clone();
     std::thread::spawn(move || {
-        if let Ok(mut db) = Db::open(&base, project.config.id) {
+        if let Ok(mut db) = Db::open(&base, scan_project.config.id) {
             let _ = scan_app.emit("scan-started", ());
-            match scan::scan(&project, &mut db) {
+            match scan::scan(&scan_project, &mut db) {
                 Ok(stats) => {
                     if !stats.changed_paths.is_empty() {
                         scan_sync.changed(stats.changed_paths.clone());
+                        scan_knowledge.changed();
                     }
+                    enqueue_transcriptions(&scan_app, &scan_state, &stats.videos_needing_transcript);
                     let _ = scan_app.emit("index-updated", stats);
                 }
                 Err(e) => {
@@ -305,12 +399,166 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                 }
             }
         }
+        // Whatever happened, the folder is no longer being walked — a
+        // knowledge build may now read a complete file list.
+        scan_knowledge.scan_finished();
+    });
+
+    // One tick per project decides whether the Map & Timeline model needs
+    // (re)building — no thread per change, and the decision itself is the
+    // pure policy in ken-core.
+    let tick_app = app.clone();
+    let tick_state = state.clone();
+    let tick_id = project.config.id;
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(KNOWLEDGE_TICK);
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            maybe_auto_build_knowledge(&tick_app, &tick_state, tick_id);
+        }
+    });
+
+    // A low-priority worker that downloads cloud-offline DOCUMENTS in the
+    // background so they become searchable without the user opening each one.
+    // One thread per project, stopped by `_bg_hydrate` on close, gated on the
+    // persisted `backgroundIndex` setting, and paced so it never fights the
+    // transcript/knowledge workers or the user's own downloads.
+    let bg_app = app.clone();
+    let bg_state = state.clone();
+    let bg_id = project.config.id;
+    std::thread::spawn(move || {
+        background_hydrate_worker(bg_app, bg_state, bg_id, bg_stop);
     });
 
     // The morning digest may be due the moment a project opens.
     let _ = maybe_generate_digest(app, state, false);
 
     Ok(info)
+}
+
+/// How often the background hydration worker wakes to look for cloud-only
+/// documents to pull down. Long on purpose: this is opportunistic work that
+/// must stay out of the way.
+const BG_HYDRATE_TICK: Duration = Duration::from_secs(20);
+
+/// Per-file download budget for one background attempt. Far shorter than the
+/// on-open `cloud::DEFAULT_DEADLINE` (300s) — nobody is waiting on this, so a
+/// slow file is abandoned quickly (its provider keeps downloading) and retried
+/// on a later tick instead of pinning the single worker to one file.
+const BG_HYDRATE_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Quiet gap between two background downloads so a large backlog trickles in
+/// rather than saturating disk and bandwidth in a burst.
+const BG_HYDRATE_PACING: Duration = Duration::from_secs(3);
+
+/// Minimum wait before retrying a file that failed to materialize. A provider
+/// that's offline (or a file that keeps timing out) must not be hammered every
+/// tick — the backoff makes a persistent failure quiet instead of a spin.
+const BG_HYDRATE_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The worker loop. Sequential and single-threaded, so there's no in-flight
+/// dedup to do beyond the per-file backoff map; all file I/O runs OFF the
+/// global lock against a private `Db` handle (the same pattern `hydrate_file`
+/// and the background scan use), so it never freezes the UI.
+fn background_hydrate_worker(
+    app: AppHandle,
+    state: SharedState,
+    project_id: uuid::Uuid,
+    stop: Arc<AtomicBool>,
+) {
+    // rel_path -> earliest instant we may retry after a failed hydrate.
+    let mut backoff: std::collections::HashMap<String, Instant> = Default::default();
+
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(BG_HYDRATE_TICK);
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Snapshot everything the tick needs, then drop the lock immediately —
+        // the download and re-index below must not hold it. A different project
+        // being open means this tick is stale (the drop guard will stop us).
+        let (base, project, engine, sync, auto_knowledge) = {
+            let guard = state.lock().unwrap();
+            let Some(active) = guard.active.as_ref() else {
+                continue;
+            };
+            if active.project.config.id != project_id {
+                return;
+            }
+            if !ken_core::bg_hydrate::background_index_enabled(&active.project) {
+                continue; // feature off → idle, but keep the thread alive
+            }
+            (
+                guard.base_dir.clone(),
+                active.project.clone(),
+                active.engine.clone(),
+                active.sync.clone(),
+                active.auto_knowledge.clone(),
+            )
+        };
+
+        // Read the cloud-only document backlog off a private handle.
+        let Ok(db) = Db::open(&base, project_id) else {
+            continue;
+        };
+        let Ok(files) = db.list_files() else {
+            continue;
+        };
+        drop(db);
+        let pending = ken_core::bg_hydrate::pending_documents(&files, &project);
+
+        for rel in pending {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            // Respect the backoff for a file that recently refused to arrive.
+            if backoff.get(&rel).is_some_and(|&until| Instant::now() < until) {
+                continue;
+            }
+            let Ok(abs) = project.resolve(&rel) else {
+                continue;
+            };
+
+            match cloud::hydrate_with_deadline(&abs, BG_HYDRATE_DEADLINE) {
+                Ok(()) => {
+                    backoff.remove(&rel);
+                    // Re-index off the global lock, on a private handle: a
+                    // committed write is visible to the app's own reads.
+                    let changed = Db::open(&base, project_id)
+                        .ok()
+                        .and_then(|mut db| scan::refresh_path(&project, &mut db, &rel).ok())
+                        .unwrap_or(false);
+                    if changed {
+                        // Same downstream notifications `hydrate_file` fires, so
+                        // a just-downloaded doc reaches ingests, Map/Timeline and
+                        // sync, and the footer's cloud_only count drops.
+                        let paths = vec![rel.clone()];
+                        engine.sources_changed(paths.clone());
+                        sync.changed(paths.clone());
+                        auto_knowledge.changed();
+                        let _ = app.emit(
+                            "index-updated",
+                            ScanStats {
+                                changed_paths: paths,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    // Pace the backlog so it trickles rather than bursts.
+                    std::thread::sleep(BG_HYDRATE_PACING);
+                }
+                // Provider offline, or the file is still downloading past the
+                // short deadline: leave the row cloud_only and try later. Never
+                // an error — nobody asked for this work.
+                Err(_) => {
+                    backoff.insert(rel, Instant::now() + BG_HYDRATE_BACKOFF);
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -348,6 +596,49 @@ fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     registry.save(&guard.base_dir).map_err(err)
 }
 
+/// Rename a project. The name lives in two stores that must stay in step: the
+/// project's own `.ken/project.json` (source of truth, travels with the folder)
+/// and the user-level registry (drives the switcher/recents). When the renamed
+/// project is the open one, the in-memory copy is updated too so the title bar
+/// and switcher reflect it without a reopen.
+#[tauri::command]
+fn rename_project(
+    state: State<SharedState>,
+    id: String,
+    name: String,
+) -> CmdResult<ProjectInfo> {
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    let mut guard = state.lock().unwrap();
+    let base_dir = guard.base_dir.clone();
+
+    let mut registry = Registry::load(&base_dir).map_err(err)?;
+    let entry_path = registry
+        .projects
+        .iter()
+        .find(|e| e.id == uuid)
+        .map(|e| e.path.clone())
+        .ok_or("unknown project")?;
+
+    // Rewrite `.ken/project.json`, validating first — an invalid name aborts
+    // here before either store is touched.
+    let info = if let Some(active) =
+        guard.active.as_mut().filter(|a| a.project.config.id == uuid)
+    {
+        active.project.set_name(&name).map_err(err)?;
+        ProjectInfo::of(&active.project)
+    } else {
+        let mut project = Project::open(&entry_path).map_err(err)?;
+        project.set_name(&name).map_err(err)?;
+        ProjectInfo::of(&project)
+    };
+
+    if let Some(entry) = registry.projects.iter_mut().find(|e| e.id == uuid) {
+        entry.name = info.name.clone();
+    }
+    registry.save(&base_dir).map_err(err)?;
+    Ok(info)
+}
+
 /// The id of the most recently opened project, for launch-to-last-project.
 #[tauri::command]
 fn last_project_id(state: State<SharedState>) -> CmdResult<Option<String>> {
@@ -373,6 +664,9 @@ fn set_folder_selection(
     active.project.set_excluded(excluded).map_err(err)?;
     let stats = scan::scan(&active.project, &mut active.db).map_err(err)?;
     let info = ProjectInfo::of(&active.project);
+    let videos = stats.videos_needing_transcript.clone();
+    drop(guard);
+    enqueue_transcriptions(&app, state.inner(), &videos);
     let _ = app.emit("index-updated", stats);
     Ok(info)
 }
@@ -412,26 +706,121 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
 
 #[tauri::command]
 fn search(state: State<SharedState>, query: String, limit: Option<usize>) -> CmdResult<Vec<SearchHit>> {
+    // Hold the global lock only long enough to clone the Arc (microseconds),
+    // then release it so the FTS query runs on the dedicated read-only handle
+    // without serializing against every other command and background worker.
+    let search_db = {
+        let guard = state.lock().unwrap();
+        guard.active.as_ref().ok_or("no project open")?.search_db.clone()
+    };
+    let db = search_db.lock().unwrap();
+    db.search(&query, limit.unwrap_or(30)).map_err(err)
+}
+
+/// Error code the frontend matches on to offer a download instead of a
+/// failure: the file's bytes are still in the cloud.
+const CLOUD_ONLY_ERR: &str = "CLOUD_ONLY";
+
+/// Resolve a project-relative path without holding the state lock across the
+/// file I/O that follows. Reads can block for a long time (a cloud
+/// placeholder downloads on first read), and the lock serializes every other
+/// command in the app.
+fn resolve_path(state: &State<SharedState>, rel_path: &str) -> CmdResult<PathBuf> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
-    active.db.search(&query, limit.unwrap_or(30)).map_err(err)
+    active.project.resolve(rel_path).map_err(err)
 }
 
 #[tauri::command]
 fn read_file(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
-    let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    let abs = resolve_path(&state, &rel_path)?;
+    if cloud::is_placeholder(&abs) {
+        return Err(CLOUD_ONLY_ERR.into());
+    }
     std::fs::read_to_string(&abs).map_err(err)
 }
 
 #[tauri::command]
 fn read_file_bytes(state: State<SharedState>, rel_path: String) -> CmdResult<tauri::ipc::Response> {
-    let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    let abs = resolve_path(&state, &rel_path)?;
+    if cloud::is_placeholder(&abs) {
+        return Err(CLOUD_ONLY_ERR.into());
+    }
     let bytes = std::fs::read(&abs).map_err(err)?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Is this file a cloud placeholder (OneDrive/iCloud "online-only")?
+#[tauri::command]
+fn is_cloud_only(state: State<SharedState>, rel_path: String) -> CmdResult<bool> {
+    Ok(cloud::is_placeholder(&resolve_path(&state, &rel_path)?))
+}
+
+/// Download a cloud placeholder's bytes, then index its content. The download
+/// blocks for as long as the provider takes (minutes, for a big file — see
+/// `cloud::hydrate`), so it runs on a blocking thread with no lock held; the
+/// rest of the app stays responsive meanwhile.
+#[tauri::command]
+async fn hydrate_file(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    rel_path: String,
+) -> CmdResult<()> {
+    let abs = resolve_path(&state, &rel_path)?;
+    let path = abs.clone();
+    tauri::async_runtime::spawn_blocking(move || ken_core::cloud::hydrate(&path))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+
+    // Snapshot everything the re-index and its notifications need, then drop
+    // the global lock immediately.
+    let (base, project, engine, sync, auto_knowledge) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        (
+            guard.base_dir.clone(),
+            active.project.clone(),
+            active.engine.clone(),
+            active.sync.clone(),
+            active.auto_knowledge.clone(),
+        )
+    };
+    let project_id = project.config.id;
+
+    // The bytes are here now. Re-index so the content becomes searchable;
+    // hydration changes neither size nor mtime, so nothing else would notice.
+    // Parsing a large just-downloaded file (extract::extract) can take
+    // seconds, so run it OFF the global lock — like the download above —
+    // against a private Db handle to the same sqlite file (the pattern the
+    // background scan uses; a committed write is visible to the global
+    // handle's reads). Holding the lock across the parse would freeze every
+    // other IPC command right after "Downloading…" clears.
+    let rel = rel_path.clone();
+    let changed = tauri::async_runtime::spawn_blocking(move || -> CmdResult<bool> {
+        let mut db = Db::open(&base, project_id).map_err(err)?;
+        scan::refresh_path(&project, &mut db, &rel).map_err(err)
+    })
+    .await
+    .map_err(err)??;
+
+    // Drive the SAME downstream notifications the watcher fires for a changed
+    // file, so a just-downloaded doc reaches ingests, Map/Timeline, and sync
+    // immediately instead of waiting for an edit or a manual reindex.
+    if changed {
+        let paths = vec![rel_path.clone()];
+        engine.sources_changed(paths.clone());
+        sync.changed(paths.clone());
+        auto_knowledge.changed();
+        let _ = app.emit(
+            "index-updated",
+            ScanStats {
+                changed_paths: paths,
+                ..Default::default()
+            },
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -454,6 +843,24 @@ fn save_file(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Record the just-written version as seen so the user's OWN edit never
+    // counts as unread — the whole point of unread being "changed by someone
+    // else". Read the post-refresh row so size/mtime match what the index (and
+    // the unread check) now hold. Capture from `active` first, then touch
+    // `guard.base_dir` (its mutable borrow through `active` must end first).
+    let seen_version = active
+        .db
+        .get_file(&rel_path)
+        .map_err(err)?
+        .map(|r| (r.size, r.mtime));
+    let project_id = active.project.config.id;
+    if let Some(version) = seen_version {
+        let base = guard.base_dir.clone();
+        let mut us = UserState::load(&base, project_id);
+        if us.mark_seen(&rel_path, version) {
+            let _ = us.save(&base, project_id);
+        }
+    }
     let _ = app.emit("file-saved", &rel_path);
     Ok(mtime)
 }
@@ -480,6 +887,9 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
     let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
+    let videos = stats.videos_needing_transcript.clone();
+    drop(guard);
+    enqueue_transcriptions(&app, state.inner(), &videos);
     let _ = app.emit("index-updated", stats.clone());
     Ok(stats)
 }
@@ -545,6 +955,242 @@ fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> Cmd
     let active = guard.active.as_mut().ok_or("no project open")?;
     scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
     scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
+    Ok(())
+}
+
+// ---------- file import ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportDto {
+    import_id: String,
+    file_name: String,
+    /// Project-relative path of the STAGED copy — feed it straight to the same
+    /// preview commands a normal file uses (`.ken/imports/...` reads fine
+    /// through `project.resolve`; it's not a cloud placeholder, so it isn't
+    /// blocked). The staged file is not indexed, hence `kind`/`size` here.
+    preview_rel: String,
+    kind: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlacementDto {
+    /// Project-relative destination folder; empty means the project root.
+    folder: String,
+    is_new: bool,
+    rationale: Option<String>,
+}
+
+/// The single staged file for an import: (absolute path, file name). Its dir
+/// holds exactly the one file `import_begin` copied in, so classify/commit read
+/// the name back rather than threading it through every call.
+fn staged_file(root: &std::path::Path, import_id: &str) -> CmdResult<(PathBuf, String)> {
+    let dir = ken_core::import::staging_dir(root, import_id);
+    let entry = std::fs::read_dir(&dir)
+        .map_err(|_| "This import is no longer available.".to_string())?
+        .flatten()
+        .find(|e| e.path().is_file())
+        .ok_or("This import is no longer available.")?;
+    let name = entry.file_name().to_string_lossy().into_owned();
+    Ok((entry.path(), name))
+}
+
+/// The project's real folders (project-relative), the same set `get_tree`
+/// surfaces — the grounding the classifier chooses among. Walks off any lock.
+fn project_folders(root: &std::path::Path) -> Vec<String> {
+    let mut folders = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".ken" && !(e.path().is_dir() && ken_core::scan::is_junk_dir_name(&name))
+        })
+        .build();
+    for entry in walker.flatten() {
+        if entry.path().is_dir() && entry.path() != root {
+            if let Ok(rel) = entry.path().strip_prefix(root) {
+                folders.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    folders.sort();
+    folders
+}
+
+/// Copy an external file into a private staging area inside the project so it's
+/// previewable before it's placed, without indexing it. The original is only
+/// read; the copy runs OFF the lock (a large file must not freeze other IPC).
+#[tauri::command]
+fn import_begin(state: State<SharedState>, src_path: String) -> CmdResult<ImportDto> {
+    let root = {
+        let guard = state.lock().unwrap();
+        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+    };
+    let src = PathBuf::from(&src_path);
+    if !src.is_file() {
+        return Err("Choose a file to import.".into());
+    }
+    let file_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("That file has no name.")?;
+    let import_id = ken_core::import::new_import_id();
+    let dir = ken_core::import::staging_dir(&root, &import_id);
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let dest = dir.join(&file_name);
+    std::fs::copy(&src, &dest).map_err(err)?;
+    let size = dest.metadata().map(|m| m.len()).unwrap_or(0);
+    let kind = ken_core::extract::FileKind::from_path(&dest).as_str().to_string();
+    Ok(ImportDto {
+        preview_rel: ken_core::import::staging_rel(&import_id, &file_name),
+        import_id,
+        file_name,
+        kind,
+        size,
+    })
+}
+
+/// Ask Claude Code where the staged file should live, grounded in the project's
+/// real folders. Awaitable (the CLI takes seconds). Never hard-fails: a missing
+/// CLI, a lost staging file, or an unusable reply all degrade to the project
+/// root so the import flow keeps working.
+#[tauri::command]
+async fn import_classify(
+    state: State<'_, SharedState>,
+    import_id: String,
+) -> CmdResult<PlacementDto> {
+    let root = {
+        let guard = state.lock().unwrap();
+        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+    };
+    let default = || PlacementDto { folder: String::new(), is_new: false, rationale: None };
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return Ok(default());
+    };
+    let Ok((abs, file_name)) = staged_file(&root, &import_id) else {
+        return Ok(default());
+    };
+    let kind = ken_core::extract::FileKind::from_path(&abs).as_str().to_string();
+    let folders = project_folders(&root);
+
+    // Parsing a large file can take seconds — do it off any lock, like the
+    // oneshot below.
+    let excerpt = tauri::async_runtime::spawn_blocking({
+        let abs = abs.clone();
+        move || {
+            ken_core::extract::extract(&abs)
+                .map(|e| e.text.chars().take(4000).collect::<String>())
+                .unwrap_or_default()
+        }
+    })
+    .await
+    .map_err(err)?;
+
+    let prompt = ken_core::import::compose_classify_prompt(&file_name, &kind, &excerpt, &folders);
+    let folders_for_parse = folders.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        assistant::oneshot(&binary, &root, &prompt, Duration::from_secs(60), &CancelToken::new())
+    })
+    .await
+    .map_err(err)?;
+
+    let placement = match outcome {
+        Ok(OneshotOutcome::Completed(text)) => {
+            ken_core::import::parse_placement(&text, &folders_for_parse)
+        }
+        _ => ken_core::import::Placement::root(),
+    };
+    Ok(PlacementDto {
+        folder: placement.folder,
+        is_new: placement.is_new,
+        rationale: placement.rationale,
+    })
+}
+
+/// Place the staged file into the chosen folder and index it. Works even if
+/// classification never ran (save-before-processed): the frontend passes
+/// whatever folder is selected. Validates the folder stays inside the project,
+/// creates it when asked, disambiguates the name so nothing is overwritten,
+/// then fires the SAME downstream notifications `hydrate_file` does.
+#[tauri::command]
+fn import_commit(
+    app: AppHandle,
+    state: State<SharedState>,
+    import_id: String,
+    dest_folder_rel: String,
+    create_folder: bool,
+) -> CmdResult<String> {
+    let (root, project, engine, sync, auto_knowledge) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        (
+            active.project.root.clone(),
+            active.project.clone(),
+            active.engine.clone(),
+            active.sync.clone(),
+            active.auto_knowledge.clone(),
+        )
+    };
+
+    let (staged_abs, file_name) = staged_file(&root, &import_id)?;
+
+    // `resolve` rejects `..`/absolute escapes; an empty folder is the root.
+    let dest_dir = project.resolve(&dest_folder_rel).map_err(err)?;
+    if !dest_dir.exists() {
+        if create_folder {
+            std::fs::create_dir_all(&dest_dir).map_err(err)?;
+        } else {
+            return Err("That folder doesn't exist.".into());
+        }
+    }
+
+    let chosen = ken_core::import::disambiguate_name(&file_name, |c| dest_dir.join(c).exists());
+    let final_abs = dest_dir.join(&chosen);
+    let final_rel = ken_core::import::final_rel(&dest_folder_rel, &chosen);
+
+    // staging → final is a move; the external original was already copied.
+    match std::fs::rename(&staged_abs, &final_abs) {
+        Ok(()) => {}
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            std::fs::copy(&staged_abs, &final_abs).map_err(err)?;
+            std::fs::remove_file(&staged_abs).map_err(err)?;
+        }
+        Err(e) => return Err(err(e)),
+    }
+    let _ = std::fs::remove_dir_all(ken_core::import::staging_dir(&root, &import_id));
+
+    let changed = {
+        let mut guard = state.lock().unwrap();
+        let active = guard.active.as_mut().ok_or("no project open")?;
+        scan::refresh_path(&active.project, &mut active.db, &final_rel).map_err(err)?
+    };
+    if changed {
+        let paths = vec![final_rel.clone()];
+        engine.sources_changed(paths.clone());
+        sync.changed(paths.clone());
+        auto_knowledge.changed();
+        let _ = app.emit(
+            "index-updated",
+            ScanStats { changed_paths: paths, ..Default::default() },
+        );
+    }
+    Ok(final_rel)
+}
+
+/// Discard a staged import (dialog cancelled): delete its staging dir.
+#[tauri::command]
+fn import_cancel(state: State<SharedState>, import_id: String) -> CmdResult<()> {
+    let root = {
+        let guard = state.lock().unwrap();
+        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+    };
+    let _ = std::fs::remove_dir_all(ken_core::import::staging_dir(&root, &import_id));
     Ok(())
 }
 
@@ -653,6 +1299,382 @@ fn file_mtime(state: State<SharedState>, rel_path: String) -> CmdResult<i64> {
         .unwrap_or(0))
 }
 
+
+// ---------- video: streaming + transcripts ----------
+
+/// Build the webview-loadable URL Tauri's asset protocol serves for a local
+/// file, matching `@tauri-apps/api/core`'s `convertFileSrc`. The asset
+/// protocol streams with HTTP range support, so the `<video>` element can seek
+/// without the bytes ever passing through JS. The project root is added to the
+/// protocol's runtime scope when the project opens (see `activate`).
+fn to_asset_url(abs: &std::path::Path) -> String {
+    let encoded = encode_uri_component(&abs.to_string_lossy());
+    if cfg!(windows) {
+        format!("http://asset.localhost/{encoded}")
+    } else {
+        format!("asset://localhost/{encoded}")
+    }
+}
+
+/// `encodeURIComponent`, so the path survives inside a URL exactly as the JS
+/// `convertFileSrc` would encode it (the asset handler decodes it the same way).
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Resolve a project-relative video to a streamable asset URL. The file is
+/// already local by the time media plays (EditorPane hydrates first), so this
+/// only validates the path and confirms the bytes are here.
+#[tauri::command]
+fn media_src(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
+    let abs = resolve_path(&state, &rel_path)?;
+    if !abs.is_file() {
+        return Err("That media file isn't available on disk.".into());
+    }
+    Ok(to_asset_url(&abs))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptDto {
+    vtt: Option<String>,
+    source_rel: Option<String>,
+    /// `ready` | `generating` | `none`
+    status: String,
+}
+
+/// A video's transcript, resolved in the contract's order: adjacent `.vtt`,
+/// then a fuzzy-matched adjacent `.docx`, then a previously generated file;
+/// failing all three, `generating` if a Whisper job is in flight, else `none`.
+#[tauri::command]
+fn video_transcript(state: State<SharedState>, rel_path: String) -> CmdResult<TranscriptDto> {
+    let (abs, root, generating) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        let abs = active.project.resolve(&rel_path).map_err(err)?;
+        let generating = active.transcripts.lock().unwrap().in_flight.contains(&rel_path);
+        (abs, active.project.root.clone(), generating)
+    };
+    // Resolution reads small adjacent files; do it off the state lock.
+    match transcript::resolve_transcript(&abs, &root) {
+        Some(t) => Ok(TranscriptDto {
+            vtt: Some(t.vtt),
+            source_rel: t.source_rel,
+            status: "ready".into(),
+        }),
+        None => Ok(TranscriptDto {
+            vtt: None,
+            source_rel: None,
+            status: if generating { "generating" } else { "none" }.into(),
+        }),
+    }
+}
+
+/// Kick off on-device transcription for one video as a background job. Manual
+/// invocation surfaces a clear error when ffmpeg or the model is missing; the
+/// finished `.vtt` re-indexes the video so `index-updated` fires and the
+/// frontend re-fetches the transcript.
+#[tauri::command]
+fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let (root, base, project_id, jobs) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        active.project.resolve(&rel_path).map_err(err)?; // reject path escape
+        (
+            active.project.root.clone(),
+            guard.base_dir.clone(),
+            active.project.config.id,
+            active.transcripts.clone(),
+        )
+    };
+    let ffmpeg = transcript::discover_ffmpeg();
+    let model = transcript::model_path(&base);
+    if let Some(blocker) = transcript::transcription_blocker(ffmpeg.is_some(), model.is_file(), &model) {
+        return Err(blocker);
+    }
+    let job = TranscriptionJob {
+        state: state.inner().clone(),
+        root,
+        project_id,
+        jobs,
+        ffmpeg: ffmpeg.unwrap(),
+        model,
+        rel_path,
+        quiet: false,
+    };
+    spawn_transcription(&app, job);
+    Ok(())
+}
+
+struct TranscriptionJob {
+    state: SharedState,
+    root: PathBuf,
+    project_id: uuid::Uuid,
+    jobs: Arc<Mutex<TranscriptJobs>>,
+    ffmpeg: PathBuf,
+    model: PathBuf,
+    rel_path: String,
+    /// Automatic (ingest) jobs stay silent on failure; manual ones don't.
+    quiet: bool,
+}
+
+/// The ingest-side enqueue: transcribe newly-seen videos automatically, but go
+/// completely quiet when ffmpeg or the model is missing — exactly like the
+/// knowledge auto-build going silent without the Claude CLI. Nobody asked for
+/// this work, so a missing prerequisite is a no-op, never an error.
+fn enqueue_transcriptions(app: &AppHandle, state: &SharedState, rels: &[String]) {
+    if rels.is_empty() {
+        return;
+    }
+    let (root, base, project_id, jobs) = {
+        let guard = state.lock().unwrap();
+        let Some(active) = guard.active.as_ref() else {
+            return;
+        };
+        (
+            active.project.root.clone(),
+            guard.base_dir.clone(),
+            active.project.config.id,
+            active.transcripts.clone(),
+        )
+    };
+    let Some(ffmpeg) = transcript::discover_ffmpeg() else {
+        return; // no ffmpeg → quiet no-op
+    };
+    let model = transcript::model_path(&base);
+    if !model.is_file() {
+        return; // no model → quiet no-op
+    }
+    for rel in rels {
+        spawn_transcription(app, TranscriptionJob {
+            state: state.clone(),
+            root: root.clone(),
+            project_id,
+            jobs: jobs.clone(),
+            ffmpeg: ffmpeg.clone(),
+            model: model.clone(),
+            rel_path: rel.clone(),
+            quiet: true,
+        });
+    }
+}
+
+/// Run one transcription off every lock (ffmpeg + Whisper are slow, like a
+/// cloud hydrate), then re-index the video under the lock so its transcript
+/// becomes searchable. Deduplicated by `in_flight`; a failed automatic job is
+/// remembered in `attempted` so it isn't retried on every scan.
+fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
+    {
+        let mut j = job.jobs.lock().unwrap();
+        if j.in_flight.contains(&job.rel_path) {
+            return; // already transcribing this video
+        }
+        if job.quiet && j.attempted.contains(&job.rel_path) {
+            return; // an earlier automatic attempt failed; don't thrash
+        }
+        j.in_flight.insert(job.rel_path.clone());
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result =
+            transcript::generate_and_cache(&job.ffmpeg, &job.model, &job.root, &job.rel_path);
+        match result {
+            Ok(_) => {
+                // Re-index the video so the fresh transcript is searchable.
+                let mut guard = job.state.lock().unwrap();
+                if let Some(active) = guard.active.as_mut() {
+                    if active.project.config.id == job.project_id {
+                        let _ = scan::refresh_path(&active.project, &mut active.db, &job.rel_path);
+                    }
+                }
+                drop(guard);
+                let _ = app.emit("index-updated", ScanStats::default());
+            }
+            Err(e) => {
+                job.jobs.lock().unwrap().attempted.insert(job.rel_path.clone());
+                if !job.quiet {
+                    let _ = app.emit("transcript-error", e.to_string());
+                }
+            }
+        }
+        job.jobs.lock().unwrap().in_flight.remove(&job.rel_path);
+    });
+}
+
+// ---------- offline model download ----------
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatusDto {
+    id: String,
+    name: String,
+    installed: bool,
+    size_bytes: Option<u64>,
+    expected_bytes: u64,
+    /// The recommended default, pre-selected in the UI.
+    recommended: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ModelProgress {
+    id: String,
+    downloaded: u64,
+    total: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ModelError {
+    id: String,
+    message: String,
+}
+
+fn status_dto(base_dir: &std::path::Path, spec: &model::ModelSpec) -> ModelStatusDto {
+    let size = model::installed_size(base_dir, spec);
+    ModelStatusDto {
+        id: spec.id.clone(),
+        name: spec.name.clone(),
+        installed: size.is_some(),
+        size_bytes: size,
+        expected_bytes: spec.expected_bytes,
+        recommended: spec.recommended,
+    }
+}
+
+/// The runtime-discovered model listing, cached so we hit the network at most
+/// once per session. Discovery falls back to the recommended model offline.
+fn discovered_specs(
+    cache: &Arc<Mutex<Option<Vec<model::ModelSpec>>>>,
+) -> Vec<model::ModelSpec> {
+    if let Some(cached) = cache.lock().unwrap().clone() {
+        return cached;
+    }
+    let specs = model::discover_models(&model::HttpSource);
+    *cache.lock().unwrap() = Some(specs.clone());
+    specs
+}
+
+/// Status of the recommended model only — cheap and offline (just a file
+/// check), so the transcript feature can gate on it without a network round
+/// trip.
+#[tauri::command]
+fn model_status(state: State<SharedState>) -> CmdResult<ModelStatusDto> {
+    let base = { state.lock().unwrap().base_dir.clone() };
+    Ok(status_dto(&base, &model::recommended()))
+}
+
+/// All models available to download, discovered from the whisper.cpp repo
+/// (recommended first). Hits the network once, then serves from cache; degrades
+/// to the recommended model alone when offline.
+#[tauri::command]
+fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
+    let (base, cache) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.model_cache.clone())
+    };
+    let specs = discovered_specs(&cache);
+    Ok(specs.iter().map(|s| status_dto(&base, s)).collect())
+}
+
+/// Start downloading a model. Returns immediately; progress and completion flow
+/// through the `model-download-progress` event (completion = a final 100%
+/// sample), failures through `model-download-error`. A second concurrent
+/// download of the same id is refused. The download itself streams to a temp
+/// file, verifies, and atomically installs — all off the global lock, on its
+/// own thread (like `spawn_transcription`).
+#[tauri::command]
+fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
+    let (base, downloads, cache) = {
+        let guard = state.lock().unwrap();
+        (
+            guard.base_dir.clone(),
+            guard.model_downloads.clone(),
+            guard.model_cache.clone(),
+        )
+    };
+    {
+        let mut in_flight = downloads.lock().unwrap();
+        if !in_flight.insert(id.clone()) {
+            return Err("This model is already downloading.".into());
+        }
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Recommended resolves without the network so the default works
+        // offline; other ids come from the discovered listing.
+        let spec = if id == model::RECOMMENDED_FILE {
+            Some(model::recommended())
+        } else {
+            discovered_specs(&cache).into_iter().find(|s| s.id == id)
+        };
+        let Some(spec) = spec else {
+            let _ = app.emit(
+                "model-download-error",
+                ModelError { id: id.clone(), message: "Unknown model.".into() },
+            );
+            downloads.lock().unwrap().remove(&id);
+            return;
+        };
+
+        let mut throttle = model::ProgressThrottle::new();
+        let start = Instant::now();
+        let progress_app = app.clone();
+        let progress_id = id.clone();
+        let on_progress = |downloaded: u64, total: u64| {
+            let now_ms = start.elapsed().as_millis() as u64;
+            // Always emit the terminal 100% (the completion signal); throttle
+            // the rest so a fast download doesn't flood the UI.
+            let done = total > 0 && downloaded >= total;
+            if done || throttle.should_emit(downloaded, total, now_ms) {
+                let _ = progress_app.emit(
+                    "model-download-progress",
+                    ModelProgress { id: progress_id.clone(), downloaded, total },
+                );
+            }
+        };
+
+        // Installed size is read from disk on the next status/list call, so a
+        // successful install needs no cache mutation here.
+        match model::download_to(&model::HttpSource, &spec, &base, on_progress) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = app.emit(
+                    "model-download-error",
+                    ModelError { id: id.clone(), message: e.to_string() },
+                );
+            }
+        }
+        downloads.lock().unwrap().remove(&id);
+    });
+    Ok(())
+}
+
+/// Delete an installed model file. Missing is a no-op.
+#[tauri::command]
+fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
+    let base = { state.lock().unwrap().base_dir.clone() };
+    // Only the file name is needed to locate the install; build a minimal spec.
+    let spec = model::ModelSpec {
+        id: id.clone(),
+        name: id.clone(),
+        file: id.clone(),
+        url: String::new(),
+        expected_bytes: 0,
+        recommended: id == model::RECOMMENDED_FILE,
+    };
+    model::remove(&base, &spec).map_err(err)
+}
 
 // ---------- ingest commands ----------
 
@@ -909,6 +1931,11 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
     let now = engine::now_epoch();
     let mut items: Vec<InboxItem> = Vec::new();
 
+    // Per-user, per-project ignores (app-data, never synced): a file the user
+    // silenced drops out of the inbox entirely, so the list AND the live badge
+    // count reflect the choice. The file stays indexed — only its nag is hidden.
+    let ignored = UserState::load(&guard.base_dir, active.project.config.id).ignored;
+
     // One walk over the recipes yields stale + broken items and the
     // name/threshold lookups the run-based items need.
     let mut names: std::collections::HashMap<String, String> = Default::default();
@@ -985,6 +2012,9 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
         if f.status != "failed" {
             continue;
         }
+        if ignored.contains(&f.rel_path) {
+            continue;
+        }
         let file_name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path).to_string();
         items.push(InboxItem {
             id: format!("file-{}", f.rel_path),
@@ -1001,9 +2031,15 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
     }
 
     for it in active.db.list_open_review_items().map_err(err)? {
+        let kind = stored_kind(&it.kind);
+        // Conflicts/stored items reference a file in `source_ref`; skip the ones
+        // whose file the user ignored. Slug-based kinds carry no file ref.
+        if user_state::inbox_item_ignored(&kind, &it.source_ref, &ignored) {
+            continue;
+        }
         items.push(InboxItem {
             id: format!("item-{}", it.id),
-            kind: stored_kind(&it.kind),
+            kind,
             title: it.title,
             body: it.body,
             when: it.created_at,
@@ -1067,6 +2103,106 @@ fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
         .db
         .resolve_review_item(id, engine::now_epoch())
         .map_err(err)
+}
+
+// ---------- ignored files (user-level, never synced) ----------
+
+/// Load the current project's private user-state from app-data. Helper for the
+/// ignore commands so each one reads/writes the same non-synced file.
+fn load_user_state(guard: &AppState) -> CmdResult<(std::path::PathBuf, uuid::Uuid, UserState)> {
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let base = guard.base_dir.clone();
+    let id = active.project.config.id;
+    let us = UserState::load(&base, id);
+    Ok((base, id, us))
+}
+
+/// Silence a file's review issues for THIS user only (stored in app-data, never
+/// written to the synced `.ken/` config). The file stays indexed and findable.
+#[tauri::command]
+fn ignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.ignore(rel_path) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Reverse an ignore, so the file's issues can surface again.
+#[tauri::command]
+fn unignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.unignore(&rel_path) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// The current project's ignored files, for the Settings undo list and the
+/// home "Needs a look" filter.
+#[tauri::command]
+fn list_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
+    let guard = state.lock().unwrap();
+    let (_, _, us) = load_user_state(&guard)?;
+    Ok(us.ignored.into_iter().collect())
+}
+
+/// The index's files as `(rel_path, (size, mtime))` version pairs — the shape
+/// the unread computation consumes.
+fn index_versions(files: &[FileRow]) -> Vec<(String, (i64, i64))> {
+    files
+        .iter()
+        .map(|f| (f.rel_path.clone(), (f.size, f.mtime)))
+        .collect()
+}
+
+/// Files changed by someone/something ELSE since the user last looked (the nav
+/// dot + the Files "unread" filter). Self-saves and opens keep files seen, so
+/// what remains is external edits, syncs, and cloud hydrates.
+#[tauri::command]
+fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let files = active.db.list_files().map_err(err)?;
+    let (base, id, mut us) = load_user_state(&guard)?;
+    let index = index_versions(&files);
+    // Defensive baseline: activate() normally does this, but guarantee it so a
+    // never-baselined project reports empty rather than its entire tree.
+    if us.baseline(&index) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(us.unread(&index))
+}
+
+/// Record a file as seen at its current version (the frontend calls this on
+/// open, and it backs the "Mark as viewed" context-menu item).
+#[tauri::command]
+fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let Some(row) = active.db.get_file(&rel_path).map_err(err)? else {
+        return Ok(()); // not indexed (yet) — nothing to mark
+    };
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.mark_seen(rel_path, (row.size, row.mtime)) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Mark every currently-unread file seen ("Mark all as viewed").
+#[tauri::command]
+fn mark_all_seen(state: State<SharedState>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let files = active.db.list_files().map_err(err)?;
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.mark_all_seen(&index_versions(&files)) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
 }
 
 // ---------- sync ----------
@@ -1292,6 +2428,29 @@ fn set_ingest_runner_mode(state: State<SharedState>, mode: String) -> CmdResult<
         .config
         .extra
         .insert("ingestRunner".into(), serde_json::Value::String(mode));
+    active.project.save().map_err(err)
+}
+
+/// Is background download-and-index of cloud-offline documents enabled?
+#[tauri::command]
+fn get_background_index(state: State<SharedState>) -> CmdResult<bool> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    Ok(ken_core::bg_hydrate::background_index_enabled(&active.project))
+}
+
+/// Turn background cloud indexing on or off. Persisted in `project.json`; the
+/// always-running worker reads this each tick, so it idles when off and picks
+/// the backlog straight back up when on — no thread to restart.
+#[tauri::command]
+fn set_background_index(state: State<SharedState>, enabled: bool) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    active
+        .project
+        .config
+        .extra
+        .insert("backgroundIndex".into(), serde_json::Value::Bool(enabled));
     active.project.save().map_err(err)
 }
 
@@ -1559,6 +2718,10 @@ fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> Cmd
 
 // ---------- knowledge model (Map & Timeline) ----------
 
+/// How often the auto-build policy is consulted. Far shorter than any of
+/// its thresholds — the tick only asks a question; the thresholds decide.
+const KNOWLEDGE_TICK: Duration = Duration::from_secs(30);
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeModelDto {
@@ -1567,12 +2730,21 @@ struct KnowledgeModelDto {
     events: Vec<EventRow>,
     /// Epoch seconds of the last build; null before the first one.
     built_at: Option<i64>,
+    /// A build is running right now — the Map/Timeline screens may open
+    /// mid-build (an automatic one starts before they're ever visited),
+    /// so the state has to come back with the model, not only as an event.
+    building: bool,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeModelState {
-    /// `building` | `ready` | `error`
+    /// `building` | `ready` | `error` | `idle`
+    ///
+    /// `idle` ends an automatic build that didn't produce a model (a CLI
+    /// that isn't logged in, say): the screens stop saying "building" and
+    /// go back to offering a manual refresh, which reports the real error.
+    /// Nobody asked for the build, so nobody gets an error banner for it.
     state: String,
     detail: Option<String>,
 }
@@ -1589,11 +2761,14 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
         edges,
         events: active.db.list_events().map_err(err)?,
         built_at: active.db.knowledge_model_built_at().map_err(err)?,
+        building: active.knowledge_running.load(Ordering::SeqCst),
     })
 }
 
-/// Rebuild the knowledge model — manual only in v1. Progress arrives as
+/// Rebuild the knowledge model now, by hand. Progress arrives as
 /// `knowledge-model-state` events: building → ready | error {detail}.
+/// Unlike the automatic build this ignores every threshold — "rebuild it
+/// now" is exactly what it says.
 #[tauri::command]
 fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
@@ -1601,28 +2776,58 @@ fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResu
     let Some(binary) = ken_core::runner::discover_claude() else {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     };
-    let running = active.knowledge_running.clone();
-    if running.swap(true, Ordering::SeqCst) {
+    let job = KnowledgeBuild {
+        base: guard.base_dir.clone(),
+        project: active.project.clone(),
+        binary,
+        running: active.knowledge_running.clone(),
+        tracker: active.auto_knowledge.clone(),
+        quiet_failure: false,
+    };
+    drop(guard);
+
+    if !start_knowledge_build(&app, job) {
         return Err("Ken is already mapping this project — give it a moment.".into());
     }
-    let project = active.project.clone();
-    let project_id = project.config.id;
-    let base = guard.base_dir.clone();
-    drop(guard);
+    Ok(())
+}
+
+struct KnowledgeBuild {
+    base: PathBuf,
+    project: Project,
+    binary: PathBuf,
+    running: Arc<AtomicBool>,
+    tracker: Arc<AutoBuildTracker>,
+    /// Automatic builds report failure as `idle`, not `error`.
+    quiet_failure: bool,
+}
+
+/// Start one build thread, or report that one is already in flight. The
+/// `knowledge_running` flag is the single guard both entry points share,
+/// so a manual refresh and the tick can never run two Claude sessions
+/// over the same corpus.
+fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
+    if job.running.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    // The changes indexed so far are this build's input; anything landing
+    // while it reads must survive into the next rebuild.
+    job.tracker.build_started(Instant::now());
 
     let _ = app.emit("knowledge-model-state", KnowledgeModelState {
         state: "building".into(),
         detail: None,
     });
+    let project_id = job.project.config.id;
     let thread_app = app.clone();
     std::thread::spawn(move || {
         let today = local_date_today();
-        let result = Db::open(&base, project_id)
+        let result = Db::open(&job.base, project_id)
             .map_err(|e| e.to_string())
             .and_then(|mut db| {
                 knowledge_model::build_knowledge_model(
-                    &binary,
-                    &project,
+                    &job.binary,
+                    &job.project,
                     &mut db,
                     &today,
                     &CancelToken::new(),
@@ -1637,15 +2842,71 @@ fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResu
                     counts.entities, counts.events
                 )),
             },
+            Err(_) if job.quiet_failure => KnowledgeModelState {
+                state: "idle".into(),
+                detail: None,
+            },
             Err(detail) => KnowledgeModelState {
                 state: "error".into(),
                 detail: Some(detail),
             },
         };
         let _ = thread_app.emit("knowledge-model-state", event);
-        running.store(false, Ordering::SeqCst);
+        // Stamp the attempt BEFORE clearing the guard: the next tick must
+        // never see "not running" together with a stale attempt clock, or
+        // a failing build could restart immediately.
+        job.tracker.build_finished(Instant::now());
+        job.running.store(false, Ordering::SeqCst);
     });
-    Ok(())
+    true
+}
+
+/// The automatic side of the same build: consult the policy, and start a
+/// build only if it says so. Runs on `KNOWLEDGE_TICK`; every early return
+/// here is silent by design (this is work nobody asked for).
+fn maybe_auto_build_knowledge(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) {
+    // discover_claude() walks every PATH entry and stats candidates; a slow
+    // or networked PATH entry can block for seconds. Resolve it BEFORE taking
+    // the global lock so the stat never blocks every other IPC command each
+    // tick. No CLI, no AI features — and no error either: Ken's other screens
+    // work fine without it, and the manual button explains the install.
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return;
+    };
+    let guard = state.lock().unwrap();
+    let Some(active) = guard.active.as_ref() else {
+        return;
+    };
+    if active.project.config.id != project_id {
+        return; // a different project is open now; this tick is stale
+    }
+    let ctx = AutoBuildContext {
+        claude_available: true,
+        in_flight: active.knowledge_running.load(Ordering::SeqCst),
+        // Only status='indexed' rows have readable content; a folder of
+        // image / failed / cloud-only files has file_count() > 0 but nothing
+        // to build from, and must not trip the tick into a paid empty run.
+        indexed_files: active.db.indexed_file_count().unwrap_or(0) as usize,
+        never_built: active
+            .db
+            .knowledge_model_built_at()
+            .ok()
+            .flatten()
+            .is_none(),
+    };
+    if !active.auto_knowledge.should_build(ctx, Instant::now()) {
+        return;
+    }
+    let job = KnowledgeBuild {
+        base: guard.base_dir.clone(),
+        project: active.project.clone(),
+        binary,
+        running: active.knowledge_running.clone(),
+        tracker: active.auto_knowledge.clone(),
+        quiet_failure: true,
+    };
+    drop(guard);
+    start_knowledge_build(app, job);
 }
 
 // ---------- chat commands ----------
@@ -1680,6 +2941,7 @@ fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> 
         created_at: now,
         last_active_at: now,
         archived: false,
+        model: None,
     };
     active.chat_db.lock().unwrap().upsert_chat(&row).map_err(err)?;
     let _ = app.emit("chat-updated", row.clone());
@@ -1692,6 +2954,8 @@ fn send_chat_message(
     state: State<SharedState>,
     chat_id: String,
     text: String,
+    open_files: Option<Vec<String>>,
+    focused_file: Option<String>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
@@ -1734,8 +2998,18 @@ fn send_chat_message(
         (had_messages, row)
     };
     drop(guard);
-    let _ = row;
-    engine_arc.send(&chat_id, &text, resume).map_err(err)
+
+    // The stored transcript keeps the user's raw text; the CLI additionally
+    // gets a weak-hint preamble naming the files open on screen (when any),
+    // clearly caveated as "not necessarily relevant".
+    let open = open_files.unwrap_or_default();
+    let prompt = match chat::build_context_preamble(focused_file.as_deref(), &open) {
+        Some(preamble) => format!("{preamble}\n\n{text}"),
+        None => text.clone(),
+    };
+    engine_arc
+        .send(&chat_id, &prompt, resume, row.model.as_deref())
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -1756,6 +3030,24 @@ fn set_chat_pinned(app: AppHandle, state: State<SharedState>, chat_id: String, p
     let active = guard.active.as_ref().ok_or("no project open")?;
     let mut db = active.chat_db.lock().unwrap();
     db.set_chat_flag(&chat_id, ChatFlag::Pinned, pinned).map_err(err)?;
+    if let Ok(Some(row)) = db.get_chat(&chat_id) {
+        let _ = app.emit("chat-updated", row);
+    }
+    Ok(())
+}
+
+/// Set a chat's model to a stable tier alias (or clear to the CLI default when
+/// `model` is None/empty/unrecognized). Applies to the next message/session;
+/// any live process keeps its current model until it respawns.
+#[tauri::command]
+fn set_chat_model(app: AppHandle, state: State<SharedState>, chat_id: String, model: Option<String>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    // Store only a validated alias; anything else clears to the default so we
+    // never persist a string we'd refuse to pass to the CLI.
+    let alias = model.as_deref().and_then(chat::valid_model_alias);
+    let mut db = active.chat_db.lock().unwrap();
+    db.set_chat_model(&chat_id, alias).map_err(err)?;
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
         let _ = app.emit("chat-updated", row);
     }
@@ -1830,9 +3122,8 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
         let _ = db.append_chat_message(&chat_id, "divider", "continued in the terminal", now);
         (had || row.kind == "ingest" || row.kind == "research", row)
     };
-    let _ = row;
 
-    let pty = chat::attach_terminal(&binary, &active.project.root, &chat_id, resume, on_data_dup(app.clone(), chat_id.clone()))
+    let pty = chat::attach_terminal(&binary, &active.project.root, &chat_id, resume, row.model.as_deref(), on_data_dup(app.clone(), chat_id.clone()))
         .map_err(err)?;
     active.terminals.lock().unwrap().insert(chat_id.clone(), TerminalHandle::Own(pty));
 
@@ -1956,6 +3247,7 @@ fn start_research(
         created_at: now,
         last_active_at: now,
         archived: false,
+        model: None,
     };
     {
         let mut db = active.chat_db.lock().unwrap();
@@ -2084,6 +3376,8 @@ pub fn run() {
         base_dir,
         hooks: None,
         active: None,
+        model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        model_cache: Arc::new(Mutex::new(None)),
     }));
 
     tauri::Builder::default()
@@ -2111,6 +3405,7 @@ pub fn run() {
             create_project,
             open_project,
             forget_project,
+            rename_project,
             last_project_id,
             current_project,
             set_folder_selection,
@@ -2118,13 +3413,26 @@ pub fn run() {
             search,
             read_file,
             read_file_bytes,
+            is_cloud_only,
+            hydrate_file,
             save_file,
             file_meta,
             extracted_text,
             reindex,
             move_file,
+            import_begin,
+            import_classify,
+            import_commit,
+            import_cancel,
             open_external,
             file_mtime,
+            media_src,
+            video_transcript,
+            generate_transcript,
+            model_status,
+            list_models,
+            download_model,
+            remove_model,
             list_ingests,
             get_ingest,
             save_ingest,
@@ -2136,12 +3444,20 @@ pub fn run() {
             pending_approvals,
             review_inbox,
             resolve_review_item,
+            ignore_file,
+            unignore_file,
+            list_ignored,
+            unread_files,
+            mark_seen,
+            mark_all_seen,
             sync_status,
             set_sync_auto,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,
             set_ingest_runner_mode,
+            get_background_index,
+            set_background_index,
             claude_doctor,
             mcp_info,
             current_digest,
@@ -2155,6 +3471,7 @@ pub fn run() {
             send_chat_message,
             rename_chat,
             set_chat_pinned,
+            set_chat_model,
             archive_chat,
             enter_terminal_mode,
             leave_terminal_mode,

@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, type IngestMode, type IngestRefresh } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import { composeSingleOutput, toProjectRelative } from "../lib/projectPath";
 
   let {
     slug,
@@ -20,18 +22,40 @@
     };
   } = $props();
 
+  // Recipes persist `output` as one string; the form edits it as a folder plus
+  // (single mode only) a bare document name, since a folder dialog can't name a
+  // file. Splitting on load keeps the two editors and the stored value in sync.
+  function decompose(out: string, m: IngestMode): [folder: string, name: string] {
+    const norm = out.replace(/\/+$/, "");
+    if (m === "collection") return [norm, ""];
+    const i = norm.lastIndexOf("/");
+    return i >= 0 ? [norm.slice(0, i), norm.slice(i + 1)] : ["", norm];
+  }
+
+  const [seedFolder, seedName] = decompose(
+    preset?.output ?? "",
+    preset?.mode ?? "single",
+  );
+
   let name = $state(preset?.name ?? "");
   let description = $state(preset?.description ?? "");
   let instruction = $state(preset?.instruction ?? "");
-  let output = $state(preset?.output ?? "knowledge/");
   let mode = $state<IngestMode>(preset?.mode ?? "single");
   let refresh = $state<IngestRefresh>(preset?.refresh ?? "on-change");
   let selectedSources = $state<string[]>([]);
+  let outputFolder = $state(seedFolder); // project-relative folder from the dialog
+  let outputName = $state(seedName); // single-mode document filename
   let error = $state<string | null>(null);
   let loading = $state(slug !== null);
 
+  // Top-level folders offered as one-click "quick add" shortcuts; the dialog
+  // remains the way to reach any nested folder.
   const topFolders = $derived(
     app.folders.filter((f) => !f.relPath.includes("/") && !f.excluded),
+  );
+  // Top folders not already chosen, offered as quick-add shortcuts.
+  const sourceSuggestions = $derived(
+    topFolders.filter((f) => !selectedSources.includes(f.relPath)),
   );
 
   onMount(async () => {
@@ -41,10 +65,13 @@
         name = detail.recipe.name;
         description = detail.recipe.description;
         instruction = detail.recipe.instruction;
-        output = detail.recipe.output;
         mode = detail.recipe.mode;
         refresh = detail.recipe.refresh;
         selectedSources = detail.recipe.sources;
+        [outputFolder, outputName] = decompose(
+          detail.recipe.output,
+          detail.recipe.mode,
+        );
       } catch (e) {
         error = String(e);
       }
@@ -52,14 +79,67 @@
     loading = false;
   });
 
-  function toggleSource(rel: string) {
-    selectedSources = selectedSources.includes(rel)
-      ? selectedSources.filter((s) => s !== rel)
-      : [...selectedSources, rel];
+  function addSource(rel: string) {
+    if (!selectedSources.includes(rel)) selectedSources = [...selectedSources, rel];
+  }
+
+  function removeSource(rel: string) {
+    selectedSources = selectedSources.filter((s) => s !== rel);
+  }
+
+  // Open the OS dialog constrained to the project, then hand back a
+  // project-relative path — or null after setting an inline error.
+  async function pickInsideProject(): Promise<string | null> {
+    const root = app.project?.root;
+    if (!root) {
+      error = "No project is open.";
+      return null;
+    }
+    const chosen = await openDialog({ directory: true, defaultPath: root });
+    if (typeof chosen !== "string") return null; // dialog cancelled
+    const r = toProjectRelative(root, chosen);
+    if (!r.ok) {
+      error = r.error;
+      return null;
+    }
+    return r.rel;
+  }
+
+  async function addSourceFolder() {
+    error = null;
+    const rel = await pickInsideProject();
+    if (rel === null) return;
+    if (rel === "") {
+      error = "That's the whole project — leave sources empty to read everything.";
+      return;
+    }
+    addSource(rel);
+  }
+
+  async function chooseOutputFolder() {
+    error = null;
+    const rel = await pickInsideProject();
+    if (rel === null) return;
+    outputFolder = rel;
   }
 
   async function save() {
     error = null;
+    let output: string;
+    if (mode === "collection") {
+      if (!outputFolder) {
+        error = "Choose a folder for the documents.";
+        return;
+      }
+      output = `${outputFolder}/`;
+    } else {
+      const r = composeSingleOutput(outputFolder, outputName);
+      if (!r.ok) {
+        error = r.error;
+        return;
+      }
+      output = r.rel;
+    }
     try {
       const recipe = await api.saveIngest({
         slug: slug ?? undefined,
@@ -102,19 +182,28 @@
     <div class="field">
       <span class="field-label">Read from <span class="soft">(default: everything)</span></span>
       <div class="chips">
-        {#each topFolders as folder (folder.relPath)}
-          <button
-            class="chip"
-            class:on={selectedSources.includes(folder.relPath)}
-            onclick={() => toggleSource(folder.relPath)}
-          >
-            {selectedSources.includes(folder.relPath) ? "✓ " : ""}{folder.relPath}/
-          </button>
+        {#each selectedSources as src (src)}
+          <span class="chip on">
+            {src}/
+            <button
+              class="chip-x"
+              onclick={() => removeSource(src)}
+              aria-label={`Remove ${src}`}
+            >✕</button>
+          </span>
         {/each}
-        {#if topFolders.length === 0}
-          <span class="note">No subfolders — Ken reads the whole project.</span>
-        {/if}
+        <button class="chip add" onclick={addSourceFolder}>+ Add folder…</button>
       </div>
+      {#if sourceSuggestions.length > 0}
+        <div class="quick">
+          <span class="soft small">Quick add:</span>
+          {#each sourceSuggestions as folder (folder.relPath)}
+            <button class="chip quick-chip" onclick={() => addSource(folder.relPath)}>
+              {folder.relPath}/
+            </button>
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <div class="two-col">
@@ -142,13 +231,23 @@
       </label>
     </div>
 
-    <label>
-      Save the result to
-      <input bind:value={output} class="mono-input" placeholder={mode === "single" ? "knowledge/People.md" : "people/"} />
+    <div class="field">
+      <span class="field-label">Save the result to</span>
+      <div class="output-row">
+        <button class="btn btn-small" onclick={chooseOutputFolder}>Choose folder…</button>
+        <span class="mono folder-shown" class:placeholder={!outputFolder}>
+          {outputFolder ? `${outputFolder}/` : mode === "single" ? "project root /" : "no folder yet"}
+        </span>
+        {#if mode === "single"}
+          <input class="mono-input name-input" bind:value={outputName} placeholder="People.md" />
+        {/if}
+      </div>
       <span class="soft small">
-        {mode === "single" ? "A file path inside the project." : "A folder — Ken keeps one document per entry inside it."}
+        {mode === "single"
+          ? "Pick a folder inside the project, then name the document (e.g. People.md)."
+          : "Pick a folder inside the project — Ken keeps one document per entry inside it."}
       </span>
-    </label>
+    </div>
 
     {#if error}
       <div class="error">{error}</div>
@@ -255,6 +354,51 @@
     background: color-mix(in srgb, var(--accent) 8%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
+    gap: 6px;
+  }
+  .chip-x {
+    border: none;
+    background: none;
+    color: inherit;
+    font-size: 11px;
+    line-height: 1;
+    padding: 0;
+    opacity: 0.6;
+  }
+  .chip-x:hover {
+    opacity: 1;
+  }
+  .chip.add {
+    color: var(--accent);
+    border-style: dashed;
+    font-weight: 600;
+  }
+  .quick {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .quick-chip {
+    padding: 3px 9px;
+    font-size: 11.5px;
+  }
+  .output-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .folder-shown {
+    font-size: 12.5px;
+    color: var(--ink-secondary);
+  }
+  .folder-shown.placeholder {
+    color: var(--ink-tertiary);
+  }
+  .name-input {
+    flex: 1;
+    min-width: 120px;
   }
   .two-col {
     display: grid;

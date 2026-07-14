@@ -22,7 +22,7 @@ export interface FileRow {
   kind: string;
   size: number;
   mtime: number;
-  status: "indexed" | "metadata_only" | "failed";
+  status: "indexed" | "metadata_only" | "failed" | "cloud_only";
   error: string | null;
 }
 
@@ -210,7 +210,20 @@ export interface ChatRow {
   createdAt: number;
   lastActiveAt: number;
   archived: boolean;
+  /** Stable tier alias (see CHAT_MODELS), or null for the CLI's own default. */
+  model: string | null;
 }
+
+/** Selectable chat models. Values are the CLI's stable tier aliases, which
+ *  auto-resolve to the latest model of each tier — so this never needs version
+ *  maintenance. `null` = the CLI's own default (no `--model` forwarded). */
+export const CHAT_MODELS: { label: string; value: string | null }[] = [
+  { label: "Default", value: null },
+  { label: "Haiku", value: "haiku" },
+  { label: "Sonnet", value: "sonnet" },
+  { label: "Opus", value: "opus" },
+  { label: "Fable", value: "fable" },
+];
 
 export interface ChatMessage {
   id: number;
@@ -285,10 +298,13 @@ export interface KnowledgeModel {
   events: EventRow[];
   /** Epoch seconds of the last build; null before the first one. */
   builtAt: number | null;
+  /** A build (automatic or manual) is running right now. */
+  building: boolean;
 }
 
 export interface KnowledgeModelState {
-  state: "building" | "ready" | "error";
+  /** `idle` = an automatic build stopped without a model; not an error. */
+  state: "building" | "ready" | "error" | "idle";
   detail: string | null;
 }
 
@@ -299,12 +315,68 @@ export interface ClaudeDoctor {
   help: string;
 }
 
+/** A downloadable on-device model and whether it's installed. */
+export interface ModelStatus {
+  id: string;
+  name: string;
+  installed: boolean;
+  /** On-disk size when installed, else null. */
+  sizeBytes: number | null;
+  /** Expected download size, for the pre-download estimate. */
+  expectedBytes: number;
+  /** The recommended default, pre-selected in the UI. */
+  recommended: boolean;
+}
+
+/** Payload of the `model-download-progress` event. */
+export interface ModelProgress {
+  id: string;
+  downloaded: number;
+  total: number;
+}
+
+/** Payload of the `model-download-error` event. */
+export interface ModelDownloadError {
+  id: string;
+  message: string;
+}
+
+/** What `video_transcript` knows about a clip's captions right now. */
+export interface VideoTranscript {
+  /** WebVTT text, or null while generating / when there is none. */
+  vtt: string | null;
+  /** The transcript's own project-relative path, when one exists. */
+  sourceRel: string | null;
+  status: "ready" | "generating" | "none";
+}
+
+/** A file staged for import: the copied-in file, previewable but not yet placed. */
+export interface ImportDto {
+  importId: string;
+  fileName: string;
+  /** Project-relative path of the staged copy — feed to the preview commands. */
+  previewRel: string;
+  kind: string;
+  size: number;
+}
+
+/** The AI's (or default) destination decision for a staged import. */
+export interface Placement {
+  /** Project-relative folder; empty string = the project root. */
+  folder: string;
+  /** True when `folder` doesn't exist yet (a proposed new folder). */
+  isNew: boolean;
+  rationale: string | null;
+}
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
+  renameProject: (id: string, name: string) =>
+    invoke<ProjectInfo>("rename_project", { id, name }),
   lastProjectId: () => invoke<string | null>("last_project_id"),
   currentProject: () => invoke<ProjectInfo | null>("current_project"),
   setFolderSelection: (excluded: string[]) =>
@@ -315,6 +387,10 @@ export const api = {
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
+  isCloudOnly: (relPath: string) =>
+    invoke<boolean>("is_cloud_only", { relPath }),
+  /// Downloads an online-only file from the cloud provider. Slow by nature.
+  hydrateFile: (relPath: string) => invoke<void>("hydrate_file", { relPath }),
   saveFile: (relPath: string, content: string) =>
     invoke<number>("save_file", { relPath, content }),
   fileMeta: (relPath: string) => invoke<FileRow | null>("file_meta", { relPath }),
@@ -324,7 +400,36 @@ export const api = {
   moveFile: (fromRel: string, toRel: string) =>
     invoke<void>("move_file", { fromRel, toRel }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
+
+  /// Copy an external file into a staging area so it can be previewed pre-placement.
+  importBegin: (srcPath: string) =>
+    invoke<ImportDto>("import_begin", { srcPath }),
+  /// Ask the AI where the staged file should live. Never errors; defaults to root.
+  importClassify: (importId: string) =>
+    invoke<Placement>("import_classify", { importId }),
+  /// Place the staged file into a folder and index it; returns its final relPath.
+  importCommit: (importId: string, destFolderRel: string, createFolder: boolean) =>
+    invoke<string>("import_commit", { importId, destFolderRel, createFolder }),
+  /// Discard a staged import (dialog cancelled).
+  importCancel: (importId: string) =>
+    invoke<void>("import_cancel", { importId }),
   fileMtime: (relPath: string) => invoke<number>("file_mtime", { relPath }),
+
+  /// A webview URL for `<video src>` — asset-protocol stream, supports seeking.
+  mediaSrc: (relPath: string) => invoke<string>("media_src", { relPath }),
+  videoTranscript: (relPath: string) =>
+    invoke<VideoTranscript>("video_transcript", { relPath }),
+  /// Kicks off on-device Whisper; the .vtt lands via the `index-updated` event.
+  generateTranscript: (relPath: string) =>
+    invoke<void>("generate_transcript", { relPath }),
+
+  /// Status of the recommended transcription model (cheap, offline file check).
+  modelStatus: () => invoke<ModelStatus>("model_status"),
+  /// All downloadable models, discovered from the whisper.cpp repo (cached).
+  listModels: () => invoke<ModelStatus[]>("list_models"),
+  /// Starts a download; progress/completion arrive via `model-download-progress`.
+  downloadModel: (id: string) => invoke<void>("download_model", { id }),
+  removeModel: (id: string) => invoke<void>("remove_model", { id }),
 
   listIngests: () => invoke<IngestSummary[]>("list_ingests"),
   getIngest: (slug: string) => invoke<IngestDetail>("get_ingest", { slug }),
@@ -339,6 +444,19 @@ export const api = {
   reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
   resolveReviewItem: (id: number) =>
     invoke<void>("resolve_review_item", { id }),
+  /// Silence a file's issues for this user only (app-data, never synced).
+  ignoreFile: (relPath: string) =>
+    invoke<void>("ignore_file", { relPath }),
+  unignoreFile: (relPath: string) =>
+    invoke<void>("unignore_file", { relPath }),
+  listIgnored: () => invoke<string[]>("list_ignored"),
+  /// Files changed by someone/something else since the user last looked (nav
+  /// dot + the Files "unread" filter). Per-user, app-data, never synced.
+  unreadFiles: () => invoke<string[]>("unread_files"),
+  /// Record a file as seen at its current version (on open / "Mark as viewed").
+  markSeen: (relPath: string) => invoke<void>("mark_seen", { relPath }),
+  /// Mark every currently-unread file seen.
+  markAllSeen: () => invoke<void>("mark_all_seen"),
   syncStatus: () => invoke<SyncStatus>("sync_status"),
   setSyncAuto: (auto: boolean) =>
     invoke<SyncStatus>("set_sync_auto", { auto }),
@@ -352,6 +470,10 @@ export const api = {
     invoke<string>("resolve_conflict_copy", { itemId, resolution }),
   setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
     invoke<void>("set_ingest_runner_mode", { mode }),
+  /// Whether cloud-offline documents are downloaded + indexed in the background.
+  getBackgroundIndex: () => invoke<boolean>("get_background_index"),
+  setBackgroundIndex: (enabled: boolean) =>
+    invoke<void>("set_background_index", { enabled }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
 
@@ -366,12 +488,19 @@ export const api = {
   chatTranscript: (chatId: string) =>
     invoke<ChatMessage[]>("chat_transcript", { chatId }),
   createChat: () => invoke<ChatRow>("create_chat"),
-  sendChatMessage: (chatId: string, text: string) =>
-    invoke<void>("send_chat_message", { chatId, text }),
+  sendChatMessage: (
+    chatId: string,
+    text: string,
+    openFiles: string[],
+    focusedFile: string | null,
+  ) =>
+    invoke<void>("send_chat_message", { chatId, text, openFiles, focusedFile }),
   renameChat: (chatId: string, title: string) =>
     invoke<void>("rename_chat", { chatId, title }),
   setChatPinned: (chatId: string, pinned: boolean) =>
     invoke<void>("set_chat_pinned", { chatId, pinned }),
+  setChatModel: (chatId: string, model: string | null) =>
+    invoke<void>("set_chat_model", { chatId, model }),
   archiveChat: (chatId: string) => invoke<void>("archive_chat", { chatId }),
   enterTerminalMode: (chatId: string) =>
     invoke<void>("enter_terminal_mode", { chatId }),
@@ -419,4 +548,12 @@ export const api = {
     fn: (ev: KnowledgeModelState) => void,
   ): Promise<UnlistenFn> =>
     listen<KnowledgeModelState>("knowledge-model-state", (e) => fn(e.payload)),
+  onModelDownloadProgress: (
+    fn: (ev: ModelProgress) => void,
+  ): Promise<UnlistenFn> =>
+    listen<ModelProgress>("model-download-progress", (e) => fn(e.payload)),
+  onModelDownloadError: (
+    fn: (ev: ModelDownloadError) => void,
+  ): Promise<UnlistenFn> =>
+    listen<ModelDownloadError>("model-download-error", (e) => fn(e.payload)),
 };

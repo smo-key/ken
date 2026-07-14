@@ -89,6 +89,125 @@ fn summarize_tool(block: &Value) -> String {
     }
 }
 
+/// The stable tier aliases Claude Code resolves to the latest model of each
+/// tier — `claude --model <alias>` documents `haiku`/`sonnet`/`opus`/`fable`.
+/// Passing the alias (never a pinned `claude-*-5` id) is deliberate: the tier
+/// auto-resolves to the newest model, so this list never needs maintenance as
+/// new versions ship. `fable` is a first-class alias on the installed CLI, so
+/// no version mapping is needed for it either.
+pub const MODEL_ALIASES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
+
+/// Validate a user-chosen model against the stable aliases. Returns the
+/// canonical alias to pass as `--model`, or None to fall back to the CLI's own
+/// default — we never forward an unrecognized string (a pinned id, a typo) to
+/// the CLI.
+pub fn valid_model_alias(s: &str) -> Option<&'static str> {
+    let s = s.trim().to_ascii_lowercase();
+    MODEL_ALIASES.iter().copied().find(|a| *a == s)
+}
+
+/// Cap on how many open-file paths we list, so a user with dozens of tabs open
+/// can't bloat every prompt with a giant file list.
+const MAX_CONTEXT_FILES: usize = 20;
+
+/// Build the weak-hint context preamble from the files the user has open in
+/// Ken. Returns None when nothing is open (the message is then sent verbatim).
+/// The wording deliberately frames the list as "just what's on screen, not
+/// necessarily relevant" — the model must treat it as a hint, not a directive.
+pub fn build_context_preamble(focused: Option<&str>, open: &[String]) -> Option<String> {
+    if open.is_empty() {
+        return None;
+    }
+    let shown = open.len().min(MAX_CONTEXT_FILES);
+    let mut lines = String::new();
+    for path in &open[..shown] {
+        lines.push_str(&format!("\n- {path}"));
+    }
+    if open.len() > shown {
+        lines.push_str(&format!("\n- … and {} more", open.len() - shown));
+    }
+    let focus = match focused {
+        Some(f) if !f.trim().is_empty() => format!("\nCurrently focused: {f}"),
+        _ => String::new(),
+    };
+    Some(format!(
+        "[Context — files the user currently has open in Ken. These are just \
+         what's on their screen, NOT necessarily the most relevant files to \
+         your question:{lines}{focus}]"
+    ))
+}
+
+/// Ensure Claude Code treats `project_root` as a trusted folder before we spawn
+/// it. On a first interactive run in an unseen folder the CLI shows a blocking
+/// "Do you trust the files in this folder?" onboarding dialog (it records the
+/// answer as `hasTrustDialogAccepted` under `projects[<abs path>]` in
+/// `~/.claude.json`); in Ken's PTY chat that dialog wedges the session. Because
+/// the folder is one the user already chose as a Ken project, pre-accepting the
+/// trust is honest consent — and it is scoped to exactly this project's path(s)
+/// so it never affects the user's other Claude usage. Best-effort: any IO/parse
+/// failure is swallowed so a chat still spawns (it just may hit the prompt).
+pub fn ensure_folder_trusted(project_root: &Path) {
+    let Some(cfg_path) = claude_config_path() else { return };
+
+    // The CLI keys the map by the process cwd. Register both the path we pass
+    // and its canonical (symlink-resolved) form, so we match whichever the
+    // spawned process ends up reporting as its cwd.
+    let mut keys = vec![project_root.to_string_lossy().into_owned()];
+    if let Ok(canon) = std::fs::canonicalize(project_root) {
+        let canon = canon.to_string_lossy().into_owned();
+        if !keys.contains(&canon) {
+            keys.push(canon);
+        }
+    }
+
+    let existing = std::fs::read(&cfg_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or(Value::Null);
+    let updated = apply_folder_trust(existing, &keys);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&updated) {
+        let _ = std::fs::write(&cfg_path, bytes);
+    }
+}
+
+/// Locate Claude Code's `.claude.json`. Honors `CLAUDE_CONFIG_DIR` (which the
+/// CLI itself respects) so a custom config location — and test isolation — work
+/// the same way the CLI sees them; otherwise `~/.claude.json`.
+fn claude_config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join(".claude.json"));
+    }
+    dirs::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// Set the trust/onboarding flags for exactly `path_keys` in a parsed
+/// `~/.claude.json` value, creating the `projects` map and entries as needed
+/// and leaving every other key (and every other project) untouched. Pure so it
+/// is unit-tested without a real home directory.
+fn apply_folder_trust(mut cfg: Value, path_keys: &[String]) -> Value {
+    if !cfg.is_object() {
+        cfg = Value::Object(serde_json::Map::new());
+    }
+    let root = cfg.as_object_mut().unwrap();
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !projects.is_object() {
+        *projects = Value::Object(serde_json::Map::new());
+    }
+    let projects = projects.as_object_mut().unwrap();
+    for key in path_keys {
+        let entry = projects
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+            obj.insert("hasCompletedProjectOnboarding".into(), Value::Bool(true));
+        }
+    }
+    cfg
+}
+
 struct Conversation {
     child: Child,
     /// Behind its own lock so a turn's (potentially blocking) stdin write can
@@ -127,8 +246,8 @@ impl ChatEngine {
 
     /// Send one user turn. `resume` = the session already exists (any prior
     /// message), so a fresh process must `--resume` instead of `--session-id`.
-    pub fn send(&self, chat_id: &str, text: &str, resume: bool) -> Result<()> {
-        self.ensure_process(chat_id, resume)?;
+    pub fn send(&self, chat_id: &str, text: &str, resume: bool, model: Option<&str>) -> Result<()> {
+        self.ensure_process(chat_id, resume, model)?;
         let payload = serde_json::json!({
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
@@ -174,7 +293,7 @@ impl ChatEngine {
         }
     }
 
-    fn ensure_process(&self, chat_id: &str, resume: bool) -> Result<()> {
+    fn ensure_process(&self, chat_id: &str, resume: bool, model: Option<&str>) -> Result<()> {
         let mut live = self.live.lock().unwrap();
         if let Some(conv) = live.get_mut(chat_id) {
             match conv.child.try_wait() {
@@ -198,6 +317,10 @@ impl ChatEngine {
             }
         }
 
+        // Pre-accept folder trust so a first run in a fresh project doesn't hit
+        // the blocking onboarding gate (scoped to this project's path only).
+        ensure_folder_trusted(&self.project_root);
+
         let mut cmd = Command::new(&self.binary);
         cmd.args([
             "-p",
@@ -209,6 +332,11 @@ impl ChatEngine {
             "--permission-mode",
             "acceptEdits",
         ]);
+        // Only forward a validated stable alias; anything else falls back to the
+        // CLI's own default model.
+        if let Some(alias) = model.and_then(valid_model_alias) {
+            cmd.args(["--model", alias]);
+        }
         if resume {
             cmd.args(["--resume", chat_id]);
         } else {
@@ -317,9 +445,13 @@ pub fn attach_terminal(
     project_root: &Path,
     session_id: &str,
     resume: bool,
+    model: Option<&str>,
     on_data: impl Fn(&[u8]) + Send + 'static,
 ) -> Result<ChatPty> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    // The interactive TUI is where the trust dialog actually blocks; pre-accept
+    // it for this project folder before spawning.
+    ensure_folder_trusted(project_root);
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -330,6 +462,9 @@ pub fn attach_terminal(
         })
         .map_err(|e| Error::Other(format!("pty: {e}")))?;
     let mut cmd = CommandBuilder::new(binary);
+    if let Some(alias) = model.and_then(valid_model_alias) {
+        cmd.args(["--model", alias]);
+    }
     if resume {
         cmd.args(["--resume", session_id]);
     } else {
@@ -403,7 +538,18 @@ mod tests {
     use std::sync::mpsc::{channel, Receiver};
     use std::time::Duration;
 
+    /// Keep the folder-trust writes out of the developer's real ~/.claude.json:
+    /// point CLAUDE_CONFIG_DIR at a throwaway dir shared by all tests (set once,
+    /// so parallel test threads don't race on the env var).
+    fn isolate_claude_config() {
+        use std::sync::OnceLock;
+        static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+        std::env::set_var("CLAUDE_CONFIG_DIR", d.path());
+    }
+
     fn engine(behavior: &str) -> (tempfile::TempDir, ChatEngine, Receiver<ChatUpdate>) {
+        isolate_claude_config();
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_claude(dir.path(), behavior);
         let (tx, rx) = channel();
@@ -427,6 +573,82 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn model_alias_accepts_only_stable_tiers() {
+        // The four stable tier aliases the CLI documents (`claude --help`).
+        assert_eq!(valid_model_alias("haiku"), Some("haiku"));
+        assert_eq!(valid_model_alias("sonnet"), Some("sonnet"));
+        assert_eq!(valid_model_alias("opus"), Some("opus"));
+        assert_eq!(valid_model_alias("fable"), Some("fable"));
+        // Case/whitespace tolerant (the UI sends lowercase, but be robust).
+        assert_eq!(valid_model_alias("  Opus "), Some("opus"));
+        // Empty → default (no --model forwarded). Unknown/pinned ids rejected,
+        // so we never forward an unrecognized string to the CLI.
+        assert_eq!(valid_model_alias(""), None);
+        assert_eq!(valid_model_alias("gpt-4"), None);
+        assert_eq!(valid_model_alias("claude-fable-5"), None);
+    }
+
+    #[test]
+    fn context_preamble_empty_when_nothing_open() {
+        assert_eq!(build_context_preamble(None, &[]), None);
+        assert_eq!(build_context_preamble(Some("a.md"), &[]), None);
+    }
+
+    #[test]
+    fn context_preamble_lists_open_and_focused_with_caveat() {
+        let open = vec!["notes/a.md".to_string(), "src/b.rs".to_string()];
+        let p = build_context_preamble(Some("src/b.rs"), &open).unwrap();
+        // The caveat wording must frame it as a weak hint, per the user.
+        assert!(p.contains("NOT necessarily"), "missing caveat: {p}");
+        assert!(p.contains("notes/a.md"));
+        assert!(p.contains("src/b.rs"));
+        assert!(p.contains("Currently focused: src/b.rs"), "no focus line: {p}");
+    }
+
+    #[test]
+    fn context_preamble_without_focus_omits_focus_line() {
+        let open = vec!["a.md".to_string()];
+        let p = build_context_preamble(None, &open).unwrap();
+        assert!(p.contains("a.md"));
+        assert!(!p.contains("Currently focused"), "focus line leaked: {p}");
+    }
+
+    #[test]
+    fn context_preamble_caps_long_lists() {
+        let open: Vec<String> = (0..50).map(|i| format!("f{i}.md")).collect();
+        let p = build_context_preamble(None, &open).unwrap();
+        assert!(p.contains("f0.md"));
+        // Well past the cap must be dropped and summarized, not listed.
+        assert!(!p.contains("f49.md"), "list not capped: {p}");
+        assert!(p.contains("more"), "no truncation note: {p}");
+    }
+
+    #[test]
+    fn folder_trust_sets_flag_and_preserves_other_keys() {
+        let existing = serde_json::json!({
+            "anonymousId": "keep-me",
+            "projects": {
+                "/other/proj": { "hasTrustDialogAccepted": true, "lastCost": 1.5 }
+            }
+        });
+        let out = apply_folder_trust(existing, &["/ken/proj".to_string()]);
+        // Our project is now trusted.
+        assert_eq!(out["projects"]["/ken/proj"]["hasTrustDialogAccepted"], true);
+        assert_eq!(out["projects"]["/ken/proj"]["hasCompletedProjectOnboarding"], true);
+        // Unrelated keys and other projects are untouched.
+        assert_eq!(out["anonymousId"], "keep-me");
+        assert_eq!(out["projects"]["/other/proj"]["lastCost"], 1.5);
+    }
+
+    #[test]
+    fn folder_trust_from_empty_config_is_idempotent() {
+        let a = apply_folder_trust(Value::Null, &["/p".to_string()]);
+        let b = apply_folder_trust(a.clone(), &["/p".to_string()]);
+        assert_eq!(a, b);
+        assert_eq!(b["projects"]["/p"]["hasTrustDialogAccepted"], true);
     }
 
     #[test]
@@ -459,7 +681,7 @@ mod tests {
     #[test]
     fn send_receive_turn() {
         let (_d, engine, rx) = engine("complete");
-        engine.send("chat-1", "Who owns billing?", false).unwrap();
+        engine.send("chat-1", "Who owns billing?", false, None).unwrap();
         let updates = collect_until_done(&rx, 15);
         assert!(updates.iter().any(|u| matches!(u,
             ChatUpdate::Status { status, .. } if status == "working")));
@@ -473,7 +695,7 @@ mod tests {
     #[test]
     fn tool_use_becomes_activity_line() {
         let (_d, engine, rx) = engine("complete");
-        engine.send("chat-2", "usetool please", false).unwrap();
+        engine.send("chat-2", "usetool please", false, None).unwrap();
         let updates = collect_until_done(&rx, 15);
         assert!(updates.iter().any(|u| matches!(u,
             ChatUpdate::Message { role, content, .. }
@@ -484,7 +706,7 @@ mod tests {
     fn second_turn_reuses_process_and_death_recovers_with_resume() {
         let (_d, engine, rx) = engine("stream-die");
         // First turn completes, then the fake dies (exit 7).
-        engine.send("chat-3", "one", false).unwrap();
+        engine.send("chat-3", "one", false, None).unwrap();
         let first = collect_until_done(&rx, 15);
         assert!(matches!(first.last().unwrap(),
             ChatUpdate::Status { status, .. } if status == "done"));
@@ -492,7 +714,7 @@ mod tests {
         // Give the death a moment to be noticed, then send again: the engine
         // must respawn (with --resume) and the turn must complete.
         std::thread::sleep(Duration::from_millis(400));
-        engine.send("chat-3", "two", true).unwrap();
+        engine.send("chat-3", "two", true, None).unwrap();
         let second = collect_until_done(&rx, 15);
         assert!(second.iter().any(|u| matches!(u,
             ChatUpdate::Message { content, .. } if content.contains("two"))));
@@ -510,7 +732,7 @@ mod tests {
         std::thread::spawn(move || {
             // Well past any OS pipe buffer (64 KiB) so write_all blocks.
             let big = "x".repeat(2 * 1024 * 1024);
-            let _ = sender.send("chat-stall", &big, false);
+            let _ = sender.send("chat-stall", &big, false, None);
         });
         // Let the sender spawn the process and wedge on the write.
         std::thread::sleep(Duration::from_millis(500));
@@ -534,6 +756,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_chat_conversation_and_terminal() {
+        isolate_claude_config();
         let Some(binary) = crate::runner::discover_claude() else {
             panic!("claude CLI not found");
         };
@@ -552,7 +775,7 @@ mod tests {
 
         // Turn 1.
         engine
-            .send(&chat_id, "Read fact.md and reply with just the codename.", false)
+            .send(&chat_id, "Read fact.md and reply with just the codename.", false, None)
             .unwrap();
         let updates = collect_until_done(&rx, 240);
         let reply: String = updates
@@ -573,7 +796,7 @@ mod tests {
         // Kill the process, then resume in a fresh one: context must survive.
         engine.stop(&chat_id);
         engine
-            .send(&chat_id, "Repeat the codename you just told me, nothing else.", true)
+            .send(&chat_id, "Repeat the codename you just told me, nothing else.", true, None)
             .unwrap();
         let updates2 = collect_until_done(&rx, 240);
         let reply2: String = updates2
@@ -593,7 +816,7 @@ mod tests {
         // Terminal attach on the same session: the TUI must paint something.
         std::thread::sleep(Duration::from_millis(500));
         let (dtx, drx) = channel::<usize>();
-        let mut pty = attach_terminal(&binary, dir.path(), &chat_id, true, move |b| {
+        let mut pty = attach_terminal(&binary, dir.path(), &chat_id, true, None, move |b| {
             let _ = dtx.send(b.len());
         })
         .unwrap();
@@ -611,11 +834,12 @@ mod tests {
 
     #[test]
     fn terminal_attach_round_trip() {
+        isolate_claude_config();
         let dir = tempfile::tempdir().unwrap();
         // The fake, given no special args, acts like a TUI: reads stdin.
         let bin = write_fake_claude(dir.path(), "complete");
         let (tx, rx) = channel::<Vec<u8>>();
-        let mut pty = attach_terminal(&bin, dir.path(), "sess-t", false, move |b| {
+        let mut pty = attach_terminal(&bin, dir.path(), "sess-t", false, None, move |b| {
             let _ = tx.send(b.to_vec());
         })
         .unwrap();

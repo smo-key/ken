@@ -1,33 +1,21 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { api } from "../../lib/api";
+  import { registerEmptyFind } from "../../lib/find-dom.svelte";
+  import { mimeForPath } from "../../lib/mime";
+  import PreviewLoading from "./PreviewLoading.svelte";
 
   let { relPath }: { relPath: string } = $props();
 
   let url = $state<string | null>(null);
   let error = $state<string | null>(null);
 
-  const MIME: Record<string, string> = {
-    svg: "image/svg+xml",
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    bmp: "image/bmp",
-    avif: "image/avif",
-    ico: "image/x-icon",
-  };
-
-  function mimeFor(path: string): string | undefined {
-    const ext = path.split(".").pop()?.toLowerCase() ?? "";
-    return MIME[ext];
-  }
+  registerEmptyFind("An image has no text to search.");
 
   onMount(async () => {
     try {
       const bytes = await api.readFileBytes(relPath);
-      const type = mimeFor(relPath);
+      const type = mimeForPath(relPath);
       url = URL.createObjectURL(
         type ? new Blob([bytes], { type }) : new Blob([bytes]),
       );
@@ -47,7 +35,7 @@
   {:else if url}
     <img src={url} alt={relPath} />
   {:else}
-    <div class="note">Loading image…</div>
+    <PreviewLoading label="Loading image…" />
   {/if}
 </div>
 

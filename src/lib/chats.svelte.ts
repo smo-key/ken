@@ -4,6 +4,7 @@ import {
   type ChatMessage,
   type ChatRow,
 } from "./api";
+import { app } from "./app.svelte";
 
 class ChatsStore {
   open = $state(false);
@@ -85,8 +86,13 @@ class ChatsStore {
   async send(text: string) {
     if (!this.activeId) return;
     this.sendError = null;
+    // Attach the files the user has on screen as a weak, clearly-caveated hint
+    // (the backend frames it as "not necessarily relevant"). Send all open
+    // tabs plus which one is focused.
+    const openFiles = app.fileTabs.map((t) => t.path);
+    const focusedFile = app.openFile;
     try {
-      await api.sendChatMessage(this.activeId, text);
+      await api.sendChatMessage(this.activeId, text, openFiles, focusedFile);
     } catch (e) {
       this.sendError = String(e);
     }
@@ -94,6 +100,12 @@ class ChatsStore {
 
   async pin(id: string, pinned: boolean) {
     await api.setChatPinned(id, pinned);
+  }
+
+  /** Change the active chat's model. Applies to the next message/session. */
+  async setModel(model: string | null) {
+    if (!this.activeId) return;
+    await api.setChatModel(this.activeId, model);
   }
 
   async archive(id: string) {

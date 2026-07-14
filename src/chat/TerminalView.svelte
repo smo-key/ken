@@ -4,6 +4,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import "@xterm/xterm/css/xterm.css";
   import { api } from "../lib/api";
+  import { base64 } from "../lib/mime";
 
   let { chatId }: { chatId: string } = $props();
 
@@ -17,12 +18,6 @@
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return bytes;
-  }
-
-  function bytesToB64(bytes: Uint8Array): string {
-    let bin = "";
-    for (const b of bytes) bin += String.fromCharCode(b);
-    return btoa(bin);
   }
 
   onMount(async () => {
@@ -43,7 +38,7 @@
     fit.fit();
 
     term.onData((data) => {
-      void api.chatPtyInput(chatId, bytesToB64(new TextEncoder().encode(data)));
+      void api.chatPtyInput(chatId, base64(new TextEncoder().encode(data)));
     });
     term.onResize(({ rows, cols }) => {
       void api.chatPtyResize(chatId, rows, cols);

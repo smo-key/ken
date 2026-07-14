@@ -4,6 +4,7 @@
   import { app } from "../lib/app.svelte";
   import Plus from "@lucide/svelte/icons/plus";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
+  import Pencil from "@lucide/svelte/icons/pencil";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
@@ -11,9 +12,48 @@
   let { close }: { close: () => void } = $props();
   let error = $state<string | null>(null);
 
+  // Inline rename: which row is being edited, its draft text, and a guard so
+  // an Enter-then-blur pair doesn't submit twice.
+  let renamingId = $state<string | null>(null);
+  let renameValue = $state("");
+  let renameBusy = $state(false);
+
   async function forgetId(id: string) {
     await api.forgetProject(id);
     await app.refreshRegistry();
+  }
+
+  function startRename(entry: RegistryEntryStatus) {
+    renamingId = entry.id;
+    renameValue = entry.name;
+    error = null;
+  }
+
+  async function submitRename(entry: RegistryEntryStatus) {
+    if (renameBusy || renamingId !== entry.id) return;
+    const name = renameValue.trim();
+    if (!name || name === entry.name) {
+      renamingId = null;
+      return;
+    }
+    renameBusy = true;
+    try {
+      const updated = await api.renameProject(entry.id, name);
+      await app.refreshRegistry();
+      // Keep the live title bar/switcher in step when the open project is
+      // the one renamed; app.project is reactive so the UI follows.
+      if (app.project?.id === entry.id) app.project = updated;
+      renamingId = null;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      renameBusy = false;
+    }
+  }
+
+  function focusInput(node: HTMLInputElement) {
+    node.focus();
+    node.select();
   }
 
   function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
@@ -26,6 +66,11 @@
         icon: FolderOpen,
         disabled: !entry.available,
         onSelect: () => pick(entry.path, entry.available),
+      },
+      {
+        label: "Rename…",
+        icon: Pencil,
+        onSelect: () => startRename(entry),
       },
       "separator",
       {
@@ -84,7 +129,27 @@
     >
       <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
       <span class="info">
-        <span class="name">{entry.name}</span>
+        {#if renamingId === entry.id}
+          <!-- Nested in the row <button>, so swallow clicks/keys that would
+               otherwise trigger the row's open action. -->
+          <input
+            class="name rename"
+            bind:value={renameValue}
+            onclick={(e) => e.stopPropagation()}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submitRename(entry);
+              } else if (e.key === "Escape") {
+                renamingId = null;
+              }
+            }}
+            onblur={() => void submitRename(entry)}
+            use:focusInput
+          />
+        {:else}
+          <span class="name">{entry.name}</span>
+        {/if}
         <span class="path mono">{entry.path}</span>
         {#if !entry.available}
           <span class="missing">Folder not found — was it moved or deleted?</span>
@@ -177,6 +242,18 @@
   }
   .name {
     font-weight: 600;
+  }
+  input.rename {
+    font: inherit;
+    font-weight: 600;
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid var(--accent);
+    border-radius: 5px;
+    padding: 1px 4px;
+    margin: -2px 0;
+    width: 100%;
+    outline: none;
   }
   .path {
     font-size: 11px;

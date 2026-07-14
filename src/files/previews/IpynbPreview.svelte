@@ -3,11 +3,16 @@
   import { api } from "../../lib/api";
   import { renderMarkdown } from "../../lib/markdown";
   import { parseNotebook, type IpynbCell } from "../../lib/ipynb";
+  import { registerDomFind } from "../../lib/find-dom.svelte";
+  import PreviewLoading from "./PreviewLoading.svelte";
 
   let { relPath }: { relPath: string } = $props();
 
   let cells = $state<IpynbCell[] | null>(null);
   let error = $state<string | null>(null);
+  let nb = $state<HTMLDivElement | null>(null);
+
+  registerDomFind(() => nb, { deps: () => cells });
 
   onMount(async () => {
     try {
@@ -23,11 +28,11 @@
   {#if error}
     <div class="note error">{error}</div>
   {:else if cells === null}
-    <div class="note">Rendering notebook…</div>
+    <PreviewLoading label="Rendering notebook…" />
   {:else if cells.length === 0}
     <div class="note">This notebook has no cells.</div>
   {:else}
-    <div class="nb">
+    <div class="nb" bind:this={nb}>
       {#each cells as cell, i (i)}
         {#if cell.type === "markdown"}
           <div class="md">{@html renderMarkdown(cell.source)}</div>

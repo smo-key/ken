@@ -3,10 +3,16 @@
   import { api, type FileRow } from "../../lib/api";
   import { formatSize, glyphFor, timeAgo } from "../../lib/format";
   import FileGlyph from "../FileGlyph.svelte";
+  import { registerDomFind } from "../../lib/find-dom.svelte";
 
   let { relPath, meta }: { relPath: string; meta: FileRow } = $props();
 
   let text = $state<string>("");
+  let inner = $state<HTMLDivElement | null>(null);
+
+  // The extracted text is what Ken knows about this file, so that is what find
+  // searches — the metadata card comes along because it is in the same subtree.
+  registerDomFind(() => inner, { deps: () => text });
 
   onMount(async () => {
     try {
@@ -18,7 +24,7 @@
 </script>
 
 <div class="scroll">
-  <div class="inner">
+  <div class="inner" bind:this={inner}>
     <div class="meta-card">
       <FileGlyph kind={meta.kind} />
       <div class="facts">

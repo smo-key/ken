@@ -200,3 +200,16 @@ button {
   padding: 1px 5px;
   background: var(--paper);
 }
+
+/* Find-in-document highlights. Global because they are applied imperatively to
+   DOM the previews own (<mark>), to Milkdown's inline decorations (<span>), and
+   to CSV cell inputs — none of which a component's scoped CSS can reach. */
+.ken-find {
+  background: color-mix(in srgb, var(--needs-input) 32%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+.ken-find-current {
+  background: color-mix(in srgb, var(--accent) 42%, transparent);
+  box-shadow: 0 0 0 1px var(--accent);
+}

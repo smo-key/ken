@@ -5,7 +5,7 @@
   import { app } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery } from "../lib/assist";
-  import { renderMarkdown } from "../lib/markdown";
+  import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
 
@@ -67,7 +67,10 @@
       searched = false;
       return;
     }
-    hits = await api.search(q, 30);
+    const found = await api.search(q, 30);
+    // A slower earlier request must not overwrite a newer query's results.
+    if (q !== query.trim()) return;
+    hits = found;
     searched = true;
     selected = 0;
   }
@@ -99,17 +102,6 @@
       e.preventDefault();
       openHit(hits[selected]);
     }
-  }
-
-  // Snippets carry only our <mark> tags; escape everything else.
-  function renderSnippet(snippet: string): string {
-    const escaped = snippet
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-    return escaped
-      .replaceAll("&lt;mark&gt;", "<mark>")
-      .replaceAll("&lt;/mark&gt;", "</mark>");
   }
 </script>
 
@@ -160,8 +152,9 @@
         >
           <FileGlyph kind={hit.kind} />
           <span class="hit-body">
-            <span class="snippet">{@html renderSnippet(hit.snippet)}</span>
-            <span class="path mono">{hit.relPath}</span>
+            <span class="snippet">{@html renderSearchSnippet(hit.snippet)}</span>
+            <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
+            <span class="path mono" title={hit.relPath}>{hit.relPath.split("/").pop() || hit.relPath}</span>
           </span>
           {#if i === selected}
             <span class="enter mono">↵</span>
@@ -171,8 +164,13 @@
     </div>
   {:else if searched}
     <div class="empty">
-      Nothing in this project matches “{query}”. Ken searches file contents and
-      names — try fewer or different words.
+      {#if app.scanning}
+        Nothing matches “{query}” <em>yet</em> — Ken is still reading your folder.
+        Search lights up as files are indexed.
+      {:else}
+        Nothing in this project matches “{query}”. Ken searches file contents and
+        names — try fewer or different words.
+      {/if}
     </div>
   {/if}
 

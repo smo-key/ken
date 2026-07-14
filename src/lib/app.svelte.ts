@@ -18,6 +18,23 @@ import {
   type Favorite,
 } from "./favorites";
 import {
+  loadRecents,
+  recordRecent,
+  saveRecents,
+  type RecentEntry,
+} from "./recent";
+import { review } from "./review.svelte";
+import {
+  clampChatWidth,
+  loadChatWidth,
+  saveChatWidth,
+} from "./chatWidth";
+import {
+  clampSidebarWidth,
+  loadSidebarWidth,
+  saveSidebarWidth,
+} from "./sidebar";
+import {
   closeOthers as reduceCloseOthers,
   closeTab as reduceCloseTab,
   makePersistent as reduceMakePersistent,
@@ -52,6 +69,15 @@ class AppStore {
   /** Favorites shown above the Files tree, persisted per project. */
   favorites = $state<Favorite[]>([]);
 
+  /** Files opened recently, newest first — Home's "pick up where you left off". */
+  recents = $state<RecentEntry[]>([]);
+
+  /** Files sidebar width in px — a window preference, so it spans projects. */
+  sidebarWidth = $state(loadSidebarWidth());
+
+  /** Chat drawer width in px — a window preference, so it spans projects. */
+  chatWidth = $state(loadChatWidth());
+
   /** Reveal request: tree folders on the path to this rel-path auto-expand. */
   revealTarget = $state<string | null>(null);
   revealNonce = $state(0);
@@ -72,8 +98,74 @@ class AppStore {
   syncState = $state<SyncStateName>("off");
   syncDetail = $state<string | null>(null);
 
+  /** Whether cloud-offline documents are indexed in the background (on by
+   *  default). Shared so Settings and the Home footer agree instantly. */
+  backgroundIndex = $state(true);
+
+  /** Files the user has ignored (per-user, app-data, never synced). Their
+   *  issues are hidden but they stay indexed and searchable. */
+  ignored = $state<string[]>([]);
+
+  /** Files changed by someone/something else since the user last looked —
+   *  per-user, app-data, never synced. Drives the Files nav dot, the tree's
+   *  unread markers, and the "unread" filter. */
+  unread = $state<string[]>([]);
+
+  /** Membership set for O(1) per-row unread checks in the tree. */
+  unreadSet = $derived(new Set(this.unread));
+
+  isUnread(path: string): boolean {
+    return this.unreadSet.has(path);
+  }
+
+  /** Files-tree filter: everything, or only files changed since last looked.
+   *  Ephemeral view state (not persisted). */
+  filesFilter = $state<"all" | "unread">("all");
+
   get failedFiles(): FileRow[] {
-    return this.files.filter((f) => f.status === "failed");
+    const hidden = new Set(this.ignored);
+    return this.files.filter(
+      (f) => f.status === "failed" && !hidden.has(f.relPath),
+    );
+  }
+
+  /** Hide a file's issues everywhere (Review inbox, badge, Home) for this user. */
+  async ignoreFile(relPath: string) {
+    await api.ignoreFile(relPath);
+    if (!this.ignored.includes(relPath)) this.ignored = [...this.ignored, relPath];
+    // The badge/inbox recompute on the backend; refresh so they reflect it now.
+    await review.refresh();
+  }
+
+  /** Stop ignoring a file so its issues can surface again. */
+  async unignoreFile(relPath: string) {
+    await api.unignoreFile(relPath);
+    this.ignored = this.ignored.filter((p) => p !== relPath);
+    await review.refresh();
+  }
+
+  private async loadIgnored() {
+    this.ignored = await api.listIgnored().catch(() => []);
+  }
+
+  private async loadUnread() {
+    this.unread = await api.unreadFiles().catch(() => []);
+  }
+
+  /** Record a file as seen (viewing it clears its unread state). The backend
+   *  no-ops when the seen version already matches, so calling on every open is
+   *  cheap and stays correct even if the local unread list is momentarily stale. */
+  async markSeen(relPath: string) {
+    if (this.isUnread(relPath)) {
+      this.unread = this.unread.filter((p) => p !== relPath);
+    }
+    await api.markSeen(relPath).catch(() => {});
+  }
+
+  /** Clear every unread file at once ("Mark all as viewed"). */
+  async markAllSeen() {
+    this.unread = [];
+    await api.markAllSeen().catch(() => {});
   }
 
   async init() {
@@ -84,6 +176,9 @@ class AppStore {
       this.lastScan = stats;
       this.lastScanAt = Date.now();
       void this.refreshTree();
+      // The index changing is exactly when files become (un)read — a synced or
+      // externally-edited file lands here — so recompute the unread set live.
+      void this.loadUnread();
     });
     await api.onScanError((message) => {
       this.scanning = false;
@@ -93,8 +188,14 @@ class AppStore {
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
     });
+    // Wire the review inbox to its events here (app start), not on Review-tab
+    // mount, so the nav badge stays live wherever the user is.
+    void review.subscribe();
     if (this.project) {
       this.loadProjectLocalState();
+      void this.loadBackgroundIndex();
+      void this.loadIgnored();
+      void this.loadUnread();
       await this.refreshTree();
     } else {
       // Launch straight into the last-used project when it's still around;
@@ -136,18 +237,37 @@ class AppStore {
     this.syncState = "off";
     this.syncDetail = null;
     this.loadProjectLocalState();
+    void this.loadBackgroundIndex();
+    void this.loadIgnored();
+    void this.loadUnread();
     this.screen = "home";
     await this.refreshRegistry();
     await this.refreshTree();
+    // Repopulate the badge for the newly-active project immediately, ahead of
+    // the first scan/sync event that would otherwise refresh it.
+    void review.refresh();
   }
 
-  /** Restore tabs + favorites for the current project from localStorage. */
+  /** Read the persisted background-index preference for the open project. */
+  private async loadBackgroundIndex() {
+    this.backgroundIndex = await api.getBackgroundIndex().catch(() => true);
+  }
+
+  /** Toggle background indexing of cloud-offline documents (persisted). */
+  async setBackgroundIndex(enabled: boolean) {
+    this.backgroundIndex = enabled;
+    await api.setBackgroundIndex(enabled);
+  }
+
+  /** Restore tabs + favorites + recents for the current project from localStorage. */
   private loadProjectLocalState() {
     this.fileTabs = [];
     this.activeTab = null;
     this.favorites = [];
+    this.recents = [];
     if (!this.project) return;
     this.favorites = loadFavorites(this.project.id);
+    this.recents = loadRecents(this.project.id);
     try {
       const raw = localStorage.getItem(this.tabsKey(this.project.id));
       if (raw) {
@@ -201,6 +321,8 @@ class AppStore {
   /** Open a file in a preview tab (single-click) or persistent tab. */
   openTab(path: string, persistent = false) {
     this.applyTabState(reduceOpenTab({ tabs: this.fileTabs, active: this.activeTab }, path, persistent));
+    this.recents = recordRecent(this.recents, path);
+    if (this.project) saveRecents(this.project.id, this.recents);
   }
 
   activateTab(path: string) {
@@ -239,6 +361,30 @@ class AppStore {
   removeFavorite(path: string) {
     this.favorites = removeFavorite(this.favorites, path);
     if (this.project) saveFavorites(this.project.id, this.favorites);
+  }
+
+  // ── Sidebar ───────────────────────────────────────────────────────────
+  /** Live width while the divider is being dragged. */
+  setSidebarWidth(width: number, windowWidth: number = window.innerWidth) {
+    this.sidebarWidth = clampSidebarWidth(width, windowWidth);
+  }
+
+  /** Write the settled width — separate from the setter so a drag doesn't hit
+   *  localStorage on every frame. */
+  commitSidebarWidth() {
+    saveSidebarWidth(this.sidebarWidth);
+  }
+
+  // ── Chat drawer ───────────────────────────────────────────────────────
+  /** Live width while the divider is being dragged. */
+  setChatWidth(width: number, windowWidth: number = window.innerWidth) {
+    this.chatWidth = clampChatWidth(width, windowWidth);
+  }
+
+  /** Write the settled width — separate from the setter so a drag doesn't hit
+   *  localStorage on every frame. */
+  commitChatWidth() {
+    saveChatWidth(this.chatWidth);
   }
 
   /** Ask the tree to expand every folder on the way to `path`. */

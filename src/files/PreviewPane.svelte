@@ -6,18 +6,27 @@
   import ImagePreview from "./previews/ImagePreview.svelte";
   import IpynbPreview from "./previews/IpynbPreview.svelte";
   import PptxPreview from "./previews/PptxPreview.svelte";
+  import HtmlPreview from "./previews/HtmlPreview.svelte";
+  import VideoPreview from "./previews/VideoPreview.svelte";
   import FallbackPreview from "./previews/FallbackPreview.svelte";
+  import { isHtmlPath } from "./previews/html";
 
   let { relPath, kind, meta }: { relPath: string; kind: string; meta: FileRow } =
     $props();
 
   // Some formats are routed by extension because the backend kind is coarse
-  // (e.g. .ipynb indexes as "binary").
+  // (e.g. .ipynb indexes as "binary", .html/.htm as "code", videos as "binary").
   const ext = $derived(relPath.split(".").pop()?.toLowerCase() ?? "");
+
+  const VIDEO_EXTS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi"]);
 </script>
 
 {#if ext === "ipynb"}
   <IpynbPreview {relPath} />
+{:else if VIDEO_EXTS.has(ext)}
+  <VideoPreview {relPath} />
+{:else if isHtmlPath(relPath)}
+  <HtmlPreview {relPath} />
 {:else if kind === "pdf"}
   <PdfPreview {relPath} />
 {:else if kind === "docx"}

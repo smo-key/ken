@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub struct Db {
     conn: Connection,
@@ -255,6 +255,21 @@ impl Db {
                 );
                 "#,
             )?;
+        }
+        if version < 7 {
+            // Per-chat model choice (a stable tier alias like 'opus', or NULL
+            // for the CLI's own default). Nullable so existing chats keep the
+            // default with no backfill. Guarded because ADD COLUMN has no
+            // IF NOT EXISTS and the column may already be present (a fresh DB
+            // creates the full schema, then tests rewind schema_version).
+            let has_model: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('chats') WHERE name = 'model'")?
+                .exists([])?;
+            if !has_model {
+                self.conn
+                    .execute_batch("ALTER TABLE chats ADD COLUMN model TEXT;")?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -506,6 +521,20 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
+    }
+
+    /// Count of files whose content is actually in the index (status
+    /// `indexed`). The auto-build guard ("nothing to read → don't build")
+    /// and the model builder both read only these rows, so a folder of
+    /// image (metadata_only) / failed / cloud_only files — nonzero
+    /// `file_count` but zero readable content — must count as nothing to
+    /// build, or the tick launches a paid session that reads nothing.
+    pub fn indexed_file_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE status = 'indexed'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     // --- ingest run log ---
@@ -764,11 +793,11 @@ impl Db {
 
     pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived, model)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                ON CONFLICT(id) DO UPDATE SET
                  title = ?2, kind = ?3, pinned = ?4, status = ?5,
-                 last_active_at = ?7, archived = ?8"#,
+                 last_active_at = ?7, archived = ?8, model = ?9"#,
             params![
                 chat.id,
                 chat.title,
@@ -777,7 +806,8 @@ impl Db {
                 chat.status,
                 chat.created_at,
                 chat.last_active_at,
-                chat.archived as i64
+                chat.archived as i64,
+                chat.model
             ],
         )?;
         Ok(())
@@ -793,11 +823,12 @@ impl Db {
             created_at: r.get(5)?,
             last_active_at: r.get(6)?,
             archived: r.get::<_, i64>(7)? != 0,
+            model: r.get(8)?,
         })
     }
 
     const CHAT_COLS: &'static str =
-        "id, title, kind, pinned, status, created_at, last_active_at, archived";
+        "id, title, kind, pinned, status, created_at, last_active_at, archived, model";
 
     pub fn get_chat(&self, id: &str) -> Result<Option<ChatRow>> {
         let sql = format!("SELECT {} FROM chats WHERE id = ?1", Self::CHAT_COLS);
@@ -837,6 +868,16 @@ impl Db {
             ChatFlag::Archived => "UPDATE chats SET archived = ?2 WHERE id = ?1",
         };
         self.conn.execute(sql, params![id, value as i64])?;
+        Ok(())
+    }
+
+    /// Set (or clear, with None) a chat's chosen model. Applies to the next
+    /// message/session — the live process, if any, keeps its current model.
+    pub fn set_chat_model(&mut self, id: &str, model: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chats SET model = ?2 WHERE id = ?1",
+            params![id, model],
+        )?;
         Ok(())
     }
 
@@ -1027,6 +1068,9 @@ pub struct ChatRow {
     pub created_at: i64,
     pub last_active_at: i64,
     pub archived: bool,
+    /// Chosen model as a stable tier alias (`haiku`/`sonnet`/`opus`/`fable`),
+    /// or None for the CLI's own default. Applied when a session is spawned.
+    pub model: Option<String>,
 }
 
 /// One day's digest. `content` is the raw model output — a paragraph
@@ -1360,6 +1404,27 @@ mod tests {
     }
 
     #[test]
+    fn indexed_file_count_excludes_non_indexed_rows() {
+        // seeded() has 2 indexed rows + 1 failed row.
+        let mut db = seeded();
+        assert_eq!(db.file_count().unwrap(), 3);
+        assert_eq!(db.indexed_file_count().unwrap(), 2);
+
+        // Image-only (metadata_only) and online-only (cloud_only) rows have
+        // no readable content and must not count toward the auto-build guard.
+        db.upsert_file("img/photo.jpg", "jpg", 1000, 1, "metadata_only", None, "")
+            .unwrap();
+        db.upsert_file("docs/remote.pdf", "pdf", 2000, 1, "cloud_only", None, "")
+            .unwrap();
+        assert_eq!(db.file_count().unwrap(), 5, "all rows still present");
+        assert_eq!(
+            db.indexed_file_count().unwrap(),
+            2,
+            "only status='indexed' rows count"
+        );
+    }
+
+    #[test]
     fn remove_file_removes_from_search() {
         let mut db = seeded();
         db.remove_file("knowledge/People.md").unwrap();
@@ -1426,6 +1491,36 @@ mod tests {
         assert!(Db::open_read_only(base, Uuid::new_v4()).is_err());
     }
 
+    // The search command opens its read-only handle once at project activation,
+    // while the writer keeps indexing. This asserts the structural guarantee the
+    // fix relies on: a WAL reader opened BEFORE a write still sees that write
+    // once committed, and returns the same hits the writer would. (The freedom
+    // from lock contention this buys is structural — it can't be unit-tested.)
+    #[test]
+    fn read_only_search_sees_writes_committed_after_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let id = Uuid::new_v4();
+        let mut writer = Db::open(base, id).unwrap();
+        writer
+            .upsert_file("notes/a.md", "md", 10, 1, "indexed", None, "billing cutover")
+            .unwrap();
+
+        // Reader opened while the writer is still live, before the next commit.
+        let reader = Db::open_read_only(base, id).unwrap();
+        assert_eq!(reader.search("billing", 5).unwrap().len(), 1);
+
+        // A freshly-indexed file must be findable through the same reader.
+        writer
+            .upsert_file("notes/b.md", "md", 20, 2, "indexed", None, "quarterly forecast")
+            .unwrap();
+        let via_reader = reader.search("forecast", 5).unwrap();
+        let via_writer = writer.search("forecast", 5).unwrap();
+        assert_eq!(via_reader.len(), 1);
+        let paths = |hits: &[SearchHit]| hits.iter().map(|h| h.rel_path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&via_reader), paths(&via_writer));
+    }
+
     #[test]
     fn schema_version_recorded() {
         let db = Db::open_in_memory().unwrap();
@@ -1448,6 +1543,7 @@ mod tests {
             created_at: 100,
             last_active_at: 100,
             archived: false,
+            model: None,
         };
         db.upsert_chat(&chat).unwrap();
         db.upsert_chat(&ChatRow { id: "sess-2".into(), title: "Second".into(), last_active_at: 200, created_at: 200, ..chat.clone() }).unwrap();
@@ -1469,6 +1565,32 @@ mod tests {
 
         db.set_chat_flag("sess-1", ChatFlag::Archived, true).unwrap();
         assert_eq!(db.list_chats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_model_defaults_none_and_persists() {
+        let mut db = Db::open_in_memory().unwrap();
+        let chat = ChatRow {
+            id: "m-1".into(),
+            title: "Model chat".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 1,
+            last_active_at: 1,
+            archived: false,
+            model: None,
+        };
+        db.upsert_chat(&chat).unwrap();
+        // A fresh chat carries no model → CLI default.
+        assert_eq!(db.get_chat("m-1").unwrap().unwrap().model, None);
+
+        db.set_chat_model("m-1", Some("opus")).unwrap();
+        assert_eq!(db.get_chat("m-1").unwrap().unwrap().model.as_deref(), Some("opus"));
+
+        // Clearing returns to the default.
+        db.set_chat_model("m-1", None).unwrap();
+        assert_eq!(db.get_chat("m-1").unwrap().unwrap().model, None);
     }
 
     #[test]

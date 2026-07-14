@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+use crate::assistant::{self, ParsedOutput};
 use crate::hooks::HookListener;
 use crate::{Error, Result};
 
@@ -303,7 +304,7 @@ fn run_headless(
     prompt: &str,
     cancel: &CancelToken,
 ) -> Result<RunOutcome> {
-    let mut child = std::process::Command::new(&cfg.binary)
+    let child = std::process::Command::new(&cfg.binary)
         .args([
             "-p",
             prompt,
@@ -321,52 +322,24 @@ fn run_headless(
         .spawn()
         .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
 
-    let stdout = child.stdout.take();
-    let out_buf = Arc::new(Mutex::new(String::new()));
-    let out_clone = out_buf.clone();
-    let reader_thread = std::thread::spawn(move || {
-        if let Some(mut s) = stdout {
-            let mut text = String::new();
-            let _ = s.read_to_string(&mut text);
-            *out_clone.lock().unwrap() = text;
-        }
-    });
-
-    let deadline = Instant::now() + cfg.timeout;
-    loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = reader_thread.join();
-            return Ok(RunOutcome::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let _ = reader_thread.join();
-                let output = out_buf.lock().unwrap().clone();
-                let is_error = serde_json::from_str::<serde_json::Value>(output.trim())
-                    .ok()
-                    .and_then(|v| v.get("is_error").and_then(|b| b.as_bool()))
-                    .unwrap_or(!status.success());
-                if status.success() && !is_error {
-                    return Ok(RunOutcome::Completed);
-                }
-                return Ok(RunOutcome::Failed(format!(
-                    "headless run failed (status {status:?}): {}",
-                    truncate(&output, 2000)
-                )));
+    use assistant::DriveResult;
+    let outcome = match assistant::drive_child(child, cfg.timeout, Duration::from_millis(200), cancel)
+    {
+        DriveResult::Exited(status, output, stderr) => match assistant::parse_oneshot_output(&output) {
+            ParsedOutput::Success(_) if status.success() => RunOutcome::Completed,
+            ParsedOutput::Success(_) => RunOutcome::Failed(assistant::with_stderr(
+                format!("the run exited with status {status:?}"),
+                &stderr,
+            )),
+            ParsedOutput::Error(msg) | ParsedOutput::Unusable(msg) => {
+                RunOutcome::Failed(assistant::with_stderr(msg, &stderr))
             }
-            Ok(None) => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = reader_thread.join();
-                    let tail = out_buf.lock().unwrap().clone();
-                    return Ok(RunOutcome::TimedOut(truncate(&tail, 2000).to_string()));
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => return Ok(RunOutcome::Failed(format!("wait failed: {e}"))),
-        }
-    }
+        },
+        DriveResult::Cancelled => RunOutcome::Cancelled,
+        DriveResult::TimedOut(tail) => RunOutcome::TimedOut(truncate(&tail, 2000).to_string()),
+        DriveResult::WaitFailed(e) => RunOutcome::Failed(format!("wait failed: {e}")),
+    };
+    Ok(outcome)
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -486,6 +459,32 @@ case "$BEHAVIOR" in
     sleep 300;;
   headless-fail)
     echo '{"is_error": true, "result": "simulated"}'; exit 0;;
+  headless-array)
+    # Real CLI shape since v2.x: an array of events, answer in the last one.
+    echo '[{"type":"system","subtype":"init","session_id":"'"$SESSION"'"},{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}},{"type":"rate_limit_event"},{"type":"result","subtype":"success","is_error":false,"result":"OK","duration_ms":12,"session_id":"'"$SESSION"'"}]'
+    exit 0;;
+  headless-array-error)
+    echo '[{"type":"system","subtype":"init"},{"type":"result","subtype":"error_max_turns","is_error":true,"result":"hit the turn limit"}]'
+    exit 0;;
+  headless-array-noresult)
+    # Clean exit, real work, but NO terminal result wrapper — the answer is
+    # only in the last assistant message. Must be recovered as Completed.
+    echo '[{"type":"system","subtype":"init"},{"type":"assistant","message":{"content":[{"type":"text","text":"recovered answer"}]}}]'
+    exit 0;;
+  headless-array-noresult-nonzero)
+    # Same shape but a non-zero exit: the process failed, so recovery must NOT
+    # mask it — still Failed.
+    echo '[{"type":"system","subtype":"init"},{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}]'
+    exit 5;;
+  headless-stderr-fail)
+    echo "API Error: credit balance too low" >&2
+    echo '[{"type":"result","subtype":"error_during_execution","is_error":true}]'
+    exit 0;;
+  stderr-flood)
+    # >64KB on stderr: fills the pipe buffer and blocks unless the parent drains it.
+    for i in $(seq 1 4000); do echo "warn $i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" >&2; done
+    echo '[{"type":"result","subtype":"success","is_error":false,"result":"OK"}]'
+    exit 0;;
   complete)
     sleep 0.2
     write_outputs
@@ -650,6 +649,64 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, RunOutcome::Failed(_)));
+    }
+
+    /// The v2.x CLI exits 0 and reports failure inside the trailing result
+    /// event of a JSON array; an ingest must not be reported as Completed.
+    #[test]
+    fn headless_honors_error_in_array_result_event() {
+        let (dir, bin, hooks) = setup("headless-array-error");
+        let outcome = run_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-headless-arr",
+            "prompt",
+            &hooks,
+            &CancelToken::new(),
+            || {},
+        )
+        .unwrap();
+        match outcome {
+            RunOutcome::Failed(msg) => assert!(msg.contains("error_max_turns"), "{msg}"),
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    /// A clean exit whose stdout has no terminal result event but does carry
+    /// a final assistant message did its work — report Completed (an ingest is
+    /// applied only on Completed), not Failed.
+    #[test]
+    fn headless_recovers_when_no_result_event_but_exit_zero() {
+        let (dir, bin, hooks) = setup("headless-array-noresult");
+        let outcome = run_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-noresult",
+            "prompt",
+            &hooks,
+            &CancelToken::new(),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+    }
+
+    /// Same shape but a non-zero exit is a genuine failure — recovery must not
+    /// mask it.
+    #[test]
+    fn headless_fails_when_no_result_event_and_nonzero_exit() {
+        let (dir, bin, hooks) = setup("headless-array-noresult-nonzero");
+        let outcome = run_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-noresult-nz",
+            "prompt",
+            &hooks,
+            &CancelToken::new(),
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
     }
 
     #[test]

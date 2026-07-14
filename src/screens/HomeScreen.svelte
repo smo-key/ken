@@ -6,15 +6,29 @@
   import { review } from "../lib/review.svelte";
   import { digestMarkdown } from "../lib/assist";
   import { isProjectLink, renderMarkdown } from "../lib/markdown";
-  import { timeAgo } from "../lib/format";
-  import ResearchModal from "../research/ResearchModal.svelte";
+  import { homeRecents, recentlyOpened } from "../lib/recent";
+  import HomeSearch from "./HomeSearch.svelte";
+  import HomeStatus from "./HomeStatus.svelte";
+  import RecentFiles from "./RecentFiles.svelte";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
   import Copy from "@lucide/svelte/icons/copy";
-  import Search from "@lucide/svelte/icons/search";
+  import BellOff from "@lucide/svelte/icons/bell-off";
+  import Eye from "@lucide/svelte/icons/eye";
+
+  // Right-click a "Needs a look" row to ignore that file's issues (per-user,
+  // never synced) or open it in Files.
+  function failedRowMenu(e: MouseEvent, relPath: string) {
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, [
+      { label: "Open in Files", icon: Eye, onSelect: () => app.openInFiles(relPath) },
+      "separator",
+      { label: "Ignore this file", icon: BellOff, onSelect: () => void app.ignoreFile(relPath) },
+    ]);
+  }
 
   onMount(() => void digest.init());
 
-  let researchOpen = $state(false);
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -72,13 +86,40 @@
     day: "numeric",
   });
 
-  const indexedCount = $derived(app.files.filter((f) => f.status === "indexed").length);
+  // Own history when there is one, most-recently-modified files otherwise;
+  // empty (a project with no files at all) renders no section.
+  const recents = $derived(homeRecents(app.recents, app.files));
+  const recentsFromHistory = $derived(
+    recentlyOpened(app.recents, app.files).length > 0,
+  );
+
+  const hasWaiting = $derived(
+    ingests.pending.length > 0 ||
+      blockedSlugs.length > 0 ||
+      otherReviewCount > 0,
+  );
+  const hasNeedsLook = $derived(app.failedFiles.length > 0);
+
+  // Reading order: the day, then what Ken wrote, then what wants a human, then
+  // the ways in. Three of these sections are conditional, so the entrance
+  // stagger is indexed off the sections actually rendered — a hard-coded --d
+  // would leave a dead beat wherever a section is absent.
+  const sections = $derived([
+    "masthead",
+    "digest",
+    ...(hasWaiting ? ["waiting"] : []),
+    ...(hasNeedsLook ? ["needs-look"] : []),
+    "search",
+    ...(recents.length > 0 ? ["recents"] : []),
+    "status",
+  ]);
+  const delay = (id: string) => sections.indexOf(id);
 </script>
 
 <div class="wrap">
   <div class="inner">
     <!-- Masthead: the day, set like a paper's dateline -->
-    <header class="masthead rise" style="--d: 0">
+    <header class="masthead rise" style="--d: {delay('masthead')}">
       <h1>{today}</h1>
       <div class="rule">
         <span class="rule-label">Today's digest</span>
@@ -95,7 +136,7 @@
     </header>
 
     <!-- The digest is the lead story: open serif prose, no chrome -->
-    <section class="digest rise" style="--d: 1">
+    <section class="digest rise" style="--d: {delay('digest')}">
       {#if digest.digest}
         <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
         <div class="digest-body" onclick={onDigestClick}>
@@ -136,34 +177,9 @@
       {/if}
     </section>
 
-    <!-- Quiet status strip: one line about the folder, plus the day's verbs -->
-    <section class="status rise" style="--d: 2">
-      <p class="status-line">
-        {#if app.scanning}
-          Ken is reading your folder for the first time — search lights up as
-          files are indexed.
-        {:else}
-          Watching <strong>{app.project?.name}</strong> —
-          {app.files.length} files, {indexedCount} searchable{app.failedFiles.length
-            ? `, ${app.failedFiles.length} unreadable`
-            : ""}{app.lastScanAt
-            ? ` · updated ${timeAgo(Math.floor(app.lastScanAt / 1000))}`
-            : ""}
-        {/if}
-      </p>
-      <div class="status-actions">
-        <button class="btn" onclick={() => (app.searchOpen = true)}>
-          <Search size={13} strokeWidth={1.75} /> Search
-          <span class="kbd">⌘K</span>
-        </button>
-        <button class="btn btn-ghost" onclick={() => (app.screen = "files")}>Browse files</button>
-        <button class="btn btn-ghost" onclick={() => (researchOpen = true)}>Start research</button>
-      </div>
-    </section>
-
-    {#if ingests.pending.length > 0 || blockedSlugs.length > 0 || otherReviewCount > 0}
-      <section class="rise" style="--d: 3">
-        <div class="section-label amber">Waiting on you</div>
+    {#if hasWaiting}
+      <section class="rise" style="--d: {delay('waiting')}">
+        <div class="overline amber">Waiting on you</div>
         <div class="group">
           {#each ingests.pending as run (run.id)}
             <div class="row">
@@ -198,17 +214,25 @@
       </section>
     {/if}
 
-    {#if app.failedFiles.length > 0}
-      <section class="rise" style="--d: 4">
-        <div class="section-label">Needs a look</div>
+    {#if hasNeedsLook}
+      <section class="rise" style="--d: {delay('needs-look')}">
+        <div class="overline">Needs a look</div>
         <div class="group">
           {#each app.failedFiles.slice(0, 5) as f (f.relPath)}
-            <div class="row">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="row" oncontextmenu={(e) => failedRowMenu(e, f.relPath)}>
               <span class="rdot"></span>
               <div class="rtext">
                 <strong>{f.relPath.split("/").pop()}</strong> couldn't be indexed —
                 {f.error ?? "unknown reason"}. It's still findable by name.
               </div>
+              <button
+                class="btn btn-small ghost"
+                title="Ignore this file's issues (only for you)"
+                onclick={() => void app.ignoreFile(f.relPath)}
+              >
+                Ignore
+              </button>
               <button class="btn btn-small" onclick={() => app.openInFiles(f.relPath)}>View</button>
             </div>
           {/each}
@@ -216,12 +240,26 @@
       </section>
     {/if}
 
+    <!-- The page's primary action: opens the ⌘K palette, which owns search. -->
+    <section class="find rise" style="--d: {delay('search')}">
+      <HomeSearch />
+    </section>
+
+    {#if recents.length > 0}
+      <section class="rise" style="--d: {delay('recents')}">
+        <RecentFiles rows={recents} fromHistory={recentsFromHistory} />
+      </section>
+    {/if}
+
+    <!-- Footer: a few at-a-glance stats and where team-sync stands -->
+    <section class="status rise" style="--d: {delay('status')}">
+      <HomeStatus />
+    </section>
+
   </div>
 </div>
 
-{#if researchOpen}
-  <ResearchModal close={() => (researchOpen = false)} />
-{/if}
+<ContextMenu />
 
 <style>
   .wrap {
@@ -383,56 +421,25 @@
     border-color: var(--accent);
   }
 
-  /* ── Status strip: the folder, in one quiet line ──────── */
+  /* ── Search: the page's one loud thing ────────────────── */
+  .find {
+    margin-top: 40px;
+  }
+
+  /* Footer spacing; the tiles/sync visual language lives in HomeStatus. */
   .status {
-    margin-top: 44px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    flex-wrap: wrap;
-    padding: 13px 16px;
-    background: var(--sunken-2);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-  }
-  .status-line {
-    margin: 0;
-    flex: 1;
-    min-width: 240px;
-    font-size: 13px;
-    line-height: 1.6;
-    color: var(--ink-secondary);
-  }
-  .status-line strong {
-    color: var(--ink);
-  }
-  .status-actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .status-actions .btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    margin-top: 36px;
   }
 
   /* ── Grouped attention lists ──────────────────────────── */
   section {
     margin-top: 36px;
   }
-  .status + section {
-    margin-top: 28px;
-  }
-  .section-label {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--ink-tertiary);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+  /* Typography lives on the global `.overline`; only the spacing is local. */
+  .overline {
     margin-bottom: 8px;
   }
-  .section-label.amber {
+  .overline.amber {
     color: var(--needs-input-text);
   }
   .group {
@@ -465,5 +472,13 @@
     flex: 1;
     font-size: 13px;
     line-height: 1.6;
+  }
+  /* Secondary "Ignore" action reads quieter than the primary "View". */
+  .btn.ghost {
+    background: transparent;
+    color: var(--ink-tertiary);
+  }
+  .btn.ghost:hover {
+    color: var(--ink);
   }
 </style>

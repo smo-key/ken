@@ -58,13 +58,16 @@
 
 <style>
   .scroll {
+    /* Single-sourced gutter: the assistant mark (24px) + its row gap (10px), so
+       activity/working/divider lines align under the assistant's text. */
+    --gutter: 34px;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 16px;
+    padding: 18px 16px;
     display: flex;
     flex-direction: column;
-    gap: 13px;
+    gap: 14px;
   }
   .starters {
     display: flex;
@@ -95,7 +98,7 @@
     max-width: 85%;
     background: var(--sunken);
     border-radius: 12px 12px 4px 12px;
-    padding: 10px 14px;
+    padding: 9px 13px;
     font-size: 13.5px;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -164,13 +167,15 @@
   }
   .activity {
     font-size: 11px;
+    line-height: 1.5;
     color: var(--ink-tertiary);
-    padding-left: 34px;
+    padding-left: var(--gutter);
   }
   .divider {
     display: flex;
     align-items: center;
     gap: 10px;
+    margin: 2px 0;
     color: var(--ink-tertiary);
     font-size: 11px;
   }
@@ -187,7 +192,7 @@
     gap: 8px;
     font-size: 12px;
     color: var(--ink-secondary);
-    padding-left: 34px;
+    padding-left: var(--gutter);
   }
   .pulse {
     width: 7px;

@@ -3,14 +3,20 @@
   import ExternalLink from "@lucide/svelte/icons/external-link";
   import Code from "@lucide/svelte/icons/code";
   import Eye from "@lucide/svelte/icons/eye";
+  import Lock from "@lucide/svelte/icons/lock";
+  import Search from "@lucide/svelte/icons/search";
   import { api, type FileRow } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import { find } from "../lib/find.svelte";
+  import FindBar from "./FindBar.svelte";
   import { isEditable, timeAgo } from "../lib/format";
   import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
   import PlainEditor from "./PlainEditor.svelte";
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
+  import PreviewLoading from "./previews/PreviewLoading.svelte";
+  import { isHtmlPath } from "./previews/html";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -18,10 +24,22 @@
   // (csv) or "binary" (tsv). Routed by extension, ahead of the plain editor.
   const ext = $derived(relPath.split(".").pop()?.toLowerCase() ?? "");
   const isCsv = $derived(ext === "csv" || ext === "tsv");
+  // .html/.htm index as "code", so they are editable — but a page is meant to
+  // be looked at, so they open rendered and keep the source a toggle away.
+  const isHtml = $derived(isHtmlPath(relPath));
+  let showSource = $state(false);
 
   let meta = $state<FileRow | null>(null);
   let content = $state<string | null>(null);
   let loadError = $state<string | null>(null);
+  // Cloud-storage placeholder being fetched, and why a fetch gave up.
+  let downloading = $state(false);
+  let cloudError = $state<string | null>(null);
+  // True from the first byte of load() until the file's kind/cloud-status is
+  // known. Gates every preview/editor branch so a not-yet-hydrated online-only
+  // file can't briefly mount a preview (flashing CLOUD_ONLY) before the
+  // Downloading state appears.
+  let resolving = $state(true);
 
   let mode = $state<"wysiwyg" | "plain">("wysiwyg");
   let dirty = $state(false);
@@ -50,21 +68,64 @@
     meta !== null && (isEditable(meta.kind) || isCsv) && !tooLarge,
   );
   const kind = $derived(meta?.kind ?? "binary");
+  // Read-only = we know what the file is and it renders as a preview rather than
+  // an editor: either not editable at all (PreviewPane — PDF/image/office/HTML
+  // page), or text that's too big to edit. Suppressed until the file is resolved
+  // (loading/downloading/errored) and while HTML is toggled to its editable
+  // Source view. tooLarge already implies !editable, so !editable covers it.
+  const readOnly = $derived(
+    meta !== null &&
+      !resolving &&
+      !downloading &&
+      cloudError === null &&
+      loadError === null &&
+      (!editable || (isHtml && !showSource)),
+  );
 
   onMount(async () => {
+    await load();
+    unlisten = await api.onIndexUpdated(() => void checkDisk());
+  });
+
+  async function load() {
+    loadError = null;
+    cloudError = null;
+    resolving = true;
     try {
       meta = await api.fileMeta(relPath);
+      // Files OneDrive/iCloud keep online-only have no bytes on disk yet, and
+      // reading one blocks until the provider delivers it. Opening the file is
+      // the user asking for exactly that — so download it deliberately, behind
+      // a visible "Downloading…" state, rather than freezing on a silent read.
+      if (await api.isCloudOnly(relPath)) {
+        downloading = true;
+        try {
+          await api.hydrateFile(relPath);
+          meta = await api.fileMeta(relPath); // its content is indexed now
+        } catch (e) {
+          cloudError = String(e);
+          return;
+        } finally {
+          downloading = false;
+        }
+      }
       if (meta && (isEditable(meta.kind) || isCsv) && !tooLarge) {
         content = await api.readFile(relPath);
         latest = content;
         if (meta.kind !== "md" || meta.size > WYSIWYG_MAX) mode = "plain";
       }
       knownMtime = await api.fileMtime(relPath);
+      // The user is now looking at this file: record its current version as
+      // seen so it drops out of the unread set (and never counts as "changed by
+      // someone else" until it actually changes again). Only once it truly
+      // resolved to a real, indexed file.
+      if (meta) void app.markSeen(relPath);
     } catch (e) {
       loadError = String(e);
+    } finally {
+      resolving = false;
     }
-    unlisten = await api.onIndexUpdated(() => void checkDisk());
-  });
+  }
 
   onDestroy(() => {
     unlisten?.();
@@ -128,7 +189,30 @@
     reloadKey += 1;
     mode = mode === "wysiwyg" ? "plain" : "wysiwyg";
   }
+
+  // ⌘F is find-within-this-document; ⌘K (Shell) stays project-wide search, so
+  // this handler stands down whenever that overlay owns the keyboard.
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (app.screen !== "files" || app.searchOpen) return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      find.show();
+    } else if (e.key === "Escape" && find.open) {
+      find.close();
+    }
+  }
+
+  async function toggleSource() {
+    // The preview re-reads from disk, so pending edits have to land first or
+    // the user would flip back to a stale-looking page.
+    if (dirty) await doSave();
+    content = latest;
+    reloadKey += 1;
+    showSource = !showSource;
+  }
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 <div class="pane">
   <!-- Hidden while the disk-conflict banner is up: its buttons sit exactly
@@ -145,13 +229,40 @@
         <button class="action" onclick={toggleMode}>
           {#if mode === "wysiwyg"}<Code size={13} strokeWidth={1.75} /><span>Plain text</span>{:else}<Eye size={13} strokeWidth={1.75} /><span>Formatted</span>{/if}
         </button>
+      {:else if isHtml}
+        <span class="sep"></span>
+        <button class="action" onclick={() => void toggleSource()}>
+          {#if showSource}<Eye size={13} strokeWidth={1.75} /><span>Page</span>{:else}<Code size={13} strokeWidth={1.75} /><span>Source</span>{/if}
+        </button>
       {/if}
       <span class="sep"></span>
+    {/if}
+    <button
+      class="action icon-only"
+      title="Find in document (⌘F)"
+      aria-label="Find in document"
+      onclick={() => find.toggle()}
+    >
+      <Search size={13} strokeWidth={1.75} />
+    </button>
+    {#if readOnly}
+      <span
+        class="read-only"
+        title="This file can't be edited in Ken"
+        aria-label="Read only — this file can't be edited in Ken"
+      >
+        <Lock size={12} strokeWidth={1.75} />
+        <span>Read only</span>
+      </span>
     {/if}
     <button class="action" onclick={() => api.openExternal(relPath)}>
       <ExternalLink size={13} strokeWidth={1.75} />
       <span>Open in default app</span>
     </button>
+    {#if find.open}
+      <span class="sep"></span>
+      <FindBar />
+    {/if}
   </div>
   {/if}
 
@@ -167,8 +278,32 @@
     </div>
   {/if}
 
-  {#if loadError}
+  {#if downloading}
+    <PreviewLoading
+      label="Downloading from the cloud"
+      detail="{relPath.split('/').pop()} is stored online only. This can take a moment for a large file."
+    />
+  {:else if cloudError}
+    <div class="cloud">
+      <p>
+        <strong>{relPath.split("/").pop()}</strong> is stored online only, and
+        the download didn't finish. Check that OneDrive is running and signed
+        in, then try again.
+      </p>
+      <p class="cloud-detail">{cloudError}</p>
+      <div class="cloud-actions">
+        <button class="btn" onclick={() => void load()}>Try again</button>
+        <button class="btn" onclick={() => api.openExternal(relPath)}>
+          Open in default app
+        </button>
+      </div>
+    </div>
+  {:else if loadError}
     <div class="error">{loadError}</div>
+  {:else if resolving}
+    <!-- Kind/cloud-status not yet known: no preview or editor mounts until
+         load() resolves, so an online-only file never flashes a preview. -->
+    <PreviewLoading label="Opening…" />
   {:else if tooLarge && meta}
     <div class="too-large">
       <p>
@@ -182,7 +317,9 @@
     </div>
   {:else if editable && content !== null}
     {#key reloadKey}
-      {#if isCsv}
+      {#if isHtml && !showSource && meta}
+        <PreviewPane {relPath} {kind} {meta} />
+      {:else if isCsv}
         <CsvEditor
           initial={content}
           delimiter={delimiterForPath(relPath)}
@@ -251,6 +388,9 @@
     background: var(--sunken);
     color: var(--ink);
   }
+  .action.icon-only {
+    padding: 3px 5px;
+  }
   .sep {
     width: 1px;
     height: 14px;
@@ -264,6 +404,18 @@
     padding: 0 4px;
     flex: none;
     white-space: nowrap;
+  }
+  /* Non-interactive metadata badge, styled to sit quietly alongside
+     .save-state rather than read as a button. */
+  .read-only {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 4px;
+    flex: none;
+    white-space: nowrap;
+    color: var(--ink-tertiary);
+    font-size: 11.5px;
   }
   .sdot {
     width: 5px;
@@ -320,5 +472,30 @@
     border-radius: 10px;
     font-size: 13px;
     color: var(--danger);
+  }
+  .cloud {
+    margin: 48px auto;
+    max-width: 420px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+  }
+  .cloud p {
+    margin: 0;
+    font-size: 13.5px;
+    line-height: 1.65;
+    color: var(--ink-secondary);
+  }
+  .cloud-detail {
+    font-family: var(--font-mono);
+    font-size: 11.5px !important;
+    color: var(--ink-tertiary) !important;
+    word-break: break-word;
+  }
+  .cloud-actions {
+    display: flex;
+    gap: 8px;
   }
 </style>

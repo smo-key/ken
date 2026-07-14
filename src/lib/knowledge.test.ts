@@ -1,9 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type { EntityEdge, EntityRow } from "./api";
-import { highlightMatches, layoutMap, stableHash } from "./knowledge";
+import {
+  computeMapView,
+  highlightMatches,
+  layoutMap,
+  type MapViewInput,
+  stableHash,
+} from "./knowledge";
 
-function entity(id: number, name: string): EntityRow {
-  return { id, kind: "topic", name, summary: "", sources: [] };
+function entity(
+  id: number,
+  name: string,
+  kind: EntityRow["kind"] = "topic",
+  summary = "",
+): EntityRow {
+  return { id, kind, name, summary, sources: [] };
 }
 
 function edge(id: number, a: number, b: number): EntityEdge {
@@ -60,6 +71,109 @@ describe("layoutMap", () => {
       expect(seen.has(key)).toBe(false);
       seen.add(key);
     }
+  });
+});
+
+describe("computeMapView", () => {
+  // A small graph: 1 is the hub, 2/3/4 hang off it, 5 is a lone person,
+  // 6 an organization connected only to 4.
+  const ents = [
+    entity(1, "Billing cutover", "topic", "The migration project."),
+    entity(2, "Priya N.", "person", "Owns the cutover."),
+    entity(3, "Contract", "topic"),
+    entity(4, "Decision #41", "decision"),
+    entity(5, "Lone person", "person"),
+    entity(6, "LangdonSoft", "organization"),
+  ];
+  const es = [edge(10, 1, 2), edge(11, 1, 3), edge(12, 1, 4), edge(13, 4, 6)];
+
+  const base: MapViewInput = {
+    entities: ents,
+    edges: es,
+    query: "",
+    kinds: [],
+    selected: null,
+    hovered: null,
+    showAllLabels: false,
+    prominentCount: 2,
+  };
+
+  it("idle: labels only the most-connected, everyone visible, none dimmed", () => {
+    const v = computeMapView(base);
+    // Hub (deg 3) and its neighbor Decision #41 (deg 2) are the top two.
+    expect(v.get(1)?.labeled).toBe(true);
+    expect(v.get(4)?.labeled).toBe(true);
+    // A leaf is a plain tagged dot until you interact.
+    expect(v.get(3)?.labeled).toBe(false);
+    for (const nv of v.values()) {
+      expect(nv.visible).toBe(true);
+      expect(nv.dimmed).toBe(false);
+    }
+  });
+
+  it("showAllLabels labels every visible node when idle", () => {
+    const v = computeMapView({ ...base, showAllLabels: true });
+    for (const nv of v.values()) expect(nv.labeled).toBe(true);
+  });
+
+  it("kind filter hides non-matching kinds entirely", () => {
+    const v = computeMapView({ ...base, kinds: ["person"] });
+    expect(v.get(2)?.visible).toBe(true);
+    expect(v.get(5)?.visible).toBe(true);
+    // Non-person kinds drop out of the graph.
+    expect(v.get(1)?.visible).toBe(false);
+    expect(v.get(4)?.visible).toBe(false);
+  });
+
+  it("search: matches are flagged and labeled, neighbors stay visible, rest dim", () => {
+    const v = computeMapView({ ...base, query: "priya" });
+    expect(v.get(2)?.matched).toBe(true);
+    expect(v.get(2)?.labeled).toBe(true);
+    expect(v.get(2)?.dimmed).toBe(false);
+    // Priya's neighbour (the hub) is in focus, not dimmed.
+    expect(v.get(1)?.dimmed).toBe(false);
+    // Unrelated nodes dim but remain for context.
+    expect(v.get(5)?.matched).toBe(false);
+    expect(v.get(5)?.dimmed).toBe(true);
+    expect(v.get(5)?.visible).toBe(true);
+  });
+
+  it("search matches summaries too", () => {
+    const v = computeMapView({ ...base, query: "migration" });
+    expect(v.get(1)?.matched).toBe(true);
+  });
+
+  it("selection: highlights the node and its neighbors, dims the rest", () => {
+    const v = computeMapView({ ...base, selected: 1 });
+    expect(v.get(1)?.dimmed).toBe(false);
+    expect(v.get(1)?.labeled).toBe(true);
+    // Direct neighbours of the hub stay lit and labelled.
+    for (const id of [2, 3, 4]) {
+      expect(v.get(id)?.dimmed).toBe(false);
+      expect(v.get(id)?.labeled).toBe(true);
+    }
+    // Two hops away → dimmed and unlabelled.
+    expect(v.get(6)?.dimmed).toBe(true);
+    expect(v.get(6)?.labeled).toBe(false);
+    // The lone node is dimmed too.
+    expect(v.get(5)?.dimmed).toBe(true);
+  });
+
+  it("kind filter composes with selection (filtered-out nodes never show)", () => {
+    const v = computeMapView({ ...base, selected: 1, kinds: ["person", "topic"] });
+    // Decision #41 is a neighbour but filtered out by kind.
+    expect(v.get(4)?.visible).toBe(false);
+    // A person neighbour still shows.
+    expect(v.get(2)?.visible).toBe(true);
+    expect(v.get(2)?.dimmed).toBe(false);
+  });
+
+  it("hover labels the hovered node and its neighbors when idle", () => {
+    const v = computeMapView({ ...base, hovered: 3 });
+    expect(v.get(3)?.labeled).toBe(true);
+    expect(v.get(1)?.labeled).toBe(true);
+    // A non-neighbour leaf stays a dot.
+    expect(v.get(5)?.labeled).toBe(false);
   });
 });
 

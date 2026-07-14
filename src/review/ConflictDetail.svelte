@@ -36,6 +36,7 @@
   // --- conflicted copy: load both files and diff them ---
   type CopyDiff =
     | { status: "loading" }
+    | { status: "downloading"; name: string }
     | { status: "ready"; rows: DiffRow[]; identical: boolean }
     | { status: "unavailable"; note: string };
   let copyDiff = $state<CopyDiff>({ status: "loading" });
@@ -50,8 +51,13 @@
     if (!c) return;
     let cancelled = false;
     copyDiff = { status: "loading" };
+    // Guarded setter so the hydrate step can surface a "Downloading…" state
+    // mid-flight without racing a switch to another conflict.
+    const setStatus = (s: CopyDiff) => {
+      if (!cancelled) copyDiff = s;
+    };
     void (async () => {
-      const next = await computeCopyDiff(c.originalPath, c.copyPath);
+      const next = await computeCopyDiff(c.originalPath, c.copyPath, setStatus);
       if (!cancelled) copyDiff = next;
     })();
     return () => {
@@ -59,9 +65,25 @@
     };
   });
 
+  // read_file now rejects OneDrive/iCloud online-only placeholders with
+  // CLOUD_ONLY instead of blocking to download them, so a side has to be
+  // hydrated before it can be read. Either the original or the conflicting
+  // copy may still be a placeholder.
+  async function readCopyText(
+    path: string,
+    setStatus: (s: CopyDiff) => void,
+  ): Promise<string> {
+    if (await api.isCloudOnly(path)) {
+      setStatus({ status: "downloading", name: baseName(path) });
+      await api.hydrateFile(path); // may throw if the provider isn't running
+    }
+    return api.readFile(path);
+  }
+
   async function computeCopyDiff(
     originalPath: string | null,
     copyPath: string,
+    setStatus: (s: CopyDiff) => void,
   ): Promise<CopyDiff> {
     if (!originalPath) {
       return {
@@ -70,10 +92,10 @@
       };
     }
     try {
-      const [original, conflicting] = await Promise.all([
-        api.readFile(originalPath),
-        api.readFile(copyPath),
-      ]);
+      // Sequential rather than parallel so the "Downloading…" state names one
+      // file at a time instead of flickering between the two.
+      const original = await readCopyText(originalPath, setStatus);
+      const conflicting = await readCopyText(copyPath, setStatus);
       if (looksBinary(original) || looksBinary(conflicting)) {
         return {
           status: "unavailable",
@@ -85,10 +107,12 @@
         rows: buildDiffRows(original, conflicting),
         identical: original === conflicting,
       };
-    } catch {
+    } catch (e) {
+      // Surface the real reason (e.g. a cloud provider that isn't running)
+      // instead of swallowing it behind a generic "couldn't be read".
       return {
         status: "unavailable",
-        note: "One of the files couldn't be read as text. Open both to compare them yourself.",
+        note: `One of the files couldn't be read: ${e}. Open both to compare them yourself.`,
       };
     }
   }
@@ -152,6 +176,10 @@
     <!-- Conflicted-copy variant: diff the two files, then choose one. -->
     {#if copyDiff.status === "loading"}
       <div class="soft drafting">Comparing the two versions…</div>
+    {:else if copyDiff.status === "downloading"}
+      <div class="soft drafting">
+        Downloading {copyDiff.name} from the cloud — it's stored online only…
+      </div>
     {:else if copyDiff.status === "unavailable"}
       <div class="soft">{copyDiff.note}</div>
     {:else if copyDiff.identical}

@@ -48,15 +48,41 @@ previews) works without it.
 
 ## Development
 
-Requirements: Rust (stable), Node 24+, pnpm.
+Requirements: Rust (stable), Node 24+, and pnpm (npm works too — the
+Makefile uses whichever it finds).
 
 ```sh
-pnpm install
-pnpm tauri dev     # run the app
-cargo test         # Rust tests (ken-core)
-pnpm test          # frontend tests
-pnpm check         # svelte-check
+make setup     # install frontend and Rust dependencies
+make dev       # run the app
 ```
+
+Other targets: `make build` (release bundle), `make test` (Rust +
+frontend tests), `make check` (svelte-check), `make clean`. Run `make` on
+its own to list them.
+
+### Video transcripts (optional)
+
+Ken plays MP4/MOV/WebM/MKV/AVI videos and shows a transcript beside them.
+Adjacent `.vtt` files, and Teams/Zoom `.docx` exports, are picked up
+automatically with no setup. To generate a transcript on-device for a video
+that has none, two things must be present — otherwise transcription is
+skipped silently (everything else keeps working):
+
+- **ffmpeg** on `PATH` (or in `/opt/homebrew/bin`, `/usr/local/bin`,
+  `/usr/bin`): `brew install ffmpeg`. Used to pull 16 kHz mono audio out of
+  the video. Ken never bundles it.
+- **A Whisper model** at `<app-data>/ken/whisper/ggml-base.en.bin` (on macOS
+  `~/Library/Application Support/ken/whisper/ggml-base.en.bin`). Download
+  `ggml-base.en.bin` from
+  <https://huggingface.co/ggerganov/whisper.cpp> and place it there. The
+  model is not committed to the repo (multi-MB).
+
+Transcription itself is built from source via the `whisper-rs` crate (bundles
+whisper.cpp), so building ken-core needs `cmake` and a C/C++ toolchain. It is
+behind the default `whisper` feature; `cargo build -p ken-core
+--no-default-features` skips it if that toolchain is unavailable. Generated
+transcripts are cached under `.ken/transcripts/` (never written next to your
+files) and their text is folded into the search index.
 
 The repo is a Cargo workspace: `crates/ken-core` (all domain logic —
 scanning, extraction, index, search, watching), `crates/ken-mcp` (MCP

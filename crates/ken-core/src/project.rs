@@ -13,6 +13,33 @@ use crate::{Error, Result};
 pub const CONFIG_DIR: &str = ".ken";
 pub const CONFIG_FILE: &str = "project.json";
 
+/// Upper bound on a project name's length. A name is a display label, not an
+/// identifier, so this is generous — it only exists to reject pathological
+/// input, not to shape naming.
+pub const NAME_MAX_LEN: usize = 200;
+
+/// Trim and validate a user-supplied project name, returning the normalized
+/// (trimmed) form. Names are single-line display labels: control characters
+/// (newlines, tabs) would break the switcher and title bar, and empty names
+/// leave nothing to show, so both are rejected.
+pub fn normalize_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Other("project name cannot be empty".into()));
+    }
+    if trimmed.chars().count() > NAME_MAX_LEN {
+        return Err(Error::Other(format!(
+            "project name is too long (max {NAME_MAX_LEN} characters)"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(Error::Other(
+            "project name cannot contain control characters".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
@@ -99,6 +126,16 @@ impl Project {
             let ex = ex.trim_matches('/');
             !ex.is_empty() && (rel == ex || rel.starts_with(&format!("{ex}/")))
         })
+    }
+
+    /// Rename the project, rewriting `.ken/project.json`. The invalid-name
+    /// check runs before any write, so a rejected name leaves the config
+    /// untouched. The user-level registry is a separate store the caller
+    /// updates alongside this.
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        self.config.name = name;
+        self.save()
     }
 
     pub fn set_excluded(&mut self, excluded: Vec<String>) -> Result<()> {
@@ -189,5 +226,52 @@ mod tests {
     fn open_missing_folder_errors() {
         let err = Project::open(Path::new("/nonexistent/ken-test")).unwrap_err();
         assert!(matches!(err, Error::ProjectMissing(_)));
+    }
+
+    #[test]
+    fn normalize_name_trims_and_accepts() {
+        assert_eq!(normalize_name("  Atlas Migration  ").unwrap(), "Atlas Migration");
+        assert_eq!(normalize_name("Q3 Planning").unwrap(), "Q3 Planning");
+    }
+
+    #[test]
+    fn normalize_name_rejects_empty() {
+        assert!(normalize_name("").is_err());
+        assert!(normalize_name("   ").is_err());
+        assert!(normalize_name("\t\n").is_err());
+    }
+
+    #[test]
+    fn normalize_name_rejects_control_chars() {
+        // Newlines/tabs would break the single-line switcher and title bar.
+        assert!(normalize_name("Line one\nLine two").is_err());
+        assert!(normalize_name("tab\there").is_err());
+    }
+
+    #[test]
+    fn normalize_name_rejects_overlong() {
+        let long = "x".repeat(NAME_MAX_LEN + 1);
+        assert!(normalize_name(&long).is_err());
+        assert!(normalize_name(&"x".repeat(NAME_MAX_LEN)).is_ok());
+    }
+
+    #[test]
+    fn set_name_rewrites_config() {
+        let dir = tempdir().unwrap();
+        Project::create(dir.path(), "Original").unwrap();
+        let mut p = Project::open(dir.path()).unwrap();
+        p.set_name("  Renamed  ").unwrap();
+        // Trimmed on write, and durable across a reopen.
+        assert_eq!(p.config.name, "Renamed");
+        assert_eq!(Project::open(dir.path()).unwrap().config.name, "Renamed");
+    }
+
+    #[test]
+    fn set_name_rejects_invalid_and_leaves_config() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "Keep").unwrap();
+        assert!(p.set_name("   ").is_err());
+        assert_eq!(p.config.name, "Keep");
+        assert_eq!(Project::open(dir.path()).unwrap().config.name, "Keep");
     }
 }

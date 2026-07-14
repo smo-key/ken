@@ -4,7 +4,7 @@
 //! models over what this module writes — no project files involved.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::assistant::{self, OneshotOutcome};
 use crate::db::{Db, EntityInput, EventInput};
@@ -14,12 +14,17 @@ use crate::runner::CancelToken;
 use crate::{Error, Result};
 
 /// How many indexed paths the prompt lists at most — enough to orient
-/// the agent, which reads the files itself.
-const MAX_PROMPT_FILES: usize = 200;
+/// the agent, which reads the files itself. The list is orientation
+/// only, so its token cost (~10 tokens/path → a few thousand tokens at
+/// this cap) buys broader project visibility inside the extraction
+/// budget without meaningfully growing the prompt.
+const MAX_PROMPT_FILES: usize = 400;
 
-/// Extraction caps: the views stay legible and the answer stays small.
-const MAX_ENTITIES: usize = 40;
-const MAX_EVENTS: usize = 60;
+/// Extraction caps: high enough that a real project yields a rich Map
+/// and Timeline. The Map declutters labels client-side, so a dense
+/// graph stays legible; the answer is still small by construction.
+const MAX_ENTITIES: usize = 200;
+const MAX_EVENTS: usize = 150;
 
 /// Corpus-wide reading is slower than a digest.
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -237,6 +242,185 @@ pub fn build_knowledge_model(
     }
 }
 
+// ---------- automatic rebuild policy ----------
+//
+// Every build spends a real Claude Code session over the whole corpus, so
+// over-triggering is the expensive failure here, not under-triggering.
+// The policy is therefore: one build when a project first opens, and at
+// most one automatic rebuild per cooldown afterwards — always behind a
+// quiet window so a burst of edits (or a OneDrive sync dumping a folder)
+// collapses into a single run.
+
+/// How long the index must be quiet before the FIRST build of a project.
+/// Short, because an empty Map/Timeline is what the user came to see —
+/// but long enough that the initial scan's own indexing settles first.
+pub const FIRST_BUILD_SETTLE: Duration = Duration::from_secs(60);
+
+/// How long the index must be quiet before an automatic REBUILD. Editing
+/// a document takes pauses; five minutes is past the pauses inside one
+/// work session, and past the tail of a large sync.
+pub const CHANGE_QUIET: Duration = Duration::from_secs(5 * 60);
+
+/// Floor between automatic build attempts (successes and failures alike).
+/// Bounds automatic spend at two sessions an hour no matter how busy the
+/// folder is, and turns a persistently failing CLI into a slow retry
+/// instead of a storm. Manual refresh ignores this.
+pub const MIN_AUTO_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// A folder that never goes quiet (a sync client writing continuously)
+/// would otherwise defer forever, so pending changes build anyway once
+/// they're this old — the watcher's `max_hold` guarantee, one level up.
+pub const MAX_DEFER: Duration = Duration::from_secs(30 * 60);
+
+/// Everything the policy needs that the tracker can't know by itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoBuildContext {
+    /// The Claude Code CLI was found. Without it a build can only fail,
+    /// so automatic builds simply don't happen — no error, no retry.
+    pub claude_available: bool,
+    /// A build thread is running right now (the `knowledge_running` guard).
+    pub in_flight: bool,
+    /// Indexed files available to read. Nothing to read → nothing to map.
+    pub indexed_files: usize,
+    /// This project has no stored knowledge model yet.
+    pub never_built: bool,
+}
+
+/// The full input to `should_auto_build` — a snapshot, no clocks inside.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoBuildState {
+    pub claude_available: bool,
+    pub in_flight: bool,
+    /// The project's scan is still running; the file list isn't final.
+    pub scanning: bool,
+    pub indexed_files: usize,
+    pub never_built: bool,
+    /// Source files changed since the last build started.
+    pub dirty: bool,
+    pub since_last_change: Option<Duration>,
+    pub since_first_change: Option<Duration>,
+    /// Since the last automatic OR manual build attempt finished.
+    pub since_last_attempt: Option<Duration>,
+}
+
+/// The whole "should Ken rebuild the knowledge model right now?" decision,
+/// as one pure function of observed state. Called on a slow tick; it must
+/// stay false for every tick of a burst and true exactly once after it.
+pub fn should_auto_build(s: &AutoBuildState) -> bool {
+    if !s.claude_available || s.in_flight || s.scanning || s.indexed_files == 0 {
+        return false;
+    }
+    if s.since_last_attempt.is_some_and(|since| since < MIN_AUTO_INTERVAL) {
+        return false;
+    }
+    // Settled = quiet long enough, or pending so long that waiting for
+    // quiet has become the bug.
+    let settled = |quiet: Duration| match s.since_last_change {
+        None => true, // nothing has changed since we started watching
+        Some(last) => {
+            last >= quiet || s.since_first_change.is_some_and(|first| first >= MAX_DEFER)
+        }
+    };
+    if s.never_built {
+        // A project with no model gets one even if nothing changed today.
+        return settled(FIRST_BUILD_SETTLE);
+    }
+    s.dirty && settled(CHANGE_QUIET)
+}
+
+/// Change/scan/build bookkeeping for one open project, shared between the
+/// watcher callback, the scan thread, and the tick that decides. Holds no
+/// thread of its own.
+pub struct AutoBuildTracker {
+    inner: std::sync::Mutex<TrackerInner>,
+}
+
+struct TrackerInner {
+    scanning: bool,
+    /// Set by source changes, cleared when a build starts reading them —
+    /// so a change arriving mid-build survives into the next rebuild.
+    dirty: bool,
+    first_change: Option<Instant>,
+    last_change: Option<Instant>,
+    last_attempt: Option<Instant>,
+}
+
+impl Default for AutoBuildTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AutoBuildTracker {
+    /// Starts out scanning: activation always kicks off an initial scan,
+    /// and no build may run against a half-walked folder.
+    pub fn new() -> AutoBuildTracker {
+        AutoBuildTracker {
+            inner: std::sync::Mutex::new(TrackerInner {
+                scanning: true,
+                dirty: false,
+                first_change: None,
+                last_change: None,
+                last_attempt: None,
+            }),
+        }
+    }
+
+    pub fn scan_finished(&self) {
+        self.inner.lock().unwrap().scanning = false;
+    }
+
+    /// Source files changed (a scan reported `changed_paths`). Ken's own
+    /// `.ken/` writes never reach here — the scanner and watcher both skip
+    /// hidden folders, so a build can't feed itself.
+    pub fn changed(&self) {
+        self.changed_at(Instant::now());
+    }
+
+    pub fn changed_at(&self, at: Instant) {
+        let mut i = self.inner.lock().unwrap();
+        i.dirty = true;
+        i.first_change.get_or_insert(at);
+        i.last_change = Some(at);
+    }
+
+    /// A build is about to read the index: the pending changes are its
+    /// input, so the dirty mark resets and only later changes count.
+    pub fn build_started(&self, at: Instant) {
+        let mut i = self.inner.lock().unwrap();
+        i.dirty = false;
+        i.first_change = None;
+        i.last_change = None;
+        i.last_attempt = Some(at);
+    }
+
+    /// Stamped for successes and failures alike — the cooldown is a spend
+    /// and retry limit, not a success limit.
+    pub fn build_finished(&self, at: Instant) {
+        self.inner.lock().unwrap().last_attempt = Some(at);
+    }
+
+    pub fn snapshot(&self, ctx: AutoBuildContext, now: Instant) -> AutoBuildState {
+        let i = self.inner.lock().unwrap();
+        let since = |t: Option<Instant>| t.map(|t| now.saturating_duration_since(t));
+        AutoBuildState {
+            claude_available: ctx.claude_available,
+            in_flight: ctx.in_flight,
+            scanning: i.scanning,
+            indexed_files: ctx.indexed_files,
+            never_built: ctx.never_built,
+            dirty: i.dirty,
+            since_last_change: since(i.last_change),
+            since_first_change: since(i.first_change),
+            since_last_attempt: since(i.last_attempt),
+        }
+    }
+
+    pub fn should_build(&self, ctx: AutoBuildContext, now: Instant) -> bool {
+        should_auto_build(&self.snapshot(ctx, now))
+    }
+}
+
 fn non_empty_str(v: &serde_json::Value) -> Option<String> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
@@ -275,6 +459,175 @@ mod tests {
     use super::*;
     use crate::runner::test_support::write_fake_claude;
 
+    // ---------- auto-build policy ----------
+
+    /// A settled project with a model and nothing pending — the common
+    /// case, in which nothing should ever run.
+    fn idle() -> AutoBuildState {
+        AutoBuildState {
+            claude_available: true,
+            in_flight: false,
+            scanning: false,
+            indexed_files: 12,
+            never_built: false,
+            dirty: false,
+            since_last_change: None,
+            since_first_change: None,
+            since_last_attempt: None,
+        }
+    }
+
+    #[test]
+    fn settled_project_with_a_model_never_rebuilds_on_its_own() {
+        assert!(!should_auto_build(&idle()));
+    }
+
+    #[test]
+    fn fresh_project_builds_once_the_scan_settles() {
+        let mut s = AutoBuildState { never_built: true, ..idle() };
+        // The initial scan is still walking the folder.
+        s.scanning = true;
+        assert!(!should_auto_build(&s));
+
+        // Scan done, but the index is still churning (watcher flushes).
+        s.scanning = false;
+        s.dirty = true;
+        s.since_last_change = Some(Duration::from_secs(10));
+        s.since_first_change = Some(Duration::from_secs(40));
+        assert!(!should_auto_build(&s));
+
+        // Quiet for the settle window → the first build runs.
+        s.since_last_change = Some(FIRST_BUILD_SETTLE);
+        assert!(should_auto_build(&s));
+    }
+
+    #[test]
+    fn fresh_project_with_nothing_to_read_stays_quiet() {
+        let s = AutoBuildState { never_built: true, indexed_files: 0, ..idle() };
+        assert!(!should_auto_build(&s));
+    }
+
+    #[test]
+    fn a_burst_of_changes_coalesces_into_one_build() {
+        let mut s = AutoBuildState {
+            dirty: true,
+            since_last_attempt: Some(MIN_AUTO_INTERVAL),
+            since_first_change: Some(Duration::from_secs(0)),
+            since_last_change: Some(Duration::from_secs(0)),
+            ..idle()
+        };
+        // Every tick during the burst says "not yet" — one decision per
+        // tick, never one build per change.
+        for elapsed in [0, 30, 60, 120, 240] {
+            s.since_last_change = Some(Duration::from_secs(elapsed));
+            s.since_first_change = Some(Duration::from_secs(elapsed));
+            assert!(!should_auto_build(&s), "should still be waiting at {elapsed}s");
+        }
+        s.since_last_change = Some(CHANGE_QUIET);
+        s.since_first_change = Some(CHANGE_QUIET);
+        assert!(should_auto_build(&s));
+    }
+
+    #[test]
+    fn an_endless_stream_of_changes_still_gets_a_build() {
+        // A sync client writing continuously never gives us a quiet
+        // window; the max-defer cap builds anyway (same guarantee the
+        // watcher's max_hold gives the scanner).
+        let s = AutoBuildState {
+            dirty: true,
+            since_last_change: Some(Duration::from_secs(1)),
+            since_first_change: Some(MAX_DEFER),
+            since_last_attempt: Some(MIN_AUTO_INTERVAL),
+            ..idle()
+        };
+        assert!(should_auto_build(&s));
+    }
+
+    #[test]
+    fn a_build_in_flight_is_never_double_started() {
+        let s = AutoBuildState {
+            in_flight: true,
+            never_built: true,
+            dirty: true,
+            since_last_change: Some(Duration::from_secs(3600)),
+            since_first_change: Some(Duration::from_secs(3600)),
+            ..idle()
+        };
+        assert!(!should_auto_build(&s));
+    }
+
+    #[test]
+    fn rebuilds_wait_out_the_cooldown() {
+        let mut s = AutoBuildState {
+            dirty: true,
+            since_last_change: Some(CHANGE_QUIET),
+            since_first_change: Some(CHANGE_QUIET),
+            since_last_attempt: Some(MIN_AUTO_INTERVAL - Duration::from_secs(1)),
+            ..idle()
+        };
+        assert!(!should_auto_build(&s), "too soon after the last attempt");
+        s.since_last_attempt = Some(MIN_AUTO_INTERVAL);
+        assert!(should_auto_build(&s));
+    }
+
+    #[test]
+    fn a_failed_attempt_does_not_retry_storm() {
+        // Failures stamp the same attempt clock as successes, so a broken
+        // CLI login retries at most once per cooldown — and never at all
+        // when the CLI is missing.
+        let s = AutoBuildState {
+            never_built: true,
+            since_last_attempt: Some(Duration::from_secs(5)),
+            ..idle()
+        };
+        assert!(!should_auto_build(&s));
+
+        let missing = AutoBuildState {
+            claude_available: false,
+            never_built: true,
+            ..idle()
+        };
+        assert!(!should_auto_build(&missing));
+    }
+
+    #[test]
+    fn tracker_coalesces_changes_and_reports_elapsed_time() {
+        let t = AutoBuildTracker::new();
+        let start = Instant::now();
+        let ctx = |never_built| AutoBuildContext {
+            claude_available: true,
+            in_flight: false,
+            indexed_files: 5,
+            never_built,
+        };
+
+        // The initial scan holds everything off until it finishes.
+        assert!(!t.should_build(ctx(true), start));
+        t.scan_finished();
+        assert!(t.should_build(ctx(true), start), "first build once the scan settles");
+
+        // A burst of watcher flushes marks one pending rebuild, not many:
+        // the quiet window slides with the last change, the max-defer cap
+        // measures from the first.
+        t.changed_at(start);
+        t.changed_at(start + Duration::from_secs(3));
+        t.changed_at(start + Duration::from_secs(10));
+        let s = t.snapshot(ctx(false), start + Duration::from_secs(20));
+        assert!(s.dirty);
+        assert_eq!(s.since_last_change, Some(Duration::from_secs(10)));
+        assert_eq!(s.since_first_change, Some(Duration::from_secs(20)));
+
+        // A build takes the pending work; a change landing mid-build marks
+        // the model dirty again so exactly one more rebuild follows.
+        t.build_started(start + Duration::from_secs(400));
+        assert!(!t.snapshot(ctx(false), start + Duration::from_secs(401)).dirty);
+        t.changed_at(start + Duration::from_secs(450));
+        t.build_finished(start + Duration::from_secs(500));
+        let s = t.snapshot(ctx(false), start + Duration::from_secs(501));
+        assert!(s.dirty, "the mid-build change still needs a rebuild");
+        assert_eq!(s.since_last_attempt, Some(Duration::from_secs(1)));
+    }
+
     #[test]
     fn compose_carries_the_contract() {
         let files = vec!["notes/meeting-jul-8.md".to_string(), "knowledge/People.md".to_string()];
@@ -285,7 +638,7 @@ mod tests {
         assert!(prompt.contains("\"events\""));
         assert!(prompt.contains("person|organization|topic|decision|other"));
         assert!(prompt.contains("yyyy-mm-dd"));
-        assert!(prompt.contains("At most 40 entities and 60 events"));
+        assert!(prompt.contains("At most 200 entities and 150 events"));
         assert!(prompt.contains("never invent"));
         assert!(prompt.contains("omit events with no inferable date"));
         assert!(prompt.contains("2026-07-12"));
@@ -295,10 +648,10 @@ mod tests {
 
     #[test]
     fn compose_caps_the_file_list() {
-        let files: Vec<String> = (0..230).map(|i| format!("notes/f{i}.md")).collect();
+        let files: Vec<String> = (0..430).map(|i| format!("notes/f{i}.md")).collect();
         let prompt = compose_extraction_prompt(&files, "2026-07-12");
-        assert!(prompt.contains("- notes/f199.md"));
-        assert!(!prompt.contains("- notes/f200.md"));
+        assert!(prompt.contains("- notes/f399.md"));
+        assert!(!prompt.contains("- notes/f400.md"));
         assert!(prompt.contains("…and 30 more"));
         // An empty index is named honestly.
         assert!(compose_extraction_prompt(&[], "2026-07-12").contains("- none"));
@@ -353,10 +706,10 @@ mod tests {
 
     #[test]
     fn parse_enforces_caps() {
-        let entities: Vec<String> = (0..50)
+        let entities: Vec<String> = (0..210)
             .map(|i| format!(r#"{{"kind":"topic","name":"E{i}","summary":""}}"#))
             .collect();
-        let events: Vec<String> = (0..70)
+        let events: Vec<String> = (0..160)
             .map(|i| format!(r#"{{"date":"2026-01-{:02}","category":"x","text":"e{i}"}}"#, i % 28 + 1))
             .collect();
         let raw = format!(
@@ -365,8 +718,8 @@ mod tests {
             events.join(",")
         );
         let ex = parse_extraction(&raw).unwrap();
-        assert_eq!(ex.entities.len(), 40);
-        assert_eq!(ex.events.len(), 60);
+        assert_eq!(ex.entities.len(), 200);
+        assert_eq!(ex.events.len(), 150);
     }
 
     #[test]

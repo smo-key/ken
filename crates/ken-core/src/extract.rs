@@ -27,6 +27,7 @@ pub enum FileKind {
     Pdf,
     Ipynb,
     Image,
+    Video,
     Binary,
 }
 
@@ -42,6 +43,7 @@ impl FileKind {
             FileKind::Pdf => "pdf",
             FileKind::Ipynb => "ipynb",
             FileKind::Image => "image",
+            FileKind::Video => "video",
             FileKind::Binary => "binary",
         }
     }
@@ -66,6 +68,7 @@ impl FileKind {
             "ipynb" => FileKind::Ipynb,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" | "tif"
             | "svg" => FileKind::Image,
+            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => FileKind::Video,
             _ => FileKind::Binary,
         }
     }
@@ -86,6 +89,15 @@ pub struct Extracted {
 /// Extract text from a file according to its detected kind.
 pub fn extract(path: &Path) -> Result<Extracted> {
     let kind = FileKind::from_path(path);
+    // A video's "content" is its transcript, resolved from adjacent/generated
+    // files — never the container itself, so the size cap below (which would
+    // reject most videos) must not gate it.
+    if kind == FileKind::Video {
+        return Ok(Extracted {
+            text: crate::transcript::indexable_text(path),
+            title: None,
+        });
+    }
     let size = fs::metadata(path).map_err(|e| Error::io(path, e))?.len();
     if size > MAX_EXTRACT_BYTES {
         return Ok(Extracted::default());
@@ -99,6 +111,8 @@ pub fn extract(path: &Path) -> Result<Extracted> {
         FileKind::Pdf => extract_pdf(path),
         FileKind::Ipynb => extract_ipynb(path),
         FileKind::Image => extract_image(path),
+        // Handled above, before the size cap.
+        FileKind::Video => Ok(Extracted::default()),
         FileKind::Binary => Ok(Extracted::default()),
     }
 }
@@ -294,6 +308,22 @@ mod tests {
         assert!(FileKind::Ipynb.has_content());
         assert_eq!(FileKind::from_path(Path::new("x.unknown")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("noext")), FileKind::Binary);
+    }
+
+    #[test]
+    fn video_kind_mapping() {
+        for ext in ["mp4", "mov", "m4v", "webm", "mkv", "avi", "MP4", "MoV"] {
+            let name = format!("clips/demo.{ext}");
+            assert_eq!(
+                FileKind::from_path(Path::new(&name)),
+                FileKind::Video,
+                "{ext} should be Video"
+            );
+        }
+        // A video's content is its transcript, so the kind is content-bearing:
+        // a transcript makes it searchable, its absence leaves it metadata-only.
+        assert!(FileKind::Video.has_content());
+        assert_eq!(FileKind::Video.as_str(), "video");
     }
 
     #[test]

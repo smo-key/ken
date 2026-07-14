@@ -3,14 +3,18 @@
 //! and the `ken-mcp` sidecar so both operate on the same data the same way.
 
 pub mod assistant;
+pub mod bg_hydrate;
 pub mod chat;
+pub mod cloud;
 pub mod db;
 pub mod digest;
 pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod hooks;
+pub mod import;
 pub mod knowledge_model;
+pub mod model;
 pub mod project;
 pub mod pty_registry;
 pub mod recipe;
@@ -20,6 +24,8 @@ pub mod runner;
 pub mod registry;
 pub mod scan;
 pub mod sync;
+pub mod transcript;
+pub mod user_state;
 pub mod watch;
 
 pub use error::{Error, Result};

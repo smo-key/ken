@@ -28,6 +28,12 @@ class KnowledgeStore {
           this.building = false;
           this.error = null;
           void this.load();
+        } else if (ev.state === "idle") {
+          // An automatic build gave up (usually: no Claude login). Nobody
+          // asked for it, so it leaves no error behind — the manual
+          // refresh button is right there and reports the real reason.
+          this.building = false;
+          this.error = null;
         } else {
           this.building = false;
           this.error = ev.detail ?? "The refresh didn't finish.";
@@ -42,6 +48,10 @@ class KnowledgeStore {
   async load() {
     if (!(await api.currentProject().catch(() => null))) return;
     this.model = await api.knowledgeModel().catch(() => null);
+    // A build may have started automatically long before these screens
+    // were ever opened, so the first read — not only the event stream —
+    // has to tell us it's in progress.
+    if (this.model?.building) this.building = true;
   }
 
   /** Rebuild the model (the Refresh buttons on both screens). */

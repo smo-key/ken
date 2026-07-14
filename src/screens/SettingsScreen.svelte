@@ -3,7 +3,8 @@
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
-  import { api, type McpInfo, type SyncStatus } from "../lib/api";
+  import { api, type McpInfo, type SyncStatus, type ModelStatus } from "../lib/api";
+  import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
 
@@ -17,6 +18,10 @@
   let mcp = $state<McpInfo | null>(null);
   let copied = $state<"command" | "instruction" | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
+  // Downloadable transcription models (discovered from the whisper.cpp repo).
+  let models = $state<ModelStatus[]>([]);
+  let modelsLoading = $state(true);
+  let removing = $state<string | null>(null);
 
   const themeOptions: { value: ThemeMode; title: string; hint: string }[] = [
     { value: "light", title: "Light", hint: "" },
@@ -27,8 +32,37 @@
   onMount(() => {
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
+    void refreshModels();
     return () => clearTimeout(copyTimer);
   });
+
+  async function refreshModels() {
+    modelsLoading = true;
+    try {
+      models = await api.listModels();
+    } catch {
+      models = [];
+    } finally {
+      modelsLoading = false;
+    }
+  }
+
+  function fmtModelSize(n: number): string {
+    if (n <= 0) return "";
+    const mb = n / (1024 * 1024);
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+    return `${Math.round(mb)} MB`;
+  }
+
+  async function removeModel(id: string) {
+    removing = id;
+    try {
+      await api.removeModel(id);
+      await refreshModels();
+    } finally {
+      removing = null;
+    }
+  }
 
   async function copy(text: string, what: "command" | "instruction") {
     try {
@@ -169,6 +203,91 @@
           </label>
         {/each}
       </div>
+    </div>
+
+    {#if app.ignored.length > 0}
+      <div class="card">
+        <div class="card-title">Ignored files</div>
+        <p class="note">
+          Issues for these files are hidden from Review and Home — for you only,
+          never shared with your team. They stay indexed and searchable.
+        </p>
+        <div class="folders">
+          {#each app.ignored as path (path)}
+            <div class="folder ignored">
+              <span class="mono">{path}</span>
+              <button
+                class="btn btn-small"
+                onclick={() => void app.unignoreFile(path)}
+              >
+                Un-ignore
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <div class="card">
+      <div class="card-title">Cloud files</div>
+      <div class="row">
+        <label class="radio">
+          <input
+            type="checkbox"
+            checked={app.backgroundIndex}
+            onchange={(e) =>
+              void app.setBackgroundIndex(e.currentTarget.checked)}
+          />
+          Index cloud files in the background
+        </label>
+      </div>
+      <p class="note">
+        Downloads cloud-offline documents so they're searchable without opening
+        them. Large media still download on open.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Transcription model</div>
+      <p class="note">
+        Ken transcribes videos on-device with an offline speech model — nothing
+        leaves your machine. Download the recommended model once to enable it.
+      </p>
+      {#if modelsLoading}
+        <p class="note">Checking for models…</p>
+      {:else}
+        <div class="models">
+          {#each models as model (model.id)}
+            <div class="model-row">
+              {#if model.installed}
+                <div class="head">
+                  <div class="meta">
+                    <span class="mname">{model.name}</span>
+                    {#if model.recommended}<span class="tag">recommended</span>{/if}
+                    <span class="soft">
+                      <span class="ok-dot"></span>Installed
+                      {#if model.sizeBytes}· {fmtModelSize(model.sizeBytes)}{/if}
+                    </span>
+                  </div>
+                  <button
+                    class="btn btn-small remove"
+                    onclick={() => void removeModel(model.id)}
+                    disabled={removing === model.id}
+                  >
+                    {removing === model.id ? "Removing…" : "Remove"}
+                  </button>
+                </div>
+              {:else}
+                <ModelDownloadDialog
+                  status={model}
+                  compact
+                  onInstalled={refreshModels}
+                />
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <div class="card">
@@ -404,6 +523,10 @@
   .folder input {
     accent-color: var(--accent);
   }
+  /* The ignored-files rows are read-only listings, not toggles. */
+  .folder.ignored {
+    cursor: default;
+  }
   .tag {
     font-size: 10px;
     border: 1px solid var(--border);
@@ -437,6 +560,30 @@
     flex: none;
   }
   .sync-now {
+    margin-left: auto;
+  }
+  .models {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .model-row .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .model-row .meta {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .mname {
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .remove {
     margin-left: auto;
   }
   .ok-dot {

@@ -31,6 +31,8 @@
       <span class="icon"><Icon size={16} strokeWidth={1.75} /></span>{item.label}
       {#if item.key === "files" && app.failedFiles.length > 0}
         <span class="dot" title="{app.failedFiles.length} files could not be indexed"></span>
+      {:else if item.key === "files" && app.unread.length > 0}
+        <span class="dot unread" title="{app.unread.length} files changed since you last looked"></span>
       {/if}
       {#if item.key === "review" && review.count > 0}
         <span class="count" title="{review.count} things are waiting on you">{review.count}</span>
@@ -94,6 +96,11 @@
     border-radius: 4px;
     background: var(--danger);
     border: 1.5px solid var(--paper);
+  }
+  /* Unread files are informational, not a problem — accent, not the red the
+     failed-index dot uses. Failed takes precedence when both apply. */
+  .dot.unread {
+    background: var(--accent);
   }
   .count {
     position: absolute;

@@ -2,6 +2,7 @@
 // for, plus recently resolved items. Assembled by the review_inbox
 // command; refreshed on run, index, and sync events.
 import { diffLines } from "diff";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
   type ConflictCopyPayload,
@@ -142,10 +143,38 @@ export function sourceLabel(item: InboxItem): string {
   return item.sourceRef.split("/").pop() || item.sourceRef;
 }
 
+/**
+ * The project-relative file an inbox item references, or null for slug-based
+ * kinds (approval/stale/broken-recipe). Mirrors the backend's ignore filter so
+ * the "Ignore" action only appears where it would actually silence something.
+ */
+export function inboxFileRef(item: InboxItem): string | null {
+  switch (item.kind) {
+    case "failed-file":
+    case "conflict":
+    case "conflict-copy":
+    case "stored":
+      return item.sourceRef;
+    default:
+      return null;
+  }
+}
+
+/** Trailing-debounce window for coalescing event bursts into one fetch. */
+const REFRESH_DEBOUNCE_MS = 200;
+
 class ReviewStore {
   items = $state<InboxItem[]>([]);
   done = $state<InboxItem[]>([]);
   selected = $state<string | null>(null);
+
+  // Live-subscription plumbing. The nav badge (review.count) must track reality
+  // app-wide, so these listeners are wired at app start rather than when the
+  // Review screen mounts. Handles are held so subscribe() can no-op on a repeat
+  // call and teardown can drop them instead of stacking a second set.
+  private unlisteners: UnlistenFn[] = [];
+  private subscribed = false;
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Open-item count — feeds the nav badge. */
   get count(): number {
@@ -165,11 +194,43 @@ class ReviewStore {
     return this.done.some((i) => i.id === this.selected);
   }
 
-  async init() {
-    await api.onIngestRunChanged(() => void this.refresh());
-    await api.onIndexUpdated(() => void this.refresh());
-    await api.onReviewChanged(() => void this.refresh());
+  /**
+   * Wire the inbox to the events that change what it contains, so review.count
+   * stays honest without the Review tab being open: ingest runs (approvals,
+   * broken recipes, stale), index scans (failed files), and review-changed
+   * (sync conflicts and stored items — both emit review-changed from the
+   * backend). Idempotent, so a stray second call can't double-subscribe.
+   */
+  async subscribe() {
+    if (this.subscribed) return;
+    this.subscribed = true;
+    this.unlisteners = await Promise.all([
+      api.onIngestRunChanged(() => this.scheduleRefresh()),
+      api.onIndexUpdated(() => this.scheduleRefresh()),
+      api.onReviewChanged(() => this.scheduleRefresh()),
+    ]);
     await this.refresh();
+  }
+
+  /** Drop the live subscription — for project teardown and test cleanup. */
+  unsubscribe() {
+    if (this.refreshTimer !== null) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+    for (const off of this.unlisteners) off();
+    this.unlisteners = [];
+    this.subscribed = false;
+  }
+
+  // A scan or sync pass fires many events in quick succession; collapse the
+  // burst into a single reviewInbox() fetch with a short trailing debounce.
+  private scheduleRefresh() {
+    if (this.refreshTimer !== null) clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      void this.refresh();
+    }, REFRESH_DEBOUNCE_MS);
   }
 
   async refresh() {

@@ -1,8 +1,18 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { Crepe } from "@milkdown/crepe";
+  import { editorViewCtx } from "@milkdown/kit/core";
+  // Namespace import: Svelte reserves the `$` prefix, so `$prose` can only be
+  // reached as a property.
+  import * as milkdown from "@milkdown/kit/utils";
+  import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
+  import type { Node as ProseNode } from "@milkdown/kit/prose/model";
+  import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
   import "@milkdown/crepe/theme/common/style.css";
   import "@milkdown/crepe/theme/frame.css";
+  import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
+  import { MATCH_CAP, findTextMatches } from "../lib/find";
+  import { find, type FindAdapter } from "../lib/find.svelte";
 
   let {
     initial,
@@ -11,6 +21,117 @@
 
   let host: HTMLDivElement;
   let crepe: Crepe | undefined;
+  let view = $state<EditorView | null>(null);
+
+  // Milkdown owns this DOM: wrapping hits in <mark> would make ProseMirror
+  // reconcile markup it never produced, and could corrupt the document. Find is
+  // therefore a ProseMirror decoration plugin — highlights live in the view
+  // layer, the document and its selection are never touched, and the
+  // decoration-only transactions stay out of history and out of autosave.
+  interface Hit {
+    from: number;
+    to: number;
+  }
+  interface FindState {
+    query: string;
+    current: number;
+    hits: Hit[];
+    decorations: DecorationSet;
+  }
+
+  const findKey = new PluginKey<FindState>("ken-find");
+  const EMPTY: FindState = {
+    query: "",
+    current: 0,
+    hits: [],
+    decorations: DecorationSet.empty,
+  };
+
+  function collect(doc: ProseNode, query: string): Hit[] {
+    const hits: Hit[] = [];
+    if (!query.trim()) return hits;
+    doc.descendants((node, pos) => {
+      if (hits.length >= MATCH_CAP) return false;
+      if (!node.isText || !node.text) return true;
+      const { starts } = findTextMatches(
+        node.text,
+        query,
+        MATCH_CAP - hits.length,
+      );
+      for (const start of starts) {
+        hits.push({ from: pos + start, to: pos + start + query.length });
+      }
+      return true;
+    });
+    return hits;
+  }
+
+  function build(doc: ProseNode, query: string, current: number): FindState {
+    const hits = collect(doc, query);
+    const decorations = DecorationSet.create(
+      doc,
+      hits.map((hit, i) =>
+        Decoration.inline(hit.from, hit.to, {
+          class: i === current ? `${MARK_CLASS} ${CURRENT_CLASS}` : MARK_CLASS,
+        }),
+      ),
+    );
+    return { query, current, hits, decorations };
+  }
+
+  const findPlugin = milkdown.$prose(
+    () =>
+      new Plugin<FindState>({
+        key: findKey,
+        state: {
+          init: () => EMPTY,
+          apply(tr, previous) {
+            const meta = tr.getMeta(findKey) as
+              | { query: string; current: number }
+              | undefined;
+            if (meta) return build(tr.doc, meta.query, meta.current);
+            if (tr.docChanged && previous.query) {
+              return build(tr.doc, previous.query, previous.current);
+            }
+            return previous;
+          },
+        },
+        props: {
+          decorations: (state) => findKey.getState(state)?.decorations,
+        },
+      }),
+  );
+
+  /** Decoration-only transaction: no doc change, no history entry, no save. */
+  function paint(query: string, current: number): number {
+    if (!view) return 0;
+    const tr = view.state.tr.setMeta(findKey, { query, current });
+    tr.setMeta("addToHistory", false);
+    view.dispatch(tr);
+    return findKey.getState(view.state)?.hits.length ?? 0;
+  }
+
+  $effect(() => {
+    if (!view) return;
+    const adapter: FindAdapter = {
+      search(query) {
+        const total = paint(query, 0);
+        return { total, capped: total >= MATCH_CAP };
+      },
+      async reveal(index) {
+        paint(find.query, index);
+        await tick();
+        host
+          ?.querySelector(`.${CURRENT_CLASS}`)
+          ?.scrollIntoView({ block: "center", inline: "nearest" });
+      },
+      clear() {
+        paint("", 0);
+      },
+    };
+    find.register(adapter);
+    return () => find.unregister(adapter);
+  });
 
   onMount(async () => {
     crepe = new Crepe({
@@ -27,7 +148,11 @@
         if (markdown !== prev) onchange(markdown);
       });
     });
+    crepe.editor.use(findPlugin);
     await crepe.create();
+    crepe.editor.action((ctx) => {
+      view = ctx.get(editorViewCtx);
+    });
   });
 
   onDestroy(() => {

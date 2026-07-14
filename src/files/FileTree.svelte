@@ -14,7 +14,18 @@
   import FileGlyph from "./FileGlyph.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
-  const tree = $derived(buildTree(app.files, app.folders));
+  let { width }: { width: number } = $props();
+
+  const unreadOnly = $derived(app.filesFilter === "unread");
+  // In unread-only view, buildTree gets just the unread files and synthesizes
+  // their ancestor folders (folders=[]), so nothing but the changed files and
+  // the path to them shows.
+  const shownFiles = $derived(
+    unreadOnly ? app.files.filter((f) => app.isUnread(f.relPath)) : app.files,
+  );
+  const tree = $derived(
+    buildTree(shownFiles, unreadOnly ? [] : app.folders),
+  );
 
   function glyphKind(path: string, kind: "file" | "folder"): string {
     if (kind === "folder") return "folder";
@@ -72,7 +83,7 @@
   }
 </script>
 
-<div class="tree">
+<div class="tree" style:width="{width}px">
   {#if app.favorites.length > 0}
     <div class="tree-head">Favorites</div>
     <div class="favorites">
@@ -121,11 +132,15 @@
     ondrop={onRootDrop}
   >
     {#each tree as node (node.relPath)}
-      <TreeNodeRow {node} depth={0} />
+      <TreeNodeRow {node} depth={0} expandAll={unreadOnly} />
     {/each}
     {#if tree.length === 0}
       <div class="empty">
-        {app.scanning ? "Reading your folder…" : "This folder is empty."}
+        {#if unreadOnly}
+          Nothing new — every file is up to date.
+        {:else}
+          {app.scanning ? "Reading your folder…" : "This folder is empty."}
+        {/if}
       </div>
     {/if}
   </div>
@@ -135,8 +150,8 @@
 
 <style>
   .tree {
-    flex: 0 1 264px;
-    min-width: 190px;
+    /* Width comes from the resizable, persisted sidebar preference. */
+    flex: none;
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;

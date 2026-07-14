@@ -77,7 +77,14 @@
     formOpen = true;
   }
 
-  function openNew() {
+  // Creation always starts at the gallery so template vs. blank is one choice.
+  function startCreate() {
+    galleryOpen = true;
+  }
+
+  // The gallery's "blank" affordance lands here: an empty, fully-editable form.
+  function openBlank() {
+    galleryOpen = false;
     editingSlug = null;
     formPreset = null;
     formOpen = true;
@@ -126,7 +133,7 @@
   <div class="list">
     <div class="list-head">
       Ingests
-      <button class="plus" title="New ingest" onclick={openNew}>+</button>
+      <button class="plus" title="New ingest" onclick={startCreate}>+</button>
     </div>
 
     {#if ingests.doctor && !ingests.doctor.found}
@@ -165,8 +172,7 @@
     {/if}
 
     <div class="list-foot">
-      <button class="foot-link accent" onclick={openNew}>+ New ingest</button>
-      <button class="foot-link" onclick={() => (galleryOpen = true)}>Browse templates</button>
+      <button class="foot-link accent" onclick={startCreate}>+ New ingest</button>
     </div>
   </div>
 
@@ -275,7 +281,7 @@
           Ingests keep structured documents — a people directory, a decision
           log — fresh as your files change.
         </p>
-        <button class="btn btn-primary" onclick={() => (galleryOpen = true)}>Browse templates</button>
+        <button class="btn btn-primary" onclick={startCreate}>New ingest</button>
       </div>
     {/if}
   </div>
@@ -297,6 +303,7 @@
 {#if galleryOpen}
   <TemplateGallery
     pick={openFromTemplate}
+    blank={openBlank}
     close={() => (galleryOpen = false)}
   />
 {/if}

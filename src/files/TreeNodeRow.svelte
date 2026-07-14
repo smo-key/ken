@@ -4,7 +4,9 @@
   import Star from "@lucide/svelte/icons/star";
   import StarOff from "@lucide/svelte/icons/star-off";
   import ExternalLink from "@lucide/svelte/icons/external-link";
+  import CloudIcon from "@lucide/svelte/icons/cloud";
   import SquareArrowOutUpRight from "@lucide/svelte/icons/square-arrow-out-up-right";
+  import Check from "@lucide/svelte/icons/check";
   import { app } from "../lib/app.svelte";
   import { api } from "../lib/api";
   import type { TreeNode } from "../lib/tree";
@@ -13,11 +15,17 @@
   import FileGlyph from "./FileGlyph.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
-  let { node, depth }: { node: TreeNode; depth: number } = $props();
-  let open = $state(depth < 1);
+  let {
+    node,
+    depth,
+    expandAll = false,
+  }: { node: TreeNode; depth: number; expandAll?: boolean } = $props();
+  let open = $state(depth < 1 || expandAll);
 
   const isFolder = $derived(node.file === undefined);
   const isDropTarget = $derived(drag.over === node.relPath);
+  // Unread = changed by someone/something else since the user last looked.
+  const isUnread = $derived(!isFolder && app.isUnread(node.relPath));
 
   // Auto-expand when a reveal request targets this folder or something inside it.
   $effect(() => {
@@ -26,6 +34,12 @@
     if (isFolder && t && (t === node.relPath || t.startsWith(node.relPath + "/"))) {
       open = true;
     }
+  });
+
+  // In the unread-only view every ancestor folder must open so the filtered
+  // files are actually visible, even when toggled after the row first mounted.
+  $effect(() => {
+    if (expandAll && isFolder) open = true;
   });
 
   function rowMenu(e: MouseEvent) {
@@ -44,6 +58,16 @@
         icon: ExternalLink,
         onSelect: () => void api.openExternal(node.relPath),
       },
+      ...(isUnread
+        ? ([
+            "separator",
+            {
+              label: "Mark as viewed",
+              icon: Check,
+              onSelect: () => void app.markSeen(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
       "separator",
       fav
         ? {
@@ -115,7 +139,7 @@
   </button>
   {#if open && !node.excluded}
     {#each node.children as child (child.relPath)}
-      <TreeNodeRow node={child} depth={depth + 1} />
+      <TreeNodeRow node={child} depth={depth + 1} {expandAll} />
     {/each}
   {/if}
 {:else}
@@ -123,6 +147,7 @@
     class="row file"
     class:selected={app.openFile === node.relPath}
     class:failed={node.file?.status === "failed"}
+    class:unread={isUnread}
     style:padding-left={`${8 + depth * 18 + 10}px`}
     draggable="true"
     onclick={() => app.openTab(node.relPath, false)}
@@ -138,12 +163,18 @@
     ondragend={() => drag.reset()}
     title={node.file?.status === "failed"
       ? `Not indexed — ${node.file.error ?? "unknown reason"}`
-      : node.relPath}
+      : node.file?.status === "cloud_only"
+        ? "Stored online only — open it and Ken will download it"
+        : node.relPath}
   >
     <FileGlyph kind={node.file?.kind ?? "binary"} size="sm" />
     <span class="name">{node.name}</span>
     {#if node.file?.status === "failed"}
       <span class="fail-dot" title={node.file.error ?? "not indexed"}></span>
+    {:else if node.file?.status === "cloud_only"}
+      <CloudIcon class="cloud-dot" size={12} strokeWidth={1.75} />
+    {:else if isUnread}
+      <span class="unread-dot" title="Changed since you last looked"></span>
     {/if}
   </button>
 {/if}
@@ -208,5 +239,26 @@
     border-radius: 3px;
     background: var(--danger);
     flex: none;
+  }
+  /* Unread = changed by someone else. Name goes semibold and an accent dot
+     trails it — distinct from the red failure dot and the grey cloud icon. */
+  .row.file.unread .name {
+    font-weight: 600;
+  }
+  .unread-dot {
+    margin-left: auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--accent);
+    flex: none;
+  }
+  /* Online-only file: present, just not downloaded yet. Informational, so it
+     reads quieter than the failure dot. */
+  .row :global(.cloud-dot) {
+    margin-left: auto;
+    flex: none;
+    color: var(--ink-tertiary);
+    opacity: 0.75;
   }
 </style>

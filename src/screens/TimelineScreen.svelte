@@ -3,13 +3,19 @@
   import { app } from "../lib/app.svelte";
   import { knowledge } from "../lib/knowledge.svelte";
   import { highlightMatches } from "../lib/knowledge";
-  import { timeAgo } from "../lib/format";
+  import { partitionTimeline } from "../lib/timeline";
   import Search from "@lucide/svelte/icons/search";
+  import ChevronRight from "@lucide/svelte/icons/chevron-right";
 
   onMount(() => void knowledge.visit());
 
   let query = $state("");
   let category = $state<string | null>(null);
+  /** User's manual collapse state for the future group; default collapsed. */
+  let futureOpen = $state(false);
+
+  /** yyyy-mm-dd for "now"; the real clock stays out of the pure partition. */
+  const today = new Date().toLocaleDateString("en-CA");
 
   const model = $derived(knowledge.model);
   const allEvents = $derived(model?.events ?? []);
@@ -35,8 +41,20 @@
     );
   });
 
+  const groups = $derived(partitionTimeline(filtered, today));
+
+  // A live search or category filter must be able to surface future matches,
+  // so it force-expands the future group regardless of the manual toggle.
+  const filtering = $derived(query.trim() !== "" || category !== null);
+  const showFuture = $derived(futureOpen || filtering);
+
   const MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+  function todayLabel(): string {
+    const [y, m, d] = today.split("-").map(Number);
+    return `${MONTHS[(m ?? 1) - 1] ?? "—"} ${d ?? "?"}, ${y}`;
+  }
 
   function dateLabel(date: string): string {
     const [y, m, d] = date.split("-").map(Number);
@@ -69,17 +87,6 @@
   <div class="inner">
     <div class="head">
       <h1>Timeline</h1>
-      {#if model?.builtAt}
-        <span class="when">built {timeAgo(model.builtAt)}</span>
-      {/if}
-      <span class="spacer"></span>
-      <button
-        class="btn btn-small"
-        disabled={knowledge.building}
-        onclick={() => void knowledge.refresh()}
-      >
-        {knowledge.building ? "Rebuilding…" : "Refresh"}
-      </button>
     </div>
 
     {#if knowledge.error}
@@ -88,13 +95,19 @@
 
     {#if knowledge.empty}
       <div class="empty-card">
-        <h2>Ken hasn't mapped this project yet</h2>
+        <h2>
+          {knowledge.building
+            ? "Ken is mapping this project…"
+            : "Ken hasn't mapped this project yet"}
+        </h2>
         <p>
           One pass over your documents turns dated decisions and changes
           into a timeline you can search and rewind.
         </p>
         {#if knowledge.building}
-          <p class="pulse">Ken is mapping the project…</p>
+          <p class="pulse">
+            This runs on its own after a project opens — a few minutes.
+          </p>
         {:else if knowledge.claudeFound}
           <button class="btn btn-primary" onclick={() => void knowledge.refresh()}>
             Build the timeline
@@ -140,28 +153,65 @@
       {#if filtered.length === 0}
         <div class="no-match">No events match.</div>
       {:else}
+        {#snippet eventRow(ev: (typeof filtered)[number])}
+          <div class="event">
+            <span class="dot" class:on-today={ev.date === today}></span>
+            <div class="meta">
+              <span class="date">{dateLabel(ev.date)}</span>
+              <span class="pill" style={pillStyle(ev.category)}>{ev.category}</span>
+            </div>
+            <div class="body">
+              {@html highlightMatches(ev.text, query)}
+              {#if ev.source}
+                <button
+                  class="src mono"
+                  title={ev.source}
+                  onclick={() => app.openInFiles(ev.source)}
+                >
+                  {chipLabel(ev.source)}
+                </button>
+              {/if}
+            </div>
+          </div>
+        {/snippet}
+
         <div class="timeline">
           <div class="line"></div>
-          {#each filtered as ev, i (ev.id)}
-            <div class="event">
-              <span class="dot" class:newest={i === 0}></span>
+
+          {#if groups.future.length > 0}
+            <button
+              class="collapse"
+              aria-expanded={showFuture}
+              onclick={() => (futureOpen = !showFuture)}
+            >
+              <ChevronRight class="chev" size={14} strokeWidth={2} aria-hidden="true" />
+              <span>
+                {groups.future.length} upcoming event{groups.future.length === 1 ? "" : "s"}
+                {#if filtering}<span class="hint">(matching)</span>{/if}
+              </span>
+            </button>
+            {#if showFuture}
+              {#each groups.future as ev (ev.id)}
+                {@render eventRow(ev)}
+              {/each}
+            {/if}
+          {/if}
+
+          {#if groups.hasDated}
+            <div class="event today-marker">
+              <span class="dot today"></span>
               <div class="meta">
-                <span class="date" class:newest-date={i === 0}>{dateLabel(ev.date)}</span>
-                <span class="pill" style={pillStyle(ev.category)}>{ev.category}</span>
-              </div>
-              <div class="body" class:dim={i !== 0}>
-                {@html highlightMatches(ev.text, query)}
-                {#if ev.source}
-                  <button
-                    class="src mono"
-                    title={ev.source}
-                    onclick={() => app.openInFiles(ev.source)}
-                  >
-                    {chipLabel(ev.source)}
-                  </button>
-                {/if}
+                <span class="date today-label">Today — {todayLabel()}</span>
               </div>
             </div>
+          {/if}
+
+          {#each groups.visible as ev (ev.id)}
+            {@render eventRow(ev)}
+          {/each}
+
+          {#each groups.undated as ev (ev.id)}
+            {@render eventRow(ev)}
           {/each}
         </div>
       {/if}
@@ -186,7 +236,6 @@
   .head {
     display: flex;
     align-items: center;
-    gap: 10px;
   }
   h1 {
     margin: 0;
@@ -194,13 +243,6 @@
     font-size: 28px;
     font-weight: 500;
     letter-spacing: -0.01em;
-  }
-  .when {
-    font-size: 12px;
-    color: var(--ink-tertiary);
-  }
-  .spacer {
-    flex: 1;
   }
   .error {
     font-size: 12.5px;
@@ -300,9 +342,53 @@
     border: 2.5px solid var(--paper);
     box-shadow: 0 0 0 1.5px var(--border-strong);
   }
-  .dot.newest {
+  .dot.on-today {
     background: var(--accent);
     box-shadow: 0 0 0 1.5px var(--accent);
+  }
+  /* The "now" marker: a filled accent dot with a soft halo to read as the
+     current moment rather than another dated entry. */
+  .dot.today {
+    background: var(--accent);
+    border-color: var(--paper);
+    box-shadow: 0 0 0 1.5px var(--accent), 0 0 0 5px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  .today-marker {
+    padding-bottom: 22px;
+  }
+  .today-label {
+    color: var(--accent-deep);
+  }
+
+  .collapse {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    margin-bottom: 22px;
+    padding: 3px 4px;
+    background: transparent;
+    border: none;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .collapse:hover {
+    color: var(--ink);
+  }
+  .collapse :global(.chev) {
+    transition: transform 0.12s ease;
+    flex: none;
+  }
+  .collapse[aria-expanded="true"] :global(.chev) {
+    transform: rotate(90deg);
+  }
+  .hint {
+    color: var(--ink-tertiary);
+    font-weight: 500;
+    margin-left: 3px;
   }
   .meta {
     display: flex;
@@ -315,9 +401,6 @@
     color: var(--ink-tertiary);
     letter-spacing: 0.05em;
   }
-  .newest-date {
-    color: var(--accent-deep);
-  }
   .pill {
     font-size: 10px;
     font-weight: 600;
@@ -328,9 +411,6 @@
     font-size: 13.5px;
     line-height: 1.65;
     margin-top: 3px;
-  }
-  .body.dim {
-    color: var(--ink-secondary);
   }
   .body :global(mark) {
     background: var(--match-highlight);

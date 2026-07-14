@@ -7,15 +7,20 @@
     actionsFor,
     conflictCopyPayload,
     dotFor,
+    inboxFileRef,
     sourceLabel,
     type InboxAction,
   } from "../lib/review.svelte";
   import { timeAgo } from "../lib/format";
   import type { InboxItem } from "../lib/api";
   import ConflictDetail from "../review/ConflictDetail.svelte";
+  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
+  import BellOff from "@lucide/svelte/icons/bell-off";
 
-  onMount(() => void review.init());
+  // Live subscription is wired at app start; still refresh on open as a
+  // belt-and-suspenders so the list is current the moment the tab is shown.
+  onMount(() => void review.refresh());
 
   const item = $derived(review.selectedItem);
   const itemIsDone = $derived(review.selectedIsDone);
@@ -78,6 +83,21 @@
       }
     }
   }
+
+  /** Ignore the file an item references (per-user, never synced); the inbox
+   *  and badge drop it on the next refresh. */
+  function ignore(it: InboxItem) {
+    const file = inboxFileRef(it);
+    if (file) void app.ignoreFile(file);
+  }
+
+  function rowMenu(e: MouseEvent, it: InboxItem) {
+    if (!inboxFileRef(it)) return; // slug-based items can't be ignored per-file
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, [
+      { label: "Ignore this file", icon: BellOff, onSelect: () => ignore(it) },
+    ]);
+  }
 </script>
 
 <div class="screen">
@@ -94,6 +114,7 @@
         class="row"
         class:active={review.selected === it.id}
         onclick={() => review.select(it.id)}
+        oncontextmenu={(e) => rowMenu(e, it)}
       >
         <span class="row-top">
           <span class="dot" style:background={dotFor(it.kind)}></span>
@@ -147,6 +168,15 @@
                     {LABELS[action]}
                   </button>
                 {/each}
+                {#if inboxFileRef(item)}
+                  <button
+                    class="btn ignore"
+                    title="Silence this file's issues (only for you)"
+                    onclick={() => ignore(item)}
+                  >
+                    <BellOff size={13} strokeWidth={1.75} /> Ignore
+                  </button>
+                {/if}
               </div>
             {/if}
           </div>
@@ -168,6 +198,8 @@
     {/if}
   </div>
 </div>
+
+<ContextMenu />
 
 <style>
   .screen {
@@ -305,6 +337,17 @@
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+  }
+  /* Ignore reads as a quiet, last-resort action beside the primary buttons. */
+  .btn.ignore {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--ink-tertiary);
+  }
+  .btn.ignore:hover {
+    color: var(--ink);
   }
   .resolved-note {
     font-size: 12px;

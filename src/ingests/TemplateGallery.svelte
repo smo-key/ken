@@ -5,21 +5,30 @@
   // it never saves on its own, so every field stays tailorable before saving.
   let {
     pick,
+    blank,
     close,
   }: {
     pick: (template: IngestTemplate) => void;
+    blank: () => void;
     close: () => void;
   } = $props();
 </script>
 
 <button class="scrim" onclick={close} aria-label="Close"></button>
 <div class="modal" role="dialog" aria-label="Template library">
-  <h2>Start from a template</h2>
+  <div class="head">
+    <h2>Start from a template</h2>
+    <button class="btn btn-small" onclick={blank}>Start from scratch</button>
+  </div>
   <p class="lede">
     Templates are starting points — after you pick one it's yours to tailor
     before saving.
   </p>
   <div class="grid">
+    <button class="tile blank" onclick={blank}>
+      <div class="tile-name">Blank ingest</div>
+      <div class="tile-desc">Start empty and fill in every field yourself.</div>
+    </button>
     {#each TEMPLATES as t (t.id)}
       <div class="tile">
         <div class="tile-name">{t.name}</div>
@@ -59,6 +68,14 @@
     flex-direction: column;
     gap: 14px;
   }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .head h2 {
+    flex: 1;
+  }
   h2 {
     margin: 0;
     font-family: var(--font-serif);
@@ -83,6 +100,14 @@
     flex-direction: column;
     gap: 6px;
     background: var(--sunken-2);
+  }
+  .tile.blank {
+    border-style: dashed;
+    text-align: left;
+    cursor: pointer;
+  }
+  .tile.blank:hover {
+    border-color: var(--accent);
   }
   .tile-name {
     font-size: 14px;

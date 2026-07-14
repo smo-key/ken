@@ -114,6 +114,142 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
+export type EntityKind = EntityRow["kind"];
+
+/** Per-node display state the Map renders from — the declutter decision. */
+export interface NodeView {
+  /** Rendered at all. A kind filter is the only thing that hides a node. */
+  visible: boolean;
+  /** Faded to background: present for context but out of the current focus. */
+  dimmed: boolean;
+  /** Show the text label; otherwise the node is a bare tagged dot. */
+  labeled: boolean;
+  /** Matches the active search query (drives the highlight ring). */
+  matched: boolean;
+}
+
+export interface MapViewInput {
+  entities: EntityRow[];
+  edges: EntityEdge[];
+  /** Free-text search over name + summary; empty means no search. */
+  query: string;
+  /** Kinds to keep; empty array means all kinds. */
+  kinds: EntityKind[];
+  /** The selected node id, or null. */
+  selected: number | null;
+  /** The hovered node id, or null. */
+  hovered: number | null;
+  /** Zoomed in far enough to afford every label. */
+  showAllLabels: boolean;
+  /** How many most-connected nodes carry a label at rest. */
+  prominentCount: number;
+}
+
+/** Undirected adjacency over entities present in the model. */
+export function adjacency(
+  entities: EntityRow[],
+  edges: EntityEdge[],
+): Map<number, Set<number>> {
+  const ids = new Set(entities.map((e) => e.id));
+  const adj = new Map<number, Set<number>>();
+  for (const e of entities) adj.set(e.id, new Set());
+  for (const edge of edges) {
+    if (!ids.has(edge.a) || !ids.has(edge.b)) continue;
+    adj.get(edge.a)!.add(edge.b);
+    adj.get(edge.b)!.add(edge.a);
+  }
+  return adj;
+}
+
+/**
+ * The declutter / focus / filter decision for every node, as one pure
+ * function so it can be tested and memoized apart from rendering. It runs
+ * on search/selection/hover/filter changes only — never on pan or zoom,
+ * which merely transform the already-laid-out view.
+ *
+ * Precedence: a kind filter hides non-matching nodes outright. Otherwise
+ * a *focus* — an active selection, else an active search — lights its
+ * node(s) and direct neighbors and dims everything else. With no focus,
+ * labels are budgeted to the most-connected nodes plus whatever the
+ * pointer is hovering (or every node once zoomed in).
+ */
+export function computeMapView(input: MapViewInput): Map<number, NodeView> {
+  const { entities, edges, query, kinds, selected, hovered, showAllLabels } =
+    input;
+  const adj = adjacency(entities, edges);
+  const kindSet = new Set(kinds);
+  const kindOk = (k: EntityKind) => kindSet.size === 0 || kindSet.has(k);
+
+  const q = query.trim().toLowerCase();
+  const matched = new Set<number>();
+  if (q) {
+    for (const e of entities) {
+      if (!kindOk(e.kind)) continue;
+      if (
+        e.name.toLowerCase().includes(q) ||
+        e.summary.toLowerCase().includes(q)
+      ) {
+        matched.add(e.id);
+      }
+    }
+  }
+
+  // At-rest labels go to the highest-degree visible nodes (name tiebreak),
+  // so the graph reads as a few anchors amid a field of dots.
+  const prominent = new Set(
+    [...entities]
+      .filter((e) => kindOk(e.kind) && (adj.get(e.id)?.size ?? 0) > 0)
+      .sort(
+        (a, b) =>
+          (adj.get(b.id)?.size ?? 0) - (adj.get(a.id)?.size ?? 0) ||
+          a.name.localeCompare(b.name),
+      )
+      .slice(0, Math.max(0, input.prominentCount))
+      .map((e) => e.id),
+  );
+
+  // The focus roots: the selection wins over a search.
+  let focusRoots: number[] | null = null;
+  if (selected !== null) focusRoots = [selected];
+  else if (q) focusRoots = [...matched];
+
+  const expand = (roots: number[]) => {
+    const set = new Set<number>();
+    for (const r of roots) {
+      set.add(r);
+      for (const n of adj.get(r) ?? []) set.add(n);
+    }
+    return set;
+  };
+  const focusSet = focusRoots ? expand(focusRoots) : null;
+  const hoverSet = hovered !== null ? expand([hovered]) : null;
+
+  const out = new Map<number, NodeView>();
+  for (const e of entities) {
+    if (!kindOk(e.kind)) {
+      out.set(e.id, {
+        visible: false,
+        dimmed: false,
+        labeled: false,
+        matched: false,
+      });
+      continue;
+    }
+    let dimmed = false;
+    let labeled: boolean;
+    if (focusSet) {
+      const inFocus = focusSet.has(e.id);
+      dimmed = !inFocus;
+      labeled = inFocus;
+    } else {
+      labeled =
+        showAllLabels || prominent.has(e.id) || (hoverSet?.has(e.id) ?? false);
+    }
+    out.set(e.id, { visible: true, dimmed, labeled, matched: matched.has(e.id) });
+  }
+  return out;
+}
+
 /**
  * Escape-then-mark: HTML in `text` is escaped, and the only tags in the
  * result are our own <mark>s around case-insensitive matches of `query`.

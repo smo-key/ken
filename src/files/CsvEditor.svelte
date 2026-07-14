@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { parseDelimited, serializeDelimited } from "../lib/csv";
+  import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
+  import { findCellMatches, type CellMatch } from "../lib/find";
+  import { find, type FindAdapter } from "../lib/find.svelte";
 
   let {
     initial,
@@ -40,6 +43,81 @@
 
   let gridEl = $state<HTMLDivElement | undefined>();
 
+  // Cells are inputs (or, in the capped read-only view, spans) — there is no
+  // text node to wrap — so a hit tints the cell itself and the classes come
+  // straight back off when find closes.
+  let matches: CellMatch[] = [];
+
+  // A read-only grid only renders the first VIEW_ROW_CAP rows, and find must not
+  // count what it can't show the user.
+  const findRows = $derived(
+    readOnly ? rows.slice(0, VIEW_ROW_CAP + 1) : rows,
+  );
+
+  function cellEl(m: CellMatch): HTMLElement | null {
+    return (
+      gridEl?.querySelector<HTMLElement>(
+        `[data-r="${m.row}"][data-c="${m.col}"]`,
+      ) ?? null
+    );
+  }
+
+  function clearHits() {
+    for (const el of gridEl?.querySelectorAll<HTMLElement>(`.${MARK_CLASS}`) ??
+      []) {
+      el.classList.remove(MARK_CLASS, CURRENT_CLASS);
+    }
+  }
+
+  $effect(() => {
+    const adapter: FindAdapter = {
+      // untrack: register() runs the first search from inside this effect, and a
+      // tracked read of the grid would re-register (and reset the match) on
+      // every keystroke in a cell.
+      search: (query) =>
+        untrack(() => {
+          const result = findCellMatches([findRows], query);
+          matches = result.matches;
+          clearHits();
+          for (const m of matches) cellEl(m)?.classList.add(MARK_CLASS);
+          return {
+            total: matches.length,
+            capped: result.capped,
+            note: readOnly
+              ? `Searching the first ${VIEW_ROW_CAP} rows — the rest of this file is too large to show as a grid.`
+              : undefined,
+          };
+        }),
+      reveal: (index, opts) =>
+        untrack(async () => {
+          await tick();
+          for (const el of gridEl?.querySelectorAll<HTMLElement>(
+            `.${CURRENT_CLASS}`,
+          ) ?? []) {
+            el.classList.remove(CURRENT_CLASS);
+          }
+          const el = cellEl(matches[index]);
+          if (!el) return;
+          el.classList.add(MARK_CLASS, CURRENT_CLASS);
+          // scroll=false is an edit-driven refresh: keep the accent on the
+          // current match but don't scroll the grid out from under the cell the
+          // user is typing in.
+          if (opts?.scroll !== false) {
+            el.scrollIntoView({ block: "center", inline: "center" });
+          }
+        }),
+      clear() {
+        matches = [];
+        clearHits();
+      },
+    };
+    find.register(adapter);
+    return () => {
+      clearHits();
+      find.unregister(adapter);
+    };
+  });
+
   function emit() {
     onchange(serializeDelimited(rows, delimiter));
   }
@@ -47,6 +125,7 @@
   function setCell(r: number, c: number, value: string) {
     rows[r][c] = value;
     emit();
+    find.refresh(false); // the cell the user just typed in may (not) match any more
   }
 
   function addRow() {
@@ -118,13 +197,15 @@
   </div>
 
   {#if readOnly}
-    <div class="grid-scroll">
+    <div class="grid-scroll" bind:this={gridEl}>
       <table>
         <thead>
           <tr>
             <th class="corner" aria-hidden="true"></th>
             {#each rows[0] as cell, c (c)}
-              <th class="head-cell"><span class="cell head ro">{cell}</span></th>
+              <th class="head-cell">
+                <span class="cell head ro" data-r="0" data-c={c}>{cell}</span>
+              </th>
             {/each}
           </tr>
         </thead>
@@ -133,7 +214,9 @@
             <tr>
               <td class="rownum"><span class="num">{i + 1}</span></td>
               {#each row as cell, c (c)}
-                <td><span class="cell ro">{cell}</span></td>
+                <td>
+                  <span class="cell ro" data-r={i + 1} data-c={c}>{cell}</span>
+                </td>
               {/each}
             </tr>
           {/each}
@@ -314,6 +397,15 @@
   .cell:focus {
     background: var(--surface);
     box-shadow: inset 0 0 0 2px var(--accent);
+  }
+  /* The global .ken-find rules can't win against the scoped .cell background,
+     so the cell tint is restated here at the specificity the grid needs. */
+  .cell:global(.ken-find) {
+    background: color-mix(in srgb, var(--needs-input) 32%, transparent);
+  }
+  .cell:global(.ken-find-current) {
+    background: color-mix(in srgb, var(--accent) 42%, transparent);
+    box-shadow: inset 0 0 0 1px var(--accent);
   }
   .cell.head {
     font-family: var(--font-sans);
