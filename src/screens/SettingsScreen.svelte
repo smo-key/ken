@@ -7,6 +7,14 @@
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
+  import ChevronRight from "@lucide/svelte/icons/chevron-right";
+  import {
+    buildFolderTree,
+    folderTriState,
+    isExcluded,
+    toggleFolder as toggleFolderPaths,
+    type FolderNode,
+  } from "../lib/folderTree";
 
   let busy = $state(false);
   let toggling = $state(false);
@@ -23,11 +31,31 @@
   let modelsLoading = $state(true);
   let removing = $state<string | null>(null);
 
-  const themeOptions: { value: ThemeMode; title: string; hint: string }[] = [
-    { value: "light", title: "Light", hint: "" },
-    { value: "dark", title: "Dark", hint: "" },
-    { value: "system", title: "System", hint: "(follows your OS appearance)" },
+  const themeOptions: { value: ThemeMode; title: string }[] = [
+    { value: "light", title: "Light" },
+    { value: "dark", title: "Dark" },
+    { value: "system", title: "System" },
   ];
+
+  const excludedSet = $derived(new Set(app.project?.excluded ?? []));
+  const folderTree = $derived(buildFolderTree(app.folders));
+  let expanded = $state<Set<string>>(new Set());
+
+  function toggleExpand(relPath: string) {
+    const next = new Set(expanded);
+    next.has(relPath) ? next.delete(relPath) : next.add(relPath);
+    expanded = next;
+  }
+
+  const transcriptionModels = $derived(models.filter((m) => m.category === "transcription"));
+  // Language models arrive when the other plan appends them; this card renders
+  // whatever categories the catalog returns.
+  const languageModels = $derived(models.filter((m) => m.category === "language"));
+
+  async function selectModel(category: "transcription" | "language", id: string) {
+    await api.setModelSelection(category, id);
+    await refreshModels();
+  }
 
   onMount(() => {
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
@@ -95,24 +123,13 @@
     await api.setIngestRunnerMode(mode);
   }
 
-  const included = $derived(
-    app.folders.filter((f) => !f.excluded).map((f) => f.relPath),
-  );
-
-  async function toggleFolder(relPath: string, currentlyExcluded: boolean) {
+  async function toggleFolder(relPath: string) {
     if (!app.project || toggling) return;
     toggling = true;
     try {
-      const ex = new Set(app.project.excluded);
-      if (currentlyExcluded) {
-        // Re-include: drop this path and any children from the exclusion list.
-        for (const e of [...ex]) {
-          if (e === relPath || e.startsWith(relPath + "/")) ex.delete(e);
-        }
-      } else {
-        ex.add(relPath);
-      }
-      await app.setExcluded([...ex]);
+      const currentlyExcluded = isExcluded(relPath, excludedSet);
+      const next = toggleFolderPaths(relPath, currentlyExcluded, excludedSet);
+      await app.setExcluded(next);
     } finally {
       toggling = false;
     }
@@ -132,23 +149,8 @@
   <div class="inner">
     <h1>Settings</h1>
 
-    <div class="card">
-      <div class="card-title">Appearance</div>
-      {#each themeOptions as opt (opt.value)}
-        <div class="row">
-          <span class="label">{opt.value === "light" ? "Theme" : ""}</span>
-          <label class="radio">
-            <input
-              type="radio"
-              name="theme"
-              checked={theme.mode === opt.value}
-              onchange={() => theme.set(opt.value)}
-            />
-            {opt.title} <span class="soft">{opt.hint}</span>
-          </label>
-        </div>
-      {/each}
-    </div>
+    <section class="group">
+      <div class="group-head">This project</div>
 
     <div class="card">
       <div class="card-title">Project</div>
@@ -178,32 +180,54 @@
     <div class="card">
       <div class="card-title">Watched folders</div>
       <p class="note">
-        Ken ingests every folder by default. Uncheck one to leave it out of
-        search and future AI features.
+        Ken watches every folder by default. Uncheck one to leave it and
+        everything inside it out of search and AI features.
       </p>
       {#if app.folders.length === 0}
         <p class="note">No subfolders — everything at the top level is watched.</p>
+      {:else}
+        <div class="folder-tree">
+          {#each folderTree as node (node.relPath)}
+            {@render folderRow(node, 0)}
+          {/each}
+        </div>
       {/if}
-      <div class="folders">
-        {#each app.folders as folder (folder.relPath)}
-          <label
-            class="folder"
-            style:padding-left={`${(folder.relPath.split("/").length - 1) * 18}px`}
-          >
-            <input
-              type="checkbox"
-              checked={!folder.excluded}
-              disabled={toggling}
-              onchange={() => toggleFolder(folder.relPath, folder.excluded)}
-            />
-            <span class="mono">{folder.relPath}</span>
-            {#if folder.excluded}
-              <span class="tag">excluded</span>
-            {/if}
-          </label>
-        {/each}
-      </div>
     </div>
+
+    {#snippet folderRow(node: FolderNode, depth: number)}
+      {@const tri = folderTriState(node.relPath, excludedSet)}
+      <div class="frow" style:padding-left={`${depth * 20}px`}>
+        {#if node.children.length > 0}
+          <button
+            class="chev"
+            class:open={expanded.has(node.relPath)}
+            aria-label={expanded.has(node.relPath) ? "Collapse" : "Expand"}
+            onclick={() => toggleExpand(node.relPath)}
+          >
+            <ChevronRight size={14} strokeWidth={2} />
+          </button>
+        {:else}
+          <span class="chev-spacer"></span>
+        {/if}
+        <label class="fcheck">
+          <input
+            type="checkbox"
+            checked={tri === "checked"}
+            indeterminate={tri === "indeterminate"}
+            disabled={toggling}
+            onchange={() => toggleFolder(node.relPath)}
+          />
+          <span class="mono">{node.name}</span>
+        </label>
+      </div>
+      {#if expanded.has(node.relPath)}
+        <div class="subtree">
+          {#each node.children as child (child.relPath)}
+            {@render folderRow(child, depth + 1)}
+          {/each}
+        </div>
+      {/if}
+    {/snippet}
 
     {#if app.ignored.length > 0}
       <div class="card">
@@ -245,89 +269,6 @@
         Downloads cloud-offline documents so they're searchable without opening
         them. Large media still download on open.
       </p>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Transcription model</div>
-      <p class="note">
-        Ken transcribes videos on-device with an offline speech model — nothing
-        leaves your machine. Download the recommended model once to enable it.
-      </p>
-      {#if modelsLoading}
-        <p class="note">Checking for models…</p>
-      {:else}
-        <div class="models">
-          {#each models as model (model.id)}
-            <div class="model-row">
-              {#if model.installed}
-                <div class="head">
-                  <div class="meta">
-                    <span class="mname">{model.name}</span>
-                    {#if model.recommended}<span class="tag">recommended</span>{/if}
-                    <span class="soft">
-                      <span class="ok-dot"></span>Installed
-                      {#if model.sizeBytes}· {fmtModelSize(model.sizeBytes)}{/if}
-                    </span>
-                  </div>
-                  <button
-                    class="btn btn-small remove"
-                    onclick={() => void removeModel(model.id)}
-                    disabled={removing === model.id}
-                  >
-                    {removing === model.id ? "Removing…" : "Remove"}
-                  </button>
-                </div>
-              {:else}
-                <ModelDownloadDialog
-                  status={model}
-                  compact
-                  onInstalled={refreshModels}
-                />
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    <div class="card">
-      <div class="card-title">AI runner</div>
-      {#if ingests.doctor?.found}
-        <p class="note">
-          <span class="ok-dot"></span>Claude Code found
-          {#if ingests.doctor.version}({ingests.doctor.version}){/if}
-          <span class="mono small">{ingests.doctor.path}</span>
-        </p>
-      {:else}
-        <p class="note warn">
-          Claude Code isn't installed — ingests can't run until it is.
-          <span class="mono small">npm i -g @anthropic-ai/claude-code</span>
-        </p>
-      {/if}
-      <div class="row">
-        <span class="label">Mode</span>
-        <label class="radio">
-          <input
-            type="radio"
-            name="runner"
-            checked={runnerMode === "headless"}
-            onchange={() => setRunnerMode("headless")}
-          />
-          Background <span class="soft">(recommended — can't get stuck on setup prompts)</span>
-        </label>
-      </div>
-      <div class="row">
-        <span class="label"></span>
-        <label class="radio">
-          <input
-            type="radio"
-            name="runner"
-            checked={runnerMode === "hidden-tui"}
-            onchange={() => setRunnerMode("hidden-tui")}
-          />
-          Interactive <span class="soft">(watch or step in via Chats; Claude's one-time prompts need answering there)</span>
-        </label>
-      </div>
     </div>
 
     <div class="card">
@@ -386,6 +327,121 @@
         </p>
       {/if}
     </div>
+    </section>
+
+    <section class="group">
+      <div class="group-head">On this Mac</div>
+
+    <div class="card">
+      <div class="card-title">Appearance</div>
+      <div class="row">
+        <span class="label">Theme</span>
+        <div class="seg-group" role="radiogroup" aria-label="Theme">
+          {#each themeOptions as opt (opt.value)}
+            <button
+              class="seg"
+              class:on={theme.mode === opt.value}
+              role="radio"
+              aria-checked={theme.mode === opt.value}
+              onclick={() => theme.set(opt.value)}
+            >{opt.title}</button>
+          {/each}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Offline models</div>
+      <p class="note">These run on your Mac — nothing you say or store leaves it.</p>
+      {#if modelsLoading}
+        <p class="note">Checking for models…</p>
+      {:else}
+        {@render modelCategory("Transcription", "transcription", transcriptionModels)}
+        {#if languageModels.length > 0}
+          {@render modelCategory("Answers & Map", "language", languageModels)}
+        {/if}
+      {/if}
+    </div>
+
+    {#snippet modelCategory(title: string, cat: "transcription" | "language", list: ModelStatus[])}
+      <div class="mcat">
+        <div class="mcat-title">{title}</div>
+        {#each list as m (m.id)}
+          <div class="mopt" class:selected={m.selected}>
+            <label class="mradio">
+              <input
+                type="radio"
+                name={`model-${cat}`}
+                checked={m.selected}
+                disabled={!m.installed}
+                onchange={() => void selectModel(cat, m.id)}
+              />
+              <span class="mopt-main">
+                <span class="mname">{m.name}</span>
+                <span class="mtier">{m.tier === "recommended" ? "Recommended" : "Advanced"}</span>
+                <span class="mblurb">{m.blurb}</span>
+              </span>
+            </label>
+            {#if m.installed}
+              <div class="mopt-actions">
+                <span class="soft"><span class="ok-dot"></span>Installed{#if m.sizeBytes}· {fmtModelSize(m.sizeBytes)}{/if}</span>
+                {#if !m.selected}
+                  <button class="btn btn-small remove" onclick={() => void removeModel(m.id)} disabled={removing === m.id}>
+                    {removing === m.id ? "Removing…" : "Remove"}
+                  </button>
+                {/if}
+              </div>
+            {:else}
+              <ModelDownloadDialog status={m} compact onInstalled={refreshModels} />
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/snippet}
+
+    <div class="card">
+      <div class="card-title">AI runner</div>
+      {#if ingests.doctor?.found}
+        <p class="note">
+          <span class="ok-dot"></span>Claude Code found
+          {#if ingests.doctor.version}({ingests.doctor.version}){/if}
+          <span class="mono small">{ingests.doctor.path}</span>
+        </p>
+      {:else}
+        <p class="note warn">
+          Claude Code isn't installed — ingests can't run until it is.
+          <span class="mono small">npm i -g @anthropic-ai/claude-code</span>
+        </p>
+      {/if}
+      <div class="row">
+        <span class="label">Mode</span>
+        <label class="radio">
+          <input
+            type="radio"
+            name="runner"
+            checked={runnerMode === "headless"}
+            onchange={() => setRunnerMode("headless")}
+          />
+          Background <span class="soft">(recommended — can't get stuck on setup prompts)</span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label"></span>
+        <label class="radio">
+          <input
+            type="radio"
+            name="runner"
+            checked={runnerMode === "hidden-tui"}
+            onchange={() => setRunnerMode("hidden-tui")}
+          />
+          Interactive <span class="soft">(watch or step in via Chats; Claude's one-time prompts need answering there)</span>
+        </label>
+      </div>
+    </div>
+    </section>
+
+    <section class="group">
+      <div class="group-head">Working with agents</div>
 
     <div class="card">
       <div class="mcp-head">
@@ -445,6 +501,7 @@
         </p>
       {/if}
     </div>
+    </section>
 
   </div>
 </div>
@@ -461,7 +518,22 @@
     margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 40px; /* between groups (overrides the old uniform 18px) */
+  }
+  /* Groups: generous separation between, tighter within — restores hierarchy
+     without new chrome. */
+  .group {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .group-head {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-tertiary);
+    margin-bottom: 2px;
   }
   h1 {
     margin: 0;
@@ -520,19 +592,9 @@
     cursor: pointer;
     padding: 3px 0;
   }
-  .folder input {
-    accent-color: var(--accent);
-  }
   /* The ignored-files rows are read-only listings, not toggles. */
   .folder.ignored {
     cursor: default;
-  }
-  .tag {
-    font-size: 10px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0 5px;
-    color: var(--ink-tertiary);
   }
   .btn {
     margin-left: auto;
@@ -562,27 +624,54 @@
   .sync-now {
     margin-left: auto;
   }
-  .models {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+  /* Appearance / any segmented control, matching the Files All/Unread filter. */
+  .seg-group {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    overflow: hidden;
   }
-  .model-row .head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .model-row .meta {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
-    min-width: 0;
-  }
-  .mname {
-    font-size: 13px;
+  .seg-group .seg {
+    padding: 5px 14px;
+    border: none;
+    background: var(--surface);
+    color: var(--ink-secondary);
+    font-size: 12.5px;
     font-weight: 500;
   }
+  .seg-group .seg:hover { background: var(--sunken); }
+  .seg-group .seg.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
+  }
+  /* Watched-folders tree */
+  .folder-tree { display: flex; flex-direction: column; gap: 2px; }
+  .frow { display: flex; align-items: center; gap: 4px; }
+  .chev {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border: none; background: transparent;
+    color: var(--ink-tertiary); border-radius: 4px;
+    transition: transform 0.15s ease;
+  }
+  .chev:hover { background: var(--sunken); color: var(--ink); }
+  .chev.open { transform: rotate(90deg); }
+  .chev-spacer { width: 18px; flex: none; }
+  .fcheck { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  .fcheck input { accent-color: var(--accent); }
+  .subtree { display: flex; flex-direction: column; gap: 2px; }
+  /* Offline models */
+  .mcat { display: flex; flex-direction: column; gap: 10px; }
+  .mcat + .mcat { margin-top: 16px; }
+  .mcat-title { font-size: 12px; font-weight: 600; color: var(--ink-secondary); }
+  .mopt { display: flex; flex-direction: column; gap: 6px; padding: 8px 0; }
+  .mradio { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+  .mradio input { accent-color: var(--accent); margin-top: 3px; }
+  .mopt-main { display: flex; flex-direction: column; gap: 2px; }
+  .mname { font-size: 13px; font-weight: 500; }
+  .mtier { font-size: 11px; color: var(--accent); }
+  .mblurb { font-size: 12px; color: var(--ink-tertiary); }
+  .mopt-actions { display: flex; align-items: center; gap: 10px; padding-left: 28px; }
   .remove {
     margin-left: auto;
   }
