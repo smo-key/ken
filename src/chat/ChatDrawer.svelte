@@ -22,6 +22,7 @@
   import ChatResizer from "./ChatResizer.svelte";
   import { app } from "../lib/app.svelte";
   import { clampChatWidth } from "../lib/chatWidth";
+  import { shouldSend } from "../lib/keySend";
 
   // Research runs *are* chats (kind: "research") — they open as a terminal
   // session in this drawer and are cancelled from its foot, so this is where
@@ -98,6 +99,22 @@
         chats.active.status === "needs_input"),
   );
 
+  // Focus the composer whenever it becomes the thing to type into: a chat is
+  // active, the drawer is open, and we're not in terminal mode. Re-runs on chat
+  // switch and on leaving the terminal, so the user can type immediately.
+  $effect(() => {
+    const typeable =
+      chats.open && chats.activeId !== null && !inTerminal &&
+      chats.active?.kind !== "ingest" && chats.active?.kind !== "research";
+    // Read activeId + inTerminal so the effect re-runs on select/exit-terminal.
+    void chats.activeId;
+    void inTerminal;
+    if (typeable && replyEl) {
+      // Next microtask: the textarea may have just mounted after a branch swap.
+      queueMicrotask(() => replyEl?.focus());
+    }
+  });
+
   async function cancelResearch() {
     if (chats.activeId) await api.cancelResearch(chats.activeId);
   }
@@ -118,10 +135,10 @@
     await chats.send(text);
   }
 
-  // Enter sends, Shift+Enter inserts a newline. "/" is an ordinary character now
-  // — the terminal is revealed by the explicit Terminal toggle, not a keystroke.
+  // Enter sends, Shift+Enter inserts a newline (see keySend). "/" is an ordinary
+  // character now — the terminal is revealed by the explicit Terminal toggle.
   function onKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSend(e)) {
       e.preventDefault();
       void submit();
     }

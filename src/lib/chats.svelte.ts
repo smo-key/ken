@@ -1,16 +1,22 @@
 // Chat drawer state: rows, transcripts, active chat, terminal mode.
 import {
   api,
-  type ChatMessage,
   type ChatRow,
 } from "./api";
+import {
+  dropPending,
+  nextTempId,
+  optimisticUserMessage,
+  reconcile,
+  type TranscriptEntry,
+} from "./chatEcho";
 import { app } from "./app.svelte";
 
 class ChatsStore {
   open = $state(false);
   rows = $state<ChatRow[]>([]);
   activeId = $state<string | null>(null);
-  transcript = $state<ChatMessage[]>([]);
+  transcript = $state<TranscriptEntry[]>([]);
   /** chat id currently in terminal mode (at most one). */
   terminalId = $state<string | null>(null);
   sendError = $state<string | null>(null);
@@ -33,7 +39,11 @@ class ChatsStore {
       const i = this.rows.findIndex((r) => r.id === row.id);
       if (row.archived) {
         if (i >= 0) this.rows = this.rows.toSpliced(i, 1);
-        if (this.activeId === row.id) this.activeId = this.rows[0]?.id ?? null;
+        if (this.activeId === row.id) {
+          this.activeId = this.rows[0]?.id ?? null;
+          if (this.activeId) void this.select(this.activeId);
+          else this.transcript = [];
+        }
         return;
       }
       if (i >= 0) this.rows = this.rows.toSpliced(i, 1, row);
@@ -42,7 +52,7 @@ class ChatsStore {
     });
     await api.onChatMessage((msg) => {
       if (msg.chatId === this.activeId) {
-        this.transcript = [...this.transcript, msg];
+        this.transcript = reconcile(this.transcript, msg);
       }
     });
     await this.refresh();
@@ -86,14 +96,25 @@ class ChatsStore {
   async send(text: string) {
     if (!this.activeId) return;
     this.sendError = null;
+    const chatId = this.activeId;
+    // Optimistically echo the user's message so it never vanishes; the backend's
+    // chat-message event reconciles against this pending copy by content.
+    const tempId = nextTempId();
+    this.transcript = [
+      ...this.transcript,
+      optimisticUserMessage(chatId, text, Date.now(), tempId),
+    ];
     // Attach the files the user has on screen as a weak, clearly-caveated hint
-    // (the backend frames it as "not necessarily relevant"). Send all open
-    // tabs plus which one is focused.
+    // (the backend frames it as "not necessarily relevant"). Send all open tabs
+    // plus which one is focused.
     const openFiles = app.fileTabs.map((t) => t.path);
     const focusedFile = app.openFile;
     try {
-      await api.sendChatMessage(this.activeId, text, openFiles, focusedFile);
+      await api.sendChatMessage(chatId, text, openFiles, focusedFile);
     } catch (e) {
+      // The send failed: pull the pending echo and show why, so the message
+      // doesn't sit there looking sent.
+      this.transcript = dropPending(this.transcript, tempId);
       this.sendError = String(e);
     }
   }

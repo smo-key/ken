@@ -5,10 +5,16 @@
 
   let scroller = $state<HTMLDivElement | null>(null);
 
+  // Follow the conversation, but only when the user is already near the bottom —
+  // don't yank them down while they're reading earlier messages.
   $effect(() => {
-    // Follow the conversation.
-    chats.transcript.length;
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    const len = chats.transcript.length;
+    void len;
+    const el = scroller;
+    if (!el) return;
+    const nearBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
   });
 
   function onClick(e: MouseEvent) {
@@ -36,7 +42,7 @@
 
   {#each chats.transcript as msg (msg.id + msg.role + msg.createdAt)}
     {#if msg.role === "user"}
-      <div class="bubble user">{msg.content}</div>
+      <div class="bubble user" class:pending={"pending" in msg && msg.pending}>{msg.content}</div>
     {:else if msg.role === "assistant"}
       <div class="assistant">
         <span class="mark">K</span>
@@ -102,6 +108,9 @@
     font-size: 13.5px;
     line-height: 1.55;
     white-space: pre-wrap;
+  }
+  .bubble.user.pending {
+    opacity: 0.6;
   }
   .assistant {
     display: flex;
