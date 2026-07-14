@@ -4,6 +4,8 @@ import {
   parseRels,
   parseSlide,
   parseSlideSize,
+  parseTheme,
+  resolveColor,
   resolvePath,
   slidePathsInOrder,
 } from "./pptx";
@@ -16,6 +18,90 @@ const R = `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relati
 function slide(inner: string): string {
   return `<?xml version="1.0"?><p:sld ${A} ${P} ${R}><p:cSld><p:spTree>${inner}</p:spTree></p:cSld></p:sld>`;
 }
+
+// --- Real, trimmed theme + master fragments from "Website Options v2.pptx" ---
+const THEME1 = `<?xml version="1.0"?><a:theme ${A}><a:themeElements><a:clrScheme name="Office">` +
+  `<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>` +
+  `<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>` +
+  `<a:dk2><a:srgbClr val="44546A"/></a:dk2>` +
+  `<a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>` +
+  `<a:accent1><a:srgbClr val="4472C4"/></a:accent1>` +
+  `<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>` +
+  `<a:accent6><a:srgbClr val="70AD47"/></a:accent6>` +
+  `</a:clrScheme></a:themeElements></a:theme>`;
+
+const MASTER1 = `<?xml version="1.0"?><p:sldMaster ${P} ${A}><p:clrMap ` +
+  `bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" ` +
+  `accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" ` +
+  `hlink="hlink" folHlink="folHlink"/></p:sldMaster>`;
+
+/** Parse a bare <a:solidFill> (or any color-bearing element) for resolveColor tests. */
+function colorEl(inner: string): Element {
+  const doc = new DOMParser().parseFromString(
+    `<root ${A}>${inner}</root>`, "application/xml",
+  );
+  return doc.documentElement.firstElementChild as Element;
+}
+
+describe("parseTheme", () => {
+  it("resolves scheme slots (srgbClr and sysClr lastClr) to hex", () => {
+    const t = parseTheme(THEME1, MASTER1);
+    expect(t.colors.accent1).toBe("4472C4");
+    expect(t.colors.dk1).toBe("000000"); // sysClr → lastClr
+    expect(t.colors.lt1).toBe("FFFFFF");
+  });
+
+  it("maps clrMap names (bg1→lt1, tx1→dk1) onto scheme colors", () => {
+    const t = parseTheme(THEME1, MASTER1);
+    expect(t.colors.bg1).toBe("FFFFFF"); // bg1 → lt1 → window
+    expect(t.colors.tx1).toBe("000000"); // tx1 → dk1 → windowText
+  });
+
+  it("returns an empty lookup when theme/master are missing", () => {
+    expect(parseTheme(undefined, undefined).colors).toEqual({});
+  });
+});
+
+describe("resolveColor", () => {
+  const t = parseTheme(THEME1, MASTER1);
+
+  it("still reads a plain srgbClr fill", () => {
+    expect(resolveColor(colorEl(`<a:solidFill><a:srgbClr val="F2F2F2"/></a:solidFill>`), t))
+      .toBe("#F2F2F2");
+  });
+
+  it("resolves a bare schemeClr through the theme", () => {
+    expect(resolveColor(colorEl(`<a:solidFill><a:schemeClr val="accent1"/></a:solidFill>`), t))
+      .toBe("#4472C4");
+  });
+
+  it("applies shade (darken) to a scheme color", () => {
+    // accent1 4472C4 → each channel * 0.5 → 22 39 62
+    expect(resolveColor(colorEl(
+      `<a:solidFill><a:schemeClr val="accent1"><a:shade val="50000"/></a:schemeClr></a:solidFill>`), t))
+      .toBe("#223962");
+  });
+
+  it("applies lumMod+lumOff (light tint) in document order", () => {
+    // accent6 70AD47 lumMod 20000 + lumOff 80000 → very light green
+    const c = resolveColor(colorEl(
+      `<a:solidFill><a:schemeClr val="accent6"><a:lumMod val="20000"/><a:lumOff val="80000"/></a:schemeClr></a:solidFill>`), t);
+    expect(c).toMatch(/^#[0-9A-F]{6}$/);
+    // luminance pushed high: all channels should be light (>0xC0)
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(c!.slice(i, i + 2), 16));
+    expect(Math.min(r, g, b)).toBeGreaterThan(0xC0);
+  });
+
+  it("emits rgba when alpha is present", () => {
+    expect(resolveColor(colorEl(
+      `<a:solidFill><a:srgbClr val="FF0000"><a:alpha val="50000"/></a:srgbClr></a:solidFill>`), t))
+      .toBe("rgba(255,0,0,0.5)");
+  });
+
+  it("returns undefined for a colorless / noFill element", () => {
+    expect(resolveColor(colorEl(`<a:ln><a:noFill/></a:ln>`), t)).toBeUndefined();
+  });
+});
 
 describe("emuToPx", () => {
   it("uses 9525 EMU per CSS pixel (914400 EMU/inch ÷ 96px/inch)", () => {
