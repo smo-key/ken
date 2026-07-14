@@ -109,7 +109,7 @@ pub enum LlmStatus {
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -138,33 +138,56 @@ struct Queues {
     shutdown: bool,
 }
 
+/// Why the engine factory couldn't produce an engine. `NotInstalled` is not a
+/// fault — no Language model is on disk yet — so it is never cached as a sticky
+/// load Error and the factory is retried on the next job. `Failed` is a real
+/// load failure (corrupt GGUF, backend init error): it is cached and reported
+/// until [`LlmService::rearm`] (via [`notify_model_installed`]) clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineBuildError {
+    NotInstalled,
+    Failed(String),
+}
+
 /// The inference scheduler: a single worker thread owning one [`Engine`], fed by
 /// a two-priority queue. Owns no llama.cpp types directly — the engine is built
-/// by the factory passed to [`LlmService::spawn`], lazily on the first job.
+/// by the factory passed to [`LlmService::spawn`], lazily on the first job, and
+/// rebuilt after [`rearm`](LlmService::rearm) (model installed / selection
+/// changed / recovering from a load error).
 pub struct LlmService {
     shared: Arc<(Mutex<Queues>, Condvar)>,
     interactive_pending: Arc<AtomicBool>,
+    load_status: Arc<Mutex<Option<LlmStatus>>>,
+    rebuild_gen: Arc<AtomicU64>,
     _worker: thread::JoinHandle<()>,
 }
 
 impl LlmService {
-    /// Spawn the worker. `make_engine` runs once, on the worker thread, on the
+    /// Spawn the worker. `make_engine` runs on the worker thread, lazily on the
     /// first job — so model loading (slow, fallible) never blocks submission and
-    /// its failure is reported per-job.
+    /// its failure is reported per-job. It is `FnMut`, not `FnOnce`: a failed
+    /// build must not permanently disable building (the not-installed case
+    /// retries on every job; a real error retries after [`rearm`](Self::rearm)).
     pub fn spawn<F>(make_engine: F) -> Self
     where
-        F: FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
+        F: FnMut() -> std::result::Result<Box<dyn Engine>, EngineBuildError> + Send + 'static,
     {
         let shared = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let interactive_pending = Arc::new(AtomicBool::new(false));
+        let load_status = Arc::new(Mutex::new(None));
+        let rebuild_gen = Arc::new(AtomicU64::new(0));
         let worker = {
             let shared = shared.clone();
             let ip = interactive_pending.clone();
-            thread::spawn(move || worker_loop(shared, ip, make_engine))
+            let ls = load_status.clone();
+            let gen = rebuild_gen.clone();
+            thread::spawn(move || worker_loop(shared, ip, ls, gen, make_engine))
         };
         LlmService {
             shared,
             interactive_pending,
+            load_status,
+            rebuild_gen,
             _worker: worker,
         }
     }
@@ -173,6 +196,23 @@ impl LlmService {
     /// Background caller (Map extraction) checks between its per-file jobs.
     pub fn interactive_pending(&self) -> bool {
         self.interactive_pending.load(Ordering::SeqCst)
+    }
+
+    /// The worker-cached load outcome: `None` until a build has been attempted
+    /// (or after [`rearm`](Self::rearm)); `Ready` after a successful load;
+    /// `Error` after a real load failure. The not-installed case deliberately
+    /// leaves this `None` so [`llm_status`] falls through to the file check.
+    pub fn load_status(&self) -> Option<LlmStatus> {
+        self.load_status.lock().unwrap().clone()
+    }
+
+    /// Clear any cached load Error and mark the engine for rebuild on the next
+    /// job: called when a model finishes installing or the Language selection
+    /// changes. Cheap (an atomic bump + a mutex store); the actual (re)load
+    /// happens lazily on the worker when the next job arrives.
+    pub fn rearm(&self) {
+        *self.load_status.lock().unwrap() = None;
+        self.rebuild_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     fn recompute_pending(&self, q: &Queues) {
@@ -261,13 +301,18 @@ impl Drop for LlmService {
 fn worker_loop<F>(
     shared: Arc<(Mutex<Queues>, Condvar)>,
     interactive_pending: Arc<AtomicBool>,
-    make_engine: F,
+    load_status: Arc<Mutex<Option<LlmStatus>>>,
+    rebuild_gen: Arc<AtomicU64>,
+    mut make_engine: F,
 ) where
-    F: FnOnce() -> Result<Box<dyn Engine>>,
+    F: FnMut() -> std::result::Result<Box<dyn Engine>, EngineBuildError>,
 {
     let mut engine: Option<Box<dyn Engine>> = None;
-    let mut make_engine = Some(make_engine);
+    // A cached REAL load failure: jobs fail fast on it (no rebuild churn on a
+    // broken file) until a rearm. The not-installed case never lands here.
     let mut load_err: Option<String> = None;
+    let mut seen_gen = rebuild_gen.load(Ordering::SeqCst);
+    let set_status = |s: Option<LlmStatus>| *load_status.lock().unwrap() = s;
 
     loop {
         // Take the next job: Interactive before Background.
@@ -291,16 +336,42 @@ fn worker_loop<F>(
             }
         };
 
-        // Lazily build the engine on first use.
-        if engine.is_none() && load_err.is_none() {
-            match (make_engine.take().unwrap())() {
-                Ok(e) => engine = Some(e),
-                Err(e) => load_err = Some(e.to_string()),
+        // A rearm (model installed / selection changed / error acknowledged)
+        // drops the current engine and clears the cached error so the build
+        // below runs against the new file.
+        let cur_gen = rebuild_gen.load(Ordering::SeqCst);
+        if cur_gen != seen_gen {
+            seen_gen = cur_gen;
+            engine = None;
+            load_err = None;
+        }
+
+        // (Re)build the engine lazily. `unavailable` is this job's reason when
+        // no engine results; only REAL failures stick in `load_err`/the status.
+        let mut unavailable: Option<String> = None;
+        if engine.is_none() {
+            if let Some(e) = &load_err {
+                unavailable = Some(e.clone());
+            } else {
+                match make_engine() {
+                    Ok(e) => {
+                        engine = Some(e);
+                        set_status(Some(LlmStatus::Ready));
+                    }
+                    Err(EngineBuildError::NotInstalled) => {
+                        // Not a fault: leave the status unset so llm_status
+                        // falls through to the file check (NotInstalled), and
+                        // retry the factory on the next job.
+                        set_status(None);
+                        unavailable = Some("the answers model isn't installed".into());
+                    }
+                    Err(EngineBuildError::Failed(msg)) => {
+                        load_err = Some(msg.clone());
+                        set_status(Some(LlmStatus::Error(msg.clone())));
+                        unavailable = Some(msg);
+                    }
+                }
             }
-            set_load_status(match &load_err {
-                Some(e) => LlmStatus::Error(e.clone()),
-                None => LlmStatus::Ready,
-            });
         }
 
         let Job {
@@ -322,9 +393,7 @@ fn worker_loop<F>(
             eng.generate(&prompt, greedy, &mut cb)
         } else {
             Err(Error::Other(
-                load_err
-                    .clone()
-                    .unwrap_or_else(|| "the local model is unavailable".into()),
+                unavailable.unwrap_or_else(|| "the local model is unavailable".into()),
             ))
         };
 
@@ -338,24 +407,6 @@ fn worker_loop<F>(
             interactive_pending.store(pending, Ordering::SeqCst);
         }
     }
-}
-
-static LOAD_STATUS: OnceLock<Mutex<Option<LlmStatus>>> = OnceLock::new();
-
-fn set_load_status(s: LlmStatus) {
-    let cell = LOAD_STATUS.get_or_init(|| Mutex::new(None));
-    *cell.lock().unwrap() = Some(s);
-}
-
-/// The worker-cached load outcome, read by `llm_status` (Task 4). `None` until
-/// the engine has been built (or its build attempted) at least once.
-#[allow(dead_code)]
-fn cached_load_status() -> Option<LlmStatus> {
-    LOAD_STATUS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone()
 }
 
 // --- Task 4: process-global wiring + the real engine ---
@@ -415,6 +466,22 @@ pub fn interactive_pending() -> bool {
     }
 }
 
+/// A model finished installing, or the Language selection changed: clear any
+/// cached load Error and mark the engine for rebuild so the next job loads the
+/// new/newly-selected file. Cheap, and a no-op until the service has spawned —
+/// safe to call from any download/selection success path.
+pub fn notify_model_installed() {
+    if let Some(svc) = SERVICE.get() {
+        svc.rearm();
+    }
+}
+
+/// The global service's cached load outcome (None until it exists / has built).
+#[allow(dead_code)]
+fn cached_load_status() -> Option<LlmStatus> {
+    SERVICE.get().and_then(|svc| svc.load_status())
+}
+
 /// Pure status precedence, factored out so it is testable without the process
 /// globals: a recorded load `Error` outranks the file check (a present-but-broken
 /// model must not read as `Ready`); otherwise an installed file is `Ready`, and
@@ -444,18 +511,22 @@ pub fn llm_status() -> LlmStatus {
     LlmStatus::NotInstalled
 }
 
-/// Build the real llama.cpp engine from the installed Language model.
+/// Build the real llama.cpp engine from the installed Language model. No file
+/// on disk is `NotInstalled` (retried each job, never a sticky Error); a load
+/// failure on a present file is a real `Failed`.
 #[cfg(feature = "local-llm")]
-fn make_real_engine() -> Result<Box<dyn Engine>> {
-    let path = installed_language_model()
-        .ok_or_else(|| Error::Other("the answers model isn't installed".into()))?;
-    Ok(Box::new(llama::LlamaEngine::load(&path)?))
+fn make_real_engine() -> std::result::Result<Box<dyn Engine>, EngineBuildError> {
+    let path = installed_language_model().ok_or(EngineBuildError::NotInstalled)?;
+    match llama::LlamaEngine::load(&path) {
+        Ok(e) => Ok(Box::new(e)),
+        Err(e) => Err(EngineBuildError::Failed(e.to_string())),
+    }
 }
 
 /// Feature-off stub: no engine, and the error tells the scheduler to report it.
 #[cfg(not(feature = "local-llm"))]
-fn make_real_engine() -> Result<Box<dyn Engine>> {
-    Err(Error::Other(
+fn make_real_engine() -> std::result::Result<Box<dyn Engine>, EngineBuildError> {
+    Err(EngineBuildError::Failed(
         "this build of Ken has no on-device language model".into(),
     ))
 }
@@ -783,7 +854,7 @@ mod tests {
                     scripts,
                     gate: None,
                     started: Arc::new(AtomicUsize::new(0)),
-                    order: Some(order),
+                    order: Some(order.clone()),
                 }) as Box<dyn Engine>)
             })
         };
@@ -820,9 +891,9 @@ mod tests {
                 scripts.push_back(vec!["x".to_string()]);
                 Ok(Box::new(FakeEngine {
                     scripts,
-                    gate: Some(barrier),
-                    started,
-                    order: Some(order),
+                    gate: Some(barrier.clone()),
+                    started: started.clone(),
+                    order: Some(order.clone()),
                 }) as Box<dyn Engine>)
             }))
         };
@@ -871,6 +942,127 @@ mod tests {
         let bi = log.iter().position(|s| s == "B-bg").unwrap();
         assert!(ci < bi, "interactive must run before background: {log:?}");
         assert!(!svc.interactive_pending());
+    }
+
+    #[test]
+    fn not_installed_build_failure_is_not_sticky_and_retries() {
+        use std::sync::atomic::AtomicBool;
+        let installed = Arc::new(AtomicBool::new(false));
+        let svc = {
+            let installed = installed.clone();
+            LlmService::spawn(move || {
+                if installed.load(Ordering::SeqCst) {
+                    Ok(Box::new(FakeEngine::new(&["hi"])) as Box<dyn Engine>)
+                } else {
+                    Err(EngineBuildError::NotInstalled)
+                }
+            })
+        };
+        // First job fails: nothing installed.
+        let err = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap_err();
+        assert!(err.to_string().contains("isn't installed"), "{err}");
+        // The not-installed case is NOT cached as a load Error — status stays
+        // unset, so llm_status falls through to the file check → NotInstalled.
+        assert_eq!(svc.load_status(), None);
+        assert_eq!(status_from(svc.load_status(), None), LlmStatus::NotInstalled);
+        // Model arrives (production also calls notify_model_installed → rearm;
+        // the not-installed case retries even without it, since the factory was
+        // not consumed by the failed build).
+        installed.store(true, Ordering::SeqCst);
+        svc.rearm();
+        let out = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap();
+        assert_eq!(out, "hi");
+        assert_eq!(svc.load_status(), Some(LlmStatus::Ready));
+    }
+
+    #[test]
+    fn not_installed_retries_even_without_rearm() {
+        use std::sync::atomic::AtomicBool;
+        let installed = Arc::new(AtomicBool::new(false));
+        let svc = {
+            let installed = installed.clone();
+            LlmService::spawn(move || {
+                if installed.load(Ordering::SeqCst) {
+                    Ok(Box::new(FakeEngine::new(&["hi"])) as Box<dyn Engine>)
+                } else {
+                    Err(EngineBuildError::NotInstalled)
+                }
+            })
+        };
+        let _ = svc.run("q", false, Priority::Interactive, &mut |_| true);
+        installed.store(true, Ordering::SeqCst);
+        // No rearm: the next job still retries the (unconsumed) factory.
+        let out = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap();
+        assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn real_load_error_is_sticky_until_rearmed() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let svc = {
+            let attempts = attempts.clone();
+            LlmService::spawn(move || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(EngineBuildError::Failed("corrupt model".into()))
+                } else {
+                    Ok(Box::new(FakeEngine::new(&["ok"])) as Box<dyn Engine>)
+                }
+            })
+        };
+        // First job: the build fails for real → cached Error, reported to the job.
+        let err = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap_err();
+        assert!(err.to_string().contains("corrupt model"), "{err}");
+        assert_eq!(svc.load_status(), Some(LlmStatus::Error("corrupt model".into())));
+        // A real Error outranks a present file in the status precedence.
+        assert_eq!(
+            status_from(svc.load_status(), Some(std::path::PathBuf::from("/m.gguf"))),
+            LlmStatus::Error("corrupt model".into())
+        );
+        // Without rearm, jobs fail fast on the cached error; no rebuild attempt.
+        let err2 = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap_err();
+        assert!(err2.to_string().contains("corrupt model"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "factory not retried while stuck");
+        // notify_model_installed's per-service effect: clear the error + rebuild.
+        svc.rearm();
+        assert_eq!(svc.load_status(), None, "rearm clears the cached error");
+        let out = svc
+            .run("q", false, Priority::Interactive, &mut |_| true)
+            .unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(svc.load_status(), Some(LlmStatus::Ready));
+    }
+
+    #[test]
+    fn rearm_rebuilds_a_working_engine_with_the_new_selection() {
+        // Switching 4B↔8B calls notify_model_installed: the worker drops the
+        // loaded engine and rebuilds from the (newly selected) file on the next
+        // job. Each factory call yields a fresh scripted engine here.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let svc = {
+            let attempts = attempts.clone();
+            LlmService::spawn(move || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 { "first" } else { "second" };
+                Ok(Box::new(FakeEngine::new(&[text])) as Box<dyn Engine>)
+            })
+        };
+        let out = svc.run("q", false, Priority::Interactive, &mut |_| true).unwrap();
+        assert_eq!(out, "first");
+        svc.rearm();
+        let out = svc.run("q", false, Priority::Interactive, &mut |_| true).unwrap();
+        assert_eq!(out, "second", "rearm swapped in a freshly built engine");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

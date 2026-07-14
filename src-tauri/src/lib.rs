@@ -1750,7 +1750,17 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
         // Installed size is read from disk on the next status/list call, so a
         // successful install needs no cache mutation here.
         match model::download_to(&model::HttpSource, &spec, &base, on_progress) {
-            Ok(()) => {}
+            Ok(()) => {
+                // A newly installed Language model clears any cached LLM load
+                // error and re-arms the engine build (cheap; no-op before the
+                // service spawns). Transcription installs don't touch the LLM.
+                let is_language = model::category_specs(model::ModelCategory::Language)
+                    .iter()
+                    .any(|s| s.id == spec.id);
+                if is_language {
+                    ken_core::local_llm::notify_model_installed();
+                }
+            }
             Err(e) => {
                 let _ = app.emit(
                     "model-download-error",
@@ -1789,7 +1799,13 @@ fn set_model_selection(state: State<SharedState>, category: String, id: String) 
         "language" => model::ModelCategory::Language,
         other => return Err(format!("unknown model category: {other}")),
     };
-    model::set_selected(&base, cat, &id).map_err(err)
+    model::set_selected(&base, cat, &id).map_err(err)?;
+    if cat == model::ModelCategory::Language {
+        // Switching 4B↔8B: rebuild the engine with the newly selected file on
+        // the next job (cheap flag flip; no-op before the service spawns).
+        ken_core::local_llm::notify_model_installed();
+    }
+    Ok(())
 }
 
 // ---------- ingest commands ----------
