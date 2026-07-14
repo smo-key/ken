@@ -43,7 +43,7 @@ impl Default for EngineConfig {
         EngineConfig {
             binary: None,
             timeout: Duration::from_secs(15 * 60),
-            debounce: Duration::from_secs(30),
+            debounce: Duration::from_secs(10),
         }
     }
 }
@@ -474,6 +474,11 @@ mod tests {
             }
         }
         panic!("never saw status {wanted}");
+    }
+
+    #[test]
+    fn default_debounce_is_ten_seconds() {
+        assert_eq!(EngineConfig::default().debounce, Duration::from_secs(10));
     }
 
     #[test]
