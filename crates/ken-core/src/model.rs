@@ -42,6 +42,43 @@ pub const WHISPER_LARGE_TURBO_FILE: &str = "ggml-large-v3-turbo.bin";
 /// server's Content-Length.
 pub const WHISPER_LARGE_TURBO_BYTES: u64 = 1_624_555_275;
 
+// ---------- Language models (spec §1 / §10 "Answers & Map") ----------
+
+/// Recommended answers/Map model: Qwen3-4B-Instruct-2507, Q4_K_M GGUF (~2.5 GB).
+/// The official `Qwen/...GGUF` repo is gated (needs auth), so we serve the
+/// public `unsloth` mirror of the identical quant — Ken downloads without
+/// credentials.
+pub const LANG_4B_FILE: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+pub const LANG_4B_URL: &str = "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+pub const LANG_4B_BYTES: u64 = 2_497_281_120;
+
+/// Advanced answers/Map model: Qwen3-8B, Q4_K_M GGUF (~5 GB), official repo.
+pub const LANG_8B_FILE: &str = "Qwen3-8B-Q4_K_M.gguf";
+pub const LANG_8B_URL: &str = "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf";
+pub const LANG_8B_BYTES: u64 = 5_027_783_488;
+
+fn lang_recommended_spec() -> ModelSpec {
+    ModelSpec {
+        id: LANG_4B_FILE.to_string(),
+        name: "Qwen3 4B".to_string(),
+        file: LANG_4B_FILE.to_string(),
+        url: LANG_4B_URL.to_string(),
+        expected_bytes: LANG_4B_BYTES,
+        recommended: true,
+    }
+}
+
+fn lang_advanced_spec() -> ModelSpec {
+    ModelSpec {
+        id: LANG_8B_FILE.to_string(),
+        name: "Qwen3 8B".to_string(),
+        file: LANG_8B_FILE.to_string(),
+        url: LANG_8B_URL.to_string(),
+        expected_bytes: LANG_8B_BYTES,
+        recommended: false,
+    }
+}
+
 /// One downloadable model's download identity. `id` is the file name, which is
 /// stable and unique within the repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,10 +146,24 @@ fn transcription_catalog() -> Vec<CatalogEntry> {
     ]
 }
 
-/// Language models (Answers & Map) are appended by the local-LLM plan; the
-/// category and structure exist now so that plan only adds entries here.
+/// The curated "Answers & Map" language models (spec §1 / §10) — the seam
+/// `catalog()` concatenates. Recommended = Qwen3 4B (instant); Advanced =
+/// Qwen3 8B (smarter, heavier).
 fn language_catalog() -> Vec<CatalogEntry> {
-    Vec::new()
+    vec![
+        CatalogEntry {
+            category: ModelCategory::Language,
+            tier: ModelTier::Recommended,
+            blurb: "instant answers, builds your map",
+            spec: lang_recommended_spec(),
+        },
+        CatalogEntry {
+            category: ModelCategory::Language,
+            tier: ModelTier::Advanced,
+            blurb: "smarter answers, needs more memory",
+            spec: lang_advanced_spec(),
+        },
+    ]
 }
 
 /// Every curated model, in display order (Transcription, then Language).
@@ -518,6 +569,36 @@ mod tests {
         // Blurbs are the exact Settings copy.
         assert_eq!(rec.blurb, "fast, accurate for meetings");
         assert_eq!(adv.blurb, "best accuracy, understands more languages, slower");
+    }
+
+    #[test]
+    fn language_catalog_has_qwen3_4b_and_8b() {
+        let lang: Vec<_> = catalog()
+            .into_iter()
+            .filter(|e| e.category == ModelCategory::Language)
+            .collect();
+        assert_eq!(lang.len(), 2);
+        let rec = lang.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
+        assert_eq!(rec.spec.file, "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+        assert_eq!(rec.spec.expected_bytes, 2_497_281_120);
+        assert!(rec.spec.url.starts_with("https://huggingface.co/unsloth/"));
+        assert_eq!(rec.blurb, "instant answers, builds your map");
+        let adv = lang.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
+        assert_eq!(adv.spec.file, "Qwen3-8B-Q4_K_M.gguf");
+        assert_eq!(adv.spec.expected_bytes, 5_027_783_488);
+        assert_eq!(adv.blurb, "smarter answers, needs more memory");
+
+        // With no selection.json in a fresh base_dir, selected(Language) defaults
+        // to the recommended 4B; nothing installed → no loadable path.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            selected(dir.path(), ModelCategory::Language).file,
+            rec.spec.file
+        );
+        assert_eq!(
+            selected_model_path(dir.path(), ModelCategory::Language),
+            None
+        );
     }
 
     #[test]
