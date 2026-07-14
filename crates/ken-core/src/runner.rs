@@ -562,7 +562,7 @@ if [ "$HEADLESS" = "1" ] && [ "$OUTFMT" = "stream-json" ]; then
 ' > "$STAGING/knowledge/People.md"
       fi
       # Automation phase-1 announces a proposal file to write.
-      PROPOSAL=$(echo "$PROMPT" | grep -o 'PROPOSAL_FILE=[^ ]*' | head -1 | cut -d= -f2-)
+      PROPOSAL=$(echo "$PROMPT" | grep -o 'PROPOSAL_FILE=[^ `]*' | head -1 | cut -d= -f2-)
       if [ -n "$PROPOSAL" ]; then
         mkdir -p "$(dirname "$PROPOSAL")" 2>/dev/null
         printf '%s' '## Proposed actions

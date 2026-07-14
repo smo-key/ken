@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
+use crate::automation;
 use crate::db::Db;
 use crate::hooks::{install_hooks, HookListener};
 use crate::project::Project;
@@ -124,6 +125,9 @@ struct PendingJob {
 
 enum Msg {
     Trigger { kind: RunKind, slug: String, force_full: bool },
+    /// Phase-2 automation run: carry the approved proposal text through to
+    /// the worker as a due-now `PendingJob { apply: Some(..) }`.
+    ApplyAutomation { slug: String, proposal: String },
     SourcesChanged(Vec<String>),
     Shutdown,
 }
@@ -183,6 +187,21 @@ impl IngestEngine {
                                 force_full,
                                 matched: vec![],
                                 apply: None,
+                            },
+                        );
+                        announced_queued.remove(&key);
+                    }
+                    Ok(Msg::ApplyAutomation { slug, proposal }) => {
+                        // Approved phase-2 run: due immediately, carries the
+                        // proposal text so the worker runs the apply prompt.
+                        let key = QueueKey { kind: RunKind::Automation, slug };
+                        pending.insert(
+                            key.clone(),
+                            PendingJob {
+                                deadline: Instant::now(),
+                                force_full: false,
+                                matched: vec![],
+                                apply: Some(proposal),
                             },
                         );
                         announced_queued.remove(&key);
@@ -298,14 +317,36 @@ impl IngestEngine {
                                 }));
                             }
                             RunKind::Automation => {
-                                // Automation dispatch lands with the automation
-                                // tasks; no automation job is enqueued yet. Skip
-                                // (never panic) so a mis-wired enqueue can't kill
-                                // the worker and silently stop all ingests.
-                                eprintln!(
-                                    "ken-core engine: dropped automation job '{}' — dispatch not implemented yet",
-                                    key.slug
-                                );
+                                // Claim the worker synchronously (before the loop
+                                // spins again) so the next iteration sees it busy.
+                                let token = CancelToken::new();
+                                *current_thread.lock().unwrap() =
+                                    Some((key.slug.clone(), token.clone()));
+                                let project_root = project_root.clone();
+                                let db_path = db_path.clone();
+                                let hooks = hooks.clone();
+                                let cfg = cfg.clone();
+                                let on_event = on_event.clone();
+                                let current = current_thread.clone();
+                                let slug = key.slug.clone();
+                                run_handle = Some(std::thread::spawn(move || {
+                                    if let Ok(mut db) = Db::open_at(&db_path) {
+                                        execute_automation(
+                                            &project_root,
+                                            &mut db,
+                                            &hooks,
+                                            &cfg,
+                                            &current,
+                                            &slug,
+                                            &job,
+                                            &on_event,
+                                        );
+                                    }
+                                    // Always release the worker (execute_automation
+                                    // also clears it after the run — setting None
+                                    // twice is harmless).
+                                    *current.lock().unwrap() = None;
+                                }));
                             }
                         }
                     }
@@ -335,6 +376,24 @@ impl IngestEngine {
             kind: RunKind::Ingest,
             slug: slug.to_string(),
             force_full,
+        });
+    }
+
+    /// Run-now for an automation: enqueue a due-now automation job (phase-1
+    /// proposal, or a direct run when the automation is `auto_apply`).
+    pub fn run_automation(&self, slug: &str) {
+        let _ = self.tx.send(Msg::Trigger {
+            kind: RunKind::Automation,
+            slug: slug.to_string(),
+            force_full: false,
+        });
+    }
+
+    /// Queue the phase-2 "carry out the approved actions" run for an automation.
+    pub fn apply_automation(&self, slug: &str, proposal: &str) {
+        let _ = self.tx.send(Msg::ApplyAutomation {
+            slug: slug.to_string(),
+            proposal: proposal.to_string(),
         });
     }
 
@@ -583,6 +642,216 @@ fn execute_ingest(
     }
 }
 
+enum Phase {
+    Propose,
+    Direct,
+    Apply,
+}
+
+/// Run one automation through the streaming headless runner. Mirrors
+/// `execute_ingest`'s wiring but branches on phase: phase-1 (`Propose`) writes a
+/// proposal and stages an `automation-proposal` review item; `Direct`
+/// (auto_apply) and `Apply` (approved) both act and record a `fresh` run.
+#[allow(clippy::too_many_arguments)]
+fn execute_automation(
+    project_root: &PathBuf,
+    db: &mut Db,
+    hooks: &HookListener,
+    cfg: &EngineConfig,
+    current: &Arc<Mutex<Option<(String, CancelToken)>>>,
+    slug: &str,
+    job: &PendingJob,
+    on_event: &Arc<dyn Fn(IngestEvent) + Send + Sync>,
+) {
+    let emit_fail = |run_id: i64, detail: String| {
+        on_event(IngestEvent::at("automation", slug, run_id, None, "failed", Some(detail)));
+    };
+    let project = match Project::open(project_root) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_fail(0, e.to_string());
+            return;
+        }
+    };
+    let a = match automation::load_slug(&project, slug) {
+        Ok(a) => a,
+        Err(e) => {
+            emit_fail(0, e.to_string());
+            return;
+        }
+    };
+    if !a.enabled && job.apply.is_none() {
+        return;
+    }
+
+    // Matched files: from the queued change, else recompute from the index for
+    // a run-now / apply.
+    let matched: Vec<String> = if !job.matched.is_empty() {
+        job.matched.clone()
+    } else {
+        db.list_files()
+            .map(|files| {
+                files
+                    .into_iter()
+                    .filter(|f| f.status == "indexed")
+                    .map(|f| f.rel_path)
+                    .filter(|p| automation::triggers(&a, &[p.clone()]).len() == 1)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Fresh staging dir for a proposal file (reuse the refresh staging root).
+    let staging = refresh::staging_dir(&project.root, &format!("auto-{slug}"));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        emit_fail(0, e.to_string());
+        return;
+    }
+
+    let phase = if job.apply.is_some() {
+        Phase::Apply
+    } else if a.auto_apply {
+        Phase::Direct
+    } else {
+        Phase::Propose
+    };
+    let prompt = match &phase {
+        Phase::Apply => automation::apply_prompt(&a, job.apply.as_deref().unwrap_or("")),
+        Phase::Direct => automation::direct_prompt(&a, &matched),
+        Phase::Propose => automation::proposal_prompt(&a, &matched, &staging),
+    };
+
+    let binary = cfg
+        .binary
+        .clone()
+        .or_else(runner::discover_claude)
+        .unwrap_or_else(|| PathBuf::from("claude-not-found"));
+    let session_id = Uuid::new_v4().to_string();
+    let run_id = match db.insert_run_kind(slug, Some(&session_id), now_epoch(), "automation") {
+        Ok(id) => id,
+        Err(e) => {
+            emit_fail(0, e.to_string());
+            return;
+        }
+    };
+    on_event(IngestEvent::at(
+        "automation",
+        slug,
+        run_id,
+        Some(session_id.clone()),
+        "running",
+        None,
+    ));
+
+    let token = CancelToken::new();
+    *current.lock().unwrap() = Some((slug.to_string(), token.clone()));
+    let runner_cfg = RunnerConfig {
+        binary,
+        mode: RunnerMode::Headless,
+        timeout: cfg.timeout,
+    };
+    let started = Instant::now();
+    let outcome = {
+        let act = on_event.clone();
+        let a_slug = slug.to_string();
+        let a_sid = session_id.clone();
+        runner::run_ingest_session(
+            &runner_cfg,
+            &project.root,
+            &session_id,
+            &prompt,
+            hooks,
+            &token,
+            || {}, // headless never blocks on an interactive gate
+            move |line: &str| {
+                act(IngestEvent {
+                    activity: Some(line.to_string()),
+                    elapsed_secs: Some(started.elapsed().as_secs()),
+                    ..IngestEvent::at(
+                        "automation",
+                        &a_slug,
+                        run_id,
+                        Some(a_sid.clone()),
+                        "running",
+                        None,
+                    )
+                });
+            },
+        )
+    };
+    *current.lock().unwrap() = None;
+
+    let finish = |db: &mut Db, status: &str, summary: Option<&str>, error: Option<&str>| {
+        let _ = db.update_run(run_id, status, Some(now_epoch()), summary, error, None);
+        on_event(IngestEvent::at(
+            "automation",
+            slug,
+            run_id,
+            Some(session_id.clone()),
+            status,
+            summary.or(error).map(String::from),
+        ));
+    };
+
+    match outcome {
+        Ok(RunOutcome::Completed) => match phase {
+            Phase::Propose => {
+                let proposal =
+                    std::fs::read_to_string(staging.join("proposal.md")).unwrap_or_default();
+                let _ = std::fs::remove_dir_all(&staging);
+                if proposal.trim().is_empty() {
+                    finish(db, "fresh", Some("Checked — nothing to propose."), None);
+                    return;
+                }
+                let payload =
+                    serde_json::json!({ "automationSlug": slug, "matched": matched }).to_string();
+                let _ = db.insert_review_item(
+                    "automation-proposal",
+                    &format!("{} — proposal", a.name),
+                    &proposal,
+                    slug,
+                    Some(&payload),
+                    now_epoch(),
+                );
+                finish(db, "fresh", Some("Proposed actions — awaiting your approval."), None);
+            }
+            Phase::Direct => {
+                let _ = std::fs::remove_dir_all(&staging);
+                finish(db, "fresh", Some("Ran and applied."), None);
+            }
+            Phase::Apply => {
+                let _ = std::fs::remove_dir_all(&staging);
+                finish(db, "fresh", Some("Approved actions carried out."), None);
+            }
+        },
+        Ok(RunOutcome::Cancelled) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            finish(db, "cancelled", Some("Cancelled."), None);
+        }
+        Ok(RunOutcome::TimedOut(tail)) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            finish(
+                db,
+                "failed",
+                None,
+                Some(&format!(
+                    "The run didn't finish within {} minutes and was stopped.\n{tail}",
+                    cfg.timeout.as_secs() / 60
+                )),
+            );
+        }
+        Ok(RunOutcome::Failed(d)) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            finish(db, "failed", None, Some(&d));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            finish(db, "failed", None, Some(&e.to_string()));
+        }
+    }
+}
+
 /// Apply a held run's staged output (explicit user approval).
 pub fn approve_run(project: &Project, db: &mut Db, run_id: i64) -> Result<()> {
     let run = db
@@ -707,6 +976,21 @@ mod tests {
             engine,
             events,
         }
+    }
+
+    fn rig_with_automation(behavior: &str, auto_apply: bool) -> Rig {
+        let r = rig(behavior);
+        let a = crate::automation::Automation {
+            slug: "weekly".into(),
+            name: "Weekly".into(),
+            globs: vec!["notes/*.md".into()],
+            prompt: "Summarize notes and propose follow-up tasks.".into(),
+            auto_apply,
+            enabled: true,
+            extra: serde_yaml::Mapping::new(),
+        };
+        crate::automation::save(&r.project, &a).unwrap();
+        r
     }
 
     fn wait_status(events: &Receiver<IngestEvent>, wanted: &str, secs: u64) -> IngestEvent {
@@ -986,5 +1270,41 @@ mod tests {
         );
         assert_eq!(db.get_run(held.run_id).unwrap().unwrap().status, "discarded");
         assert!(!refresh::staging_dir(&r.project.root, "people").exists());
+    }
+
+    #[test]
+    fn automation_phase1_stages_a_proposal_review_item() {
+        let r = rig_with_automation("complete", false);
+        r.engine.run_automation("weekly");
+        // Automation run logs as an automation-kind run and completes.
+        let done = wait_status(&r.events, "fresh", 20);
+        assert_eq!(done.kind, "automation");
+        let db = Db::open_at(&r.db_path).unwrap();
+        // A proposal review item was staged.
+        let items = db.list_open_review_items().unwrap();
+        let prop = items.iter().find(|i| i.kind == "automation-proposal").expect("proposal");
+        assert!(prop.body.contains("Proposed actions"));
+        assert_eq!(prop.source_ref, "weekly");
+        // The automation run itself is recorded under kind=automation.
+        assert!(!db.list_runs_of_kind("weekly", "automation", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn automation_auto_apply_runs_single_session_to_fresh() {
+        let r = rig_with_automation("complete", true);
+        r.engine.run_automation("weekly");
+        let done = wait_status(&r.events, "fresh", 20);
+        assert_eq!(done.kind, "automation");
+        let db = Db::open_at(&r.db_path).unwrap();
+        // No proposal item for an auto-apply automation.
+        assert!(db.list_open_review_items().unwrap().iter().all(|i| i.kind != "automation-proposal"));
+    }
+
+    #[test]
+    fn automation_apply_phase_runs_from_proposal() {
+        let r = rig_with_automation("complete", false);
+        r.engine.apply_automation("weekly", "## Proposed actions\n- do the thing");
+        let done = wait_status(&r.events, "fresh", 20);
+        assert_eq!(done.kind, "automation");
     }
 }
