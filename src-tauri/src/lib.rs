@@ -1123,6 +1123,12 @@ fn record_request_permission(kind: String) -> CmdResult<()> {
 /// its argument against the project root as a file path.
 #[tauri::command]
 fn record_open_settings(app: AppHandle, url: String) -> CmdResult<()> {
+    // Routing through Rust bypasses the frontend `opener:default` scope for ANY
+    // scheme, so validate server-side: only the two known macOS privacy deep
+    // links may open — anything else (file:, arbitrary app schemes) is refused.
+    if url != record::MIC_SETTINGS_URL && url != record::SCREEN_SETTINGS_URL {
+        return Err("refused to open an unrecognized settings URL".into());
+    }
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_url(url, None::<&str>)
         .map_err(err)
@@ -1407,8 +1413,11 @@ fn finish_recording(
     let body = if storage == "audio" {
         record::AUDIO_ONLY_NOTE.to_string()
     } else {
-        // Transcribe each present channel from its moved location.
-        let model = transcript::model_path(_base);
+        // Transcribe each present channel from its moved location, honouring the
+        // user's selected transcription model (§10) — same resolution as the
+        // other transcription call sites, not the hard-coded Base constant.
+        let model = model::selected_model_path(_base, model::ModelCategory::Transcription)
+            .unwrap_or_else(|| transcript::model_path(_base));
         let transcribe_all = || -> CmdResult<String> {
             if !model.is_file() {
                 return Err("Download a transcription model in Settings to make transcripts.".into());
