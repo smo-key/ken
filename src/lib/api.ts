@@ -406,6 +406,10 @@ export const api = {
   reindex: () => invoke<ScanStats>("reindex"),
   moveFile: (fromRel: string, toRel: string) =>
     invoke<void>("move_file", { fromRel, toRel }),
+  createFolder: (relPath: string) => invoke<void>("create_folder", { relPath }),
+  /** Returns the FINAL rel path (the name may have been deduped). */
+  createDocument: (relPath: string) =>
+    invoke<string>("create_document", { relPath }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
 
   /// Copy an external file into a staging area so it can be previewed pre-placement.

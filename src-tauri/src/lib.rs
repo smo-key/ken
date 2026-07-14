@@ -907,13 +907,19 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
 #[cfg(unix)]
 const EXDEV: i32 = 18;
 
-/// Move a file within the project. Both paths are validated to stay inside the
-/// project root (`resolve` rejects `..`/absolute escapes); overwriting an
-/// existing file is refused. The state guard is dropped across the rename, then
-/// re-taken to refresh the index for both paths so search stays correct before
-/// the watcher fires.
+/// Move a file OR folder within the project. Both paths are validated to stay
+/// inside the project root (`resolve` rejects `..`/absolute escapes); overwriting
+/// an existing destination is refused. Folder moves (same-parent rename or a
+/// full move) rename the directory, then reconcile child index rows through the
+/// standard rescan — the same reconciliation the watcher does, but synchronous
+/// so the caller's tree refresh already sees it.
 #[tauri::command]
-fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> CmdResult<()> {
+fn move_file(
+    app: AppHandle,
+    state: State<SharedState>,
+    from_rel: String,
+    to_rel: String,
+) -> CmdResult<()> {
     let (from_abs, to_abs) = {
         let guard = state.lock().unwrap();
         let active = guard.active.as_ref().ok_or("no project open")?;
@@ -925,8 +931,12 @@ fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> Cmd
     if from_abs == to_abs {
         return Ok(());
     }
-    if !from_abs.is_file() {
-        return Err("That file no longer exists.".to_string());
+    if ken_core::fsops::is_into_own_subtree(&from_rel, &to_rel) {
+        return Err("A folder can't be moved into itself.".to_string());
+    }
+    let from_is_dir = from_abs.is_dir();
+    if !from_abs.is_file() && !from_is_dir {
+        return Err("That file or folder no longer exists.".to_string());
     }
     if to_abs.exists() {
         let name = to_abs
@@ -943,6 +953,12 @@ fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> Cmd
         Ok(()) => {}
         #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            if from_is_dir {
+                return Err(
+                    "That folder can't be moved across drives from here — move it in Finder instead."
+                        .to_string(),
+                );
+            }
             std::fs::copy(&from_abs, &to_abs).map_err(err)?;
             std::fs::remove_file(&from_abs).map_err(err)?;
         }
@@ -951,9 +967,82 @@ fn move_file(state: State<SharedState>, from_rel: String, to_rel: String) -> Cmd
 
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
-    scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
-    scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
+    if from_is_dir {
+        // Drop the old subtree's rows, then rescan so every child re-indexes at
+        // its new path (unchanged files elsewhere are skipped by the scanner).
+        active.db.remove_folder(&from_rel).map_err(err)?;
+        let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
+        let videos = stats.videos_needing_transcript.clone();
+        drop(guard);
+        enqueue_transcriptions(&app, state.inner(), &videos);
+        let _ = app.emit("index-updated", stats);
+    } else {
+        scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
+        scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
+    }
     Ok(())
+}
+
+/// Create a folder. Fails when something with that name already exists (the UI
+/// validates sibling names first; this is the race-safety backstop). Folders
+/// aren't index rows — the tree walks them off disk — so no refresh is needed;
+/// the caller's tree refresh picks it up.
+#[tauri::command]
+fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    if abs.exists() {
+        let name = rel_path.rsplit('/').next().unwrap_or(&rel_path);
+        return Err(format!("\u{201c}{name}\u{201d} already exists here."));
+    }
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::create_dir(&abs).map_err(err)?;
+    Ok(())
+}
+
+/// Create an empty markdown document. `rel_path` names the desired location
+/// (e.g. "Meetings/Untitled.md"); a collision dedupes with a counter
+/// ("Untitled 2.md", …) rather than failing, and the FINAL project-relative
+/// path is returned so the UI opens the tab it actually created. The new file
+/// is indexed immediately so search and the tree stay correct before the
+/// watcher fires.
+#[tauri::command]
+fn create_document(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let desired_abs = active.project.resolve(&rel_path).map_err(err)?;
+    let dir = desired_abs
+        .parent()
+        .ok_or_else(|| "invalid document path".to_string())?
+        .to_path_buf();
+    let name = desired_abs
+        .file_name()
+        .ok_or_else(|| "invalid document name".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let final_name = ken_core::fsops::numbered_name(&name, |c| dir.join(c).exists());
+    let abs = dir.join(&final_name);
+    // create_new: never clobber a file that appeared between the dedupe and now.
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&abs)
+        .map_err(err)?;
+    let folder = match rel_path.rfind('/') {
+        Some(i) => &rel_path[..i],
+        None => "",
+    };
+    let final_rel = if folder.is_empty() {
+        final_name
+    } else {
+        format!("{folder}/{final_name}")
+    };
+    scan::refresh_path(&active.project, &mut active.db, &final_rel).map_err(err)?;
+    Ok(final_rel)
 }
 
 // ---------- file import ----------
@@ -3446,6 +3535,8 @@ pub fn run() {
             extracted_text,
             reindex,
             move_file,
+            create_folder,
+            create_document,
             import_begin,
             import_classify,
             import_commit,
