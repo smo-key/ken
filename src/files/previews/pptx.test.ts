@@ -364,6 +364,55 @@ describe("parseSlide — group transforms", () => {
   });
 });
 
+const TABLE_REAL =
+  `<p:graphicFrame><p:nvGraphicFramePr/>` +
+  `<p:xfrm><a:off x="333828" y="1571865"/><a:ext cx="11562516" cy="4770281"/></p:xfrm>` +
+  `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">` +
+  `<a:tbl><a:tblPr/>` +
+  `<a:tblGrid><a:gridCol w="2485572"/><a:gridCol w="6134758"/></a:tblGrid>` +
+  `<a:tr h="361559">` +
+  `<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>Component</a:t></a:r></a:p></a:txBody><a:tcPr anchor="ctr"/></a:tc>` +
+  `<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>Recommended Options</a:t></a:r></a:p></a:txBody><a:tcPr anchor="ctr"/></a:tc>` +
+  `</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
+
+const TABLE_SPANS =
+  `<p:graphicFrame>` +
+  `<p:xfrm><a:off x="0" y="0"/><a:ext cx="1905000" cy="952500"/></p:xfrm>` +
+  `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">` +
+  `<a:tbl><a:tblGrid><a:gridCol w="952500"/><a:gridCol w="952500"/></a:tblGrid>` +
+  `<a:tr h="476250">` +
+  `<a:tc gridSpan="2"><a:txBody><a:p><a:r><a:t>Header</a:t></a:r></a:p></a:txBody>` +
+  `<a:tcPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></a:tcPr></a:tc>` +
+  `<a:tc hMerge="1"><a:txBody><a:p/></a:txBody><a:tcPr/></a:tc>` +
+  `</a:tr>` +
+  `<a:tr h="476250">` +
+  `<a:tc rowSpan="1"><a:txBody><a:p><a:r><a:t>A</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>` +
+  `<a:tc><a:txBody><a:p><a:r><a:t>B</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>` +
+  `</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
+
+describe("parseSlide — tables", () => {
+  it("parses a graphicFrame table: position, column widths, cell text", () => {
+    const [s] = parseSlide(slide(TABLE_REAL)).shapes;
+    expect(s.kind).toBe("table");
+    expect(s.x).toBeCloseTo(333828 / 9525, 2);
+    expect(s.w).toBeCloseTo(11562516 / 9525, 2);
+    expect(s.table!.colWidths.map(Math.round)).toEqual([261, 644]); // 2485572,6134758 /9525
+    expect(s.table!.rows).toHaveLength(1);
+    expect(s.table!.rows[0].cells[0].paragraphs[0].runs[0].text).toBe("Component");
+    expect(s.table!.rows[0].cells[1].paragraphs[0].runs[0].text).toBe("Recommended Options");
+  });
+
+  it("captures gridSpan, hMerge/vMerge continuation, and tcPr fill via the theme", () => {
+    const theme = parseTheme(THEME1, MASTER1);
+    const [s] = parseSlide(slide(TABLE_SPANS), theme).shapes;
+    const head = s.table!.rows[0].cells[0];
+    expect(head.gridSpan).toBe(2);
+    expect(head.fill).toBe("#4472C4");
+    expect(s.table!.rows[0].cells[1].hMerge).toBe(true); // continuation → view skips it
+    expect(s.table!.rows[1].cells[0].paragraphs[0].runs[0].text).toBe("A");
+  });
+});
+
 describe("parseSlide — the repo fixture deck", () => {
   it("still reads text from a bare slide that has no positions at all", () => {
     // Mirrors crates/ken-core/fixtures/.../deck.pptx slide1 (no xfrm, no rels).

@@ -493,8 +493,9 @@ function parseParagraph(p: Element, theme?: ThemeContext): Paragraph {
   return { runs, align, level, bullet };
 }
 
-function paragraphsOf(sp: Element, theme?: ThemeContext): Paragraph[] {
-  const body = firstChildTag(sp, "p:txBody");
+function paragraphsOf(el: Element, theme?: ThemeContext): Paragraph[] {
+  // Shapes carry p:txBody; table cells carry a:txBody.
+  const body = firstChildTag(el, "p:txBody") ?? firstChildTag(el, "a:txBody");
   if (!body) return [];
   return Array.from(body.getElementsByTagName("a:p"))
     .map((p) => parseParagraph(p, theme))
@@ -613,6 +614,62 @@ function parsePic(pic: Element, ctx: Ctx = IDENTITY): Shape | null {
   };
 }
 
+/** p:graphicFrame uses p:xfrm (a:off/a:ext), no chOff/chExt. */
+function frameXfrm(frame: Element): Pick<Shape, "x" | "y" | "w" | "h"> {
+  const xfrm = firstChildTag(frame, "p:xfrm");
+  const off = xfrm && firstChildTag(xfrm, "a:off");
+  const ext = xfrm && firstChildTag(xfrm, "a:ext");
+  if (!off || !ext) return { x: null, y: null, w: null, h: null };
+  return {
+    x: emuToPx(Number(off.getAttribute("x") ?? 0)),
+    y: emuToPx(Number(off.getAttribute("y") ?? 0)),
+    w: emuToPx(Number(ext.getAttribute("cx") ?? 0)),
+    h: emuToPx(Number(ext.getAttribute("cy") ?? 0)),
+  };
+}
+
+function parseTableCell(tc: Element, theme?: ThemeContext): TableCell {
+  const tcPr = firstChildTag(tc, "a:tcPr");
+  const anchorAttr = tcPr?.getAttribute("anchor");
+  return {
+    paragraphs: paragraphsOf(tc, theme),
+    fill: resolveColor(tcPr, theme),
+    gridSpan: Number(tc.getAttribute("gridSpan")) || 1,
+    rowSpan: Number(tc.getAttribute("rowSpan")) || 1,
+    hMerge: tc.getAttribute("hMerge") === "1",
+    vMerge: tc.getAttribute("vMerge") === "1",
+    anchor: anchorAttr === "ctr" ? "center" : anchorAttr === "b" ? "bottom" : "top",
+  };
+}
+
+function parseGraphicFrame(
+  frame: Element,
+  theme?: ThemeContext,
+  ctx: Ctx = IDENTITY,
+): Shape | null {
+  const tbl = firstChildTag(frame, "a:tbl");
+  if (!tbl) return null; // charts/diagrams/oleObjects: unsupported in v1
+  const grid = firstChildTag(tbl, "a:tblGrid");
+  const colWidths = grid
+    ? Array.from(grid.getElementsByTagName("a:gridCol")).map((c) =>
+        emuToPx(Number(c.getAttribute("w") ?? 0)))
+    : [];
+  const rows: TableRow[] = Array.from(tbl.getElementsByTagName("a:tr")).map((tr) => ({
+    height: tr.getAttribute("h") ? emuToPx(Number(tr.getAttribute("h"))) : null,
+    cells: Array.from(tr.children)
+      .filter((c) => c.tagName === "a:tc")
+      .map((tc) => parseTableCell(tc, theme)),
+  }));
+  return {
+    kind: "table",
+    ...applyCtx(ctx, frameXfrm(frame)),
+    paragraphs: [],
+    isTitle: false,
+    anchor: "top",
+    table: { colWidths, rows },
+  };
+}
+
 export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide {
   const doc = parseXml(slideXml);
   const tree =
@@ -628,6 +685,9 @@ export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide 
         if (s) shapes.push(s);
       } else if (el.tagName === "p:pic") {
         const s = parsePic(el, ctx);
+        if (s) shapes.push(s);
+      } else if (el.tagName === "p:graphicFrame") {
+        const s = parseGraphicFrame(el, theme, ctx);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:grpSp") {
         walk(el, groupCtx(el, ctx));
