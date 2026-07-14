@@ -2541,10 +2541,15 @@ fn run_ingest(state: State<SharedState>, slug: String, full: Option<bool>) -> Cm
 }
 
 #[tauri::command]
-fn cancel_run(state: State<SharedState>, slug: String) -> CmdResult<()> {
+fn cancel_run(state: State<SharedState>, slug: String, kind: Option<String>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
-    active.engine.cancel(&slug);
+    // Default to Ingest for older callers; automations pass kind="automation".
+    let kind = match kind.as_deref() {
+        Some("automation") => engine::RunKind::Automation,
+        _ => engine::RunKind::Ingest,
+    };
+    active.engine.cancel(kind, &slug);
     Ok(())
 }
 

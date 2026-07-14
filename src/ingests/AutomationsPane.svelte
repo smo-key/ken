@@ -144,7 +144,7 @@
   }
 
   function cancelRun(slug: string) {
-    void api.cancelRun(slug);
+    void api.cancelRun(slug, "automation");
   }
 
   function rowMenu(e: MouseEvent, slug: string, name: string) {

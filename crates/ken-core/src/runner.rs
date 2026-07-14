@@ -540,7 +540,9 @@ if [ "$HEADLESS" = "1" ] && [ "$OUTFMT" = "stream-json" ]; then
   STAGING=$(echo "$PROMPT" | grep -o 'STAGING_DIR=[^ ]*' | head -1 | cut -d= -f2)
   echo '{"type":"system","subtype":"init","session_id":"'"$SESSION"'"}'
   case "$BEHAVIOR" in
-    stream-hang) sleep 300;;
+    # `exec` so a kill hits `sleep` directly (not a bash parent that leaves the
+    # grandchild holding the stdout pipe open) — lets a cancel surface promptly.
+    stream-hang) exec sleep 300;;
     stream-die-plain)
       # Real-CLI crash shape: plain-text stdout (not stream-json), nonzero
       # exit, NO terminal result event — must map to Failed, not Completed.

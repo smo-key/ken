@@ -538,7 +538,8 @@ export const api = {
   deleteIngest: (slug: string) => invoke<void>("delete_ingest", { slug }),
   runIngest: (slug: string, full = true) =>
     invoke<void>("run_ingest", { slug, full }),
-  cancelRun: (slug: string) => invoke<void>("cancel_run", { slug }),
+  cancelRun: (slug: string, kind: "ingest" | "automation" = "ingest") =>
+    invoke<void>("cancel_run", { slug, kind }),
   approveRun: (runId: number) => invoke<void>("approve_run", { runId }),
   discardRun: (runId: number) => invoke<void>("discard_run", { runId }),
 

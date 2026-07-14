@@ -85,12 +85,12 @@ impl Default for EngineConfig {
 }
 
 /// Which subsystem a queued job belongs to. Automations share the engine's
-/// single-worker queue; only ingests are enqueued until the automation tasks
-/// land, but the key carries the kind so the two never collide.
+/// single-worker queue; the key carries the kind so an ingest recipe and an
+/// automation that happen to share a slug never collide (in the queue or when
+/// cancelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RunKind {
     Ingest,
-    #[allow(dead_code)]
     Automation,
 }
 
@@ -111,7 +111,6 @@ struct QueueKey {
 }
 
 /// A debounced unit of work waiting in the engine queue.
-#[allow(dead_code)] // `matched`/`apply` are populated once automations enqueue.
 struct PendingJob {
     /// Earliest instant this job may start (debounce watermark).
     deadline: Instant,
@@ -122,6 +121,11 @@ struct PendingJob {
     /// Phase-2 approved proposal text; `Some` only for an automation apply job.
     apply: Option<String>,
 }
+
+/// The single in-flight run, keyed by `(kind, slug)` so a cancel targets the
+/// right subsystem. Shared between the loop (which claims/reaps it) and the run
+/// thread (which clears it on exit).
+type CurrentRun = Arc<Mutex<Option<(RunKind, String, CancelToken)>>>;
 
 enum Msg {
     Trigger { kind: RunKind, slug: String, force_full: bool },
@@ -134,7 +138,7 @@ enum Msg {
 
 pub struct IngestEngine {
     tx: Sender<Msg>,
-    current: Arc<Mutex<Option<(String, CancelToken)>>>,
+    current: CurrentRun,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -154,8 +158,7 @@ impl IngestEngine {
         on_event: impl Fn(IngestEvent) + Send + Sync + 'static,
     ) -> Result<IngestEngine> {
         let (tx, rx) = channel::<Msg>();
-        let current: Arc<Mutex<Option<(String, CancelToken)>>> =
-            Arc::new(Mutex::new(None));
+        let current: CurrentRun = Arc::new(Mutex::new(None));
         let current_thread = current.clone();
 
         let thread = std::thread::spawn(move || {
@@ -208,6 +211,7 @@ impl IngestEngine {
                     }
                     Ok(Msg::SourcesChanged(paths)) => {
                         if let Ok(project) = Project::open(&project_root) {
+                            // Recipes: on-change refreshes.
                             if let Ok(entries) = recipe::list(&project) {
                                 for entry in entries {
                                     if let recipe::RecipeEntry::Ok { recipe: r } = entry {
@@ -237,6 +241,43 @@ impl IngestEngine {
                                     }
                                 }
                             }
+                            // Automations: any enabled rule whose globs match a
+                            // changed path is enqueued (same 10s debounce), the
+                            // matched paths unioned across the window so the run
+                            // sees every file that triggered it. auto_apply is
+                            // resolved later, inside execute_automation.
+                            if let Ok(autos) = automation::list_ok(&project) {
+                                for a in autos {
+                                    if !a.enabled {
+                                        continue;
+                                    }
+                                    let hits = automation::triggers(&a, &paths);
+                                    if hits.is_empty() {
+                                        continue;
+                                    }
+                                    let key = QueueKey {
+                                        kind: RunKind::Automation,
+                                        slug: a.slug.clone(),
+                                    };
+                                    let job = pending.entry(key.clone()).or_insert_with(|| PendingJob {
+                                        deadline: Instant::now() + cfg.debounce,
+                                        force_full: false,
+                                        matched: vec![],
+                                        apply: None,
+                                    });
+                                    for h in hits {
+                                        if !job.matched.contains(&h) {
+                                            job.matched.push(h);
+                                        }
+                                    }
+                                    maybe_announce_queued(
+                                        &mut announced_queued,
+                                        &pending,
+                                        &key,
+                                        &on_event,
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -261,7 +302,7 @@ impl IngestEngine {
                                 .lock()
                                 .unwrap()
                                 .as_ref()
-                                .map(|(s, _)| s.clone())
+                                .map(|(_, s, _)| s.clone())
                                 .unwrap_or_default();
                             let mut ev = IngestEvent::at(
                                 key.kind.as_str(),
@@ -289,7 +330,7 @@ impl IngestEngine {
                                 // spins again) so the next iteration sees it busy.
                                 let token = CancelToken::new();
                                 *current_thread.lock().unwrap() =
-                                    Some((key.slug.clone(), token.clone()));
+                                    Some((RunKind::Ingest, key.slug.clone(), token.clone()));
                                 let project_root = project_root.clone();
                                 let db_path = db_path.clone();
                                 let hooks = hooks.clone();
@@ -321,7 +362,7 @@ impl IngestEngine {
                                 // spins again) so the next iteration sees it busy.
                                 let token = CancelToken::new();
                                 *current_thread.lock().unwrap() =
-                                    Some((key.slug.clone(), token.clone()));
+                                    Some((RunKind::Automation, key.slug.clone(), token.clone()));
                                 let project_root = project_root.clone();
                                 let db_path = db_path.clone();
                                 let hooks = hooks.clone();
@@ -356,7 +397,7 @@ impl IngestEngine {
             // dispatched in the Shutdown race window (Drop saw `current == None`
             // and its cancel no-opped) still stops promptly instead of hanging
             // the join for the run's full duration.
-            if let Some((_, token)) = current_thread.lock().unwrap().as_ref() {
+            if let Some((_, _, token)) = current_thread.lock().unwrap().as_ref() {
                 token.cancel();
             }
             if let Some(h) = run_handle.take() {
@@ -401,10 +442,12 @@ impl IngestEngine {
         let _ = self.tx.send(Msg::SourcesChanged(paths));
     }
 
-    /// Cancel the currently running ingest if it matches `slug`.
-    pub fn cancel(&self, slug: &str) {
-        if let Some((running_slug, token)) = self.current.lock().unwrap().as_ref() {
-            if running_slug == slug {
+    /// Cancel the currently running job if it matches `(kind, slug)`. Keyed by
+    /// kind so cancelling an ingest can't stop an automation that happens to
+    /// share the slug (and vice versa).
+    pub fn cancel(&self, kind: RunKind, slug: &str) {
+        if let Some((running_kind, running_slug, token)) = self.current.lock().unwrap().as_ref() {
+            if *running_kind == kind && running_slug == slug {
                 token.cancel();
             }
         }
@@ -414,7 +457,7 @@ impl IngestEngine {
 impl Drop for IngestEngine {
     fn drop(&mut self) {
         let _ = self.tx.send(Msg::Shutdown);
-        if let Some((_, token)) = self.current.lock().unwrap().as_ref() {
+        if let Some((_, _, token)) = self.current.lock().unwrap().as_ref() {
             token.cancel();
         }
         if let Some(t) = self.thread.take() {
@@ -658,7 +701,7 @@ fn execute_automation(
     db: &mut Db,
     hooks: &HookListener,
     cfg: &EngineConfig,
-    current: &Arc<Mutex<Option<(String, CancelToken)>>>,
+    current: &CurrentRun,
     slug: &str,
     job: &PendingJob,
     on_event: &Arc<dyn Fn(IngestEvent) + Send + Sync>,
@@ -745,7 +788,7 @@ fn execute_automation(
     ));
 
     let token = CancelToken::new();
-    *current.lock().unwrap() = Some((slug.to_string(), token.clone()));
+    *current.lock().unwrap() = Some((RunKind::Automation, slug.to_string(), token.clone()));
     let runner_cfg = RunnerConfig {
         binary,
         mode: RunnerMode::Headless,
@@ -1005,11 +1048,18 @@ mod tests {
     }
 
     fn rig_with_automation(behavior: &str, auto_apply: bool) -> Rig {
+        rig_with_automation_globs(behavior, auto_apply, vec!["notes/*.md".into()])
+    }
+
+    /// An automation with explicit globs — used to watch a folder the rig's two
+    /// recipes (which watch `notes/`) do NOT, so a `SourcesChanged` can trigger
+    /// the automation in isolation.
+    fn rig_with_automation_globs(behavior: &str, auto_apply: bool, globs: Vec<String>) -> Rig {
         let r = rig(behavior);
         let a = crate::automation::Automation {
             slug: "weekly".into(),
             name: "Weekly".into(),
-            globs: vec!["notes/*.md".into()],
+            globs,
             prompt: "Summarize notes and propose follow-up tasks.".into(),
             auto_apply,
             enabled: true,
@@ -1029,6 +1079,26 @@ mod tests {
             }
         }
         panic!("never saw status {wanted}");
+    }
+
+    /// Like `wait_status` but also requires the event's `kind` — the engine
+    /// interleaves ingest and automation events, so tests that care which
+    /// subsystem produced a status must match on both.
+    fn wait_kind_status(
+        events: &Receiver<IngestEvent>,
+        kind: &str,
+        wanted: &str,
+        secs: u64,
+    ) -> IngestEvent {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+                if ev.kind == kind && ev.status == wanted {
+                    return ev;
+                }
+            }
+        }
+        panic!("never saw {kind} status {wanted}");
     }
 
     #[test]
@@ -1059,7 +1129,7 @@ mod tests {
         r.engine.trigger("places", true);
         let w = wait_status(&r.events, "waiting", 8);
         assert!(w.detail.unwrap_or_default().contains("people"));
-        r.engine.cancel("people");
+        r.engine.cancel(RunKind::Ingest, "people");
     }
 
     #[test]
@@ -1363,5 +1433,58 @@ mod tests {
             .find(|i| i.kind == "automation-proposal").unwrap().id;
         discard_automation_proposal(&mut db, id).unwrap();
         assert_eq!(db.get_review_item(id).unwrap().unwrap().status, "resolved");
+    }
+
+    #[test]
+    fn source_change_matching_an_automation_runs_it_and_stages_a_proposal() {
+        // Watch a folder the recipes don't, so only the automation reacts.
+        let r = rig_with_automation_globs("complete", false, vec!["Recordings/*.md".into()]);
+        r.engine.sources_changed(vec!["Recordings/2026-07-13 14.02 Recording.md".into()]);
+        // The automation runs (kind=automation) and stages a proposal.
+        let done = wait_kind_status(&r.events, "automation", "fresh", 20);
+        assert_eq!(done.slug, "weekly");
+        let db = Db::open_at(&r.db_path).unwrap();
+        let items = db.list_open_review_items().unwrap();
+        let prop = items
+            .iter()
+            .find(|i| i.kind == "automation-proposal")
+            .expect("a proposal was staged by the file-change trigger");
+        assert_eq!(prop.source_ref, "weekly");
+        // The matched path is carried on the proposal payload (the union).
+        assert!(prop.payload.as_deref().unwrap_or("").contains("Recordings/2026-07-13 14.02 Recording.md"));
+    }
+
+    #[test]
+    fn source_change_not_matching_an_automation_does_not_run_it() {
+        // Automation watches Recordings/; a change under notes/ must not fire it
+        // (the recipes will fire, but no automation-kind event may appear).
+        let r = rig_with_automation_globs("complete", false, vec!["Recordings/*.md".into()]);
+        r.engine.sources_changed(vec!["notes/a.md".into()]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(ev) = r.events.recv_timeout(Duration::from_millis(200)) {
+                assert_ne!(ev.kind, "automation", "a non-matching path must not trigger the automation");
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_is_kind_aware() {
+        // A slow ingest named "people" is running; cancelling the *automation*
+        // "people" must NOT stop it — only the ingest-kind cancel does.
+        let r = rig("stream-hang");
+        r.engine.trigger("people", true);
+        wait_status(&r.events, "running", 15);
+        r.engine.cancel(RunKind::Automation, "people"); // wrong kind — no-op
+        // No cancellation should arrive in the next moment.
+        let quiet = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < quiet {
+            if let Ok(ev) = r.events.recv_timeout(Duration::from_millis(100)) {
+                assert_ne!(ev.status, "cancelled", "wrong-kind cancel must not stop the ingest");
+            }
+        }
+        // The matching-kind cancel does stop it.
+        r.engine.cancel(RunKind::Ingest, "people");
+        wait_status(&r.events, "cancelled", 10);
     }
 }
