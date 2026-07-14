@@ -1104,6 +1104,37 @@ impl Db {
         Ok(())
     }
 
+    /// One-time catch-up for the incremental Map: enqueue extraction for every
+    /// `indexed` file that has NO `extractions` row yet. Projects indexed before
+    /// the extraction queue existed have no rows, and the scanner never re-runs
+    /// `index_one` for unchanged files, so those files would never reach the
+    /// queue. Hashes the already-stored `contents` text (no byte re-read), and
+    /// leaves any file that already has a row (pending/done/error) untouched, so
+    /// it's idempotent and safe to call on every project open. Returns how many
+    /// files were enqueued.
+    pub fn backfill_extractions(&mut self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.rel_path, c.text
+               FROM files f JOIN contents c ON c.file_id = f.id
+              WHERE f.status = 'indexed'
+                AND NOT EXISTS (
+                  SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path
+                )",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let mut n = 0;
+        for (rel, text) in rows {
+            let hash = crate::knowledge_model::content_hash(&text);
+            if self.enqueue_extraction_if_changed(&rel, &hash)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Return every `error` extraction row to `pending` so the worker retries
     /// it. Called when the local model becomes ready (install / selection /
     /// error recovery): files that errored under a transient model fault — the
@@ -1832,6 +1863,34 @@ mod tests {
             (0, 1),
             "a file that only ever errored must not count as analyzed after re-enqueue"
         );
+    }
+
+    #[test]
+    fn backfill_extractions_enqueues_indexed_files_without_rows() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Two indexed files with content, one metadata-only, one already queued.
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.upsert_file("c.png", "png", 1, 1, "metadata_only", None, "").unwrap();
+        db.upsert_file("d.md", "md", 1, 1, "indexed", None, "delta").unwrap();
+        // d already has an extraction row (a normal indexed-after-v8 file).
+        db.enqueue_extraction_if_changed("d.md", &crate::knowledge_model::content_hash("delta"))
+            .unwrap();
+        db.mark_extraction_done("d.md", &crate::knowledge_model::content_hash("delta"), 50)
+            .unwrap();
+
+        // Backfill picks up a and b only (c isn't indexed; d already has a row).
+        assert_eq!(db.backfill_extractions().unwrap(), 2);
+        let mut pending = Vec::new();
+        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
+            db.mark_extraction_done(&rel, &hash, 100).unwrap();
+            pending.push(rel);
+        }
+        pending.sort();
+        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
+
+        // Idempotent: a second call enqueues nothing (every file now has a row).
+        assert_eq!(db.backfill_extractions().unwrap(), 0);
     }
 
     #[test]

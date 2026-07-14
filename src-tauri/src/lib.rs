@@ -184,8 +184,15 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     registry.last_project = Some(project.config.id);
     registry.save(&guard.base_dir).map_err(err)?;
 
-    let db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
+    let mut db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
     let watch_db_path = db_path(&guard.base_dir, project.config.id);
+
+    // One-time extraction backfill: a project indexed before the incremental
+    // Map landed has no `extractions` rows, and the scanner never re-runs
+    // index_one for unchanged files — so those files would show "0 of N
+    // analyzed" forever. Enqueue every indexed file that has no row yet,
+    // hashing its already-stored text. Cheap, idempotent, and re-index-safe.
+    let _ = db.backfill_extractions();
 
     // One-time unread baseline: snapshot the already-indexed files (this DB
     // persists across sessions, so an existing project has them here) as "seen"
