@@ -16,7 +16,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 #[test]
@@ -63,7 +63,7 @@ fn loads_a_real_model_and_generates_a_few_tokens() {
         // token_to_bytes so a multi-byte piece split across tokens is handled by
         // the caller's Utf8Streamer; here just check it is non-empty.
         let bytes = model
-            .token_to_bytes(token, Special::Plaintext)
+            .token_to_bytes(token, llama_cpp_2::model::Special::Plaintext)
             .expect("token to bytes");
         produced.push_str(&String::from_utf8_lossy(&bytes));
 
