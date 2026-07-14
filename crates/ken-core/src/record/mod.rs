@@ -205,9 +205,112 @@ pub fn metadata_header(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Idle,
+    Recording,
+    Paused,
+    Stopped,
+}
+
+/// The recorder's timing/phase bookkeeping — pure, so pause accounting is
+/// tested without any audio device. `now_ms` is a monotonic millisecond clock
+/// supplied by the caller (Tauri uses `Instant`).
+#[derive(Debug, Clone)]
+pub struct RecorderState {
+    pub phase: Phase,
+    pub mic: bool,
+    pub system: bool,
+    banked_ms: u64,
+    segment_start: Option<u64>,
+}
+
+impl RecorderState {
+    pub fn new() -> Self {
+        RecorderState { phase: Phase::Idle, mic: false, system: false, banked_ms: 0, segment_start: None }
+    }
+
+    pub fn start(&mut self, now_ms: u64, mic: bool, system: bool) {
+        self.phase = Phase::Recording;
+        self.mic = mic;
+        self.system = system;
+        self.banked_ms = 0;
+        self.segment_start = Some(now_ms);
+    }
+
+    pub fn pause(&mut self, now_ms: u64) {
+        if self.phase == Phase::Recording {
+            if let Some(s) = self.segment_start.take() {
+                self.banked_ms += now_ms.saturating_sub(s);
+            }
+            self.phase = Phase::Paused;
+        }
+    }
+
+    pub fn resume(&mut self, now_ms: u64) {
+        if self.phase == Phase::Paused {
+            self.segment_start = Some(now_ms);
+            self.phase = Phase::Recording;
+        }
+    }
+
+    pub fn stop(&mut self, now_ms: u64) {
+        if self.phase == Phase::Recording {
+            if let Some(s) = self.segment_start.take() {
+                self.banked_ms += now_ms.saturating_sub(s);
+            }
+        }
+        self.segment_start = None;
+        self.phase = Phase::Stopped;
+    }
+
+    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
+        self.banked_ms + self.segment_start.map(|s| now_ms.saturating_sub(s)).unwrap_or(0)
+    }
+
+    pub fn is_capturing(&self) -> bool {
+        self.phase == Phase::Recording
+    }
+}
+
+impl Default for RecorderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elapsed_excludes_paused_time() {
+        let mut r = RecorderState::new();
+        assert_eq!(r.phase, Phase::Idle);
+        r.start(1_000, true, false);
+        assert_eq!(r.phase, Phase::Recording);
+        assert_eq!(r.elapsed_ms(3_000), 2_000); // ran 1s..3s
+        r.pause(3_000);
+        assert_eq!(r.phase, Phase::Paused);
+        // Time passes while paused; elapsed is frozen at 2s.
+        assert_eq!(r.elapsed_ms(10_000), 2_000);
+        r.resume(10_000);
+        assert_eq!(r.elapsed_ms(11_000), 3_000); // 2s banked + 1s live
+        r.stop(12_000);
+        assert_eq!(r.phase, Phase::Stopped);
+        assert_eq!(r.elapsed_ms(99_999), 4_000); // banked at stop, frozen
+    }
+
+    #[test]
+    fn is_capturing_only_while_recording() {
+        let mut r = RecorderState::new();
+        assert!(!r.is_capturing());
+        r.start(0, true, true);
+        assert!(r.is_capturing());
+        r.pause(500);
+        assert!(!r.is_capturing());
+    }
 
     #[test]
     fn source_serializes_lowercase() {
