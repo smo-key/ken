@@ -54,6 +54,20 @@ pub fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f64).sqrt() as f32
 }
 
+/// Fold interleaved N-channel frames down to mono by averaging each frame.
+/// `channels == 0` is treated as mono. A trailing partial frame (shouldn't
+/// happen from a well-formed callback) is averaged over what's present.
+pub fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
+    let ch = channels.max(1) as usize;
+    if ch == 1 {
+        return interleaved.to_vec();
+    }
+    interleaved
+        .chunks(ch)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +86,15 @@ mod tests {
         assert!((rms(&[1.0, -1.0, 1.0, -1.0]) - 1.0).abs() < 1e-6);
         // Half-scale square wave → 0.5.
         assert!((rms(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downmix_averages_channels() {
+        // Mono passes through.
+        assert_eq!(downmix_to_mono(&[0.2, -0.4, 0.6], 1), vec![0.2, -0.4, 0.6]);
+        // Stereo interleaved L,R -> average per frame.
+        assert_eq!(downmix_to_mono(&[1.0, 0.0, -1.0, 1.0], 2), vec![0.5, 0.0]);
+        // channels=0 is treated as mono (defensive).
+        assert_eq!(downmix_to_mono(&[0.3], 0), vec![0.3]);
     }
 }
