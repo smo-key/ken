@@ -84,7 +84,7 @@
     {/if}
 
     <section class="controls">
-      <div class="clock" class:live={record.phase === "recording"}>
+      <div class="clock" class:live={record.phase === "recording" && !record.transcribing}>
         {clock(record.elapsedMs)}
       </div>
 
@@ -92,7 +92,7 @@
         <button class="rec" disabled={!canStart} onclick={() => void record.start()}>
           <span class="rec-dot"></span> Record
         </button>
-      {:else}
+      {:else if !record.transcribing}
         {#if record.phase === "recording"}
           <button class="btn" onclick={() => void record.pause()}>Pause</button>
         {:else}
@@ -103,7 +103,7 @@
       {/if}
     </section>
 
-    {#if record.recording}
+    {#if record.recording && !record.transcribing}
       <div class="storage">
         <span class="storage-label">Keep</span>
         <div class="seg">

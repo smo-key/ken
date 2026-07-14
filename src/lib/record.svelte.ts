@@ -50,12 +50,16 @@ class RecordStore {
       }
     });
     await api.onRecordTranscribing(() => {
-      // `record-transcribing` can fire even when the storage choice is "audio"
-      // (the backend still runs a channel through the pipeline). The audio path
-      // does not always resolve with a `record-saved` transcript event, so we
-      // only surface the transcribing state when a transcript is actually being
-      // produced — otherwise the UI could get stuck. record-saved/record-error
-      // remain the authoritative resolvers below.
+      // Recording has ended, but the backend emits no `record-state` phase
+      // change at stop — only the terminal `Idle` after finishing. Stop the
+      // elapsed clock here so it freezes at the true duration instead of
+      // ticking on through transcription.
+      this.stopClock();
+      // `record-transcribing` fires unconditionally at stop, before the backend
+      // examines the storage choice. For an audio-only recording no transcript
+      // is produced and the finish path goes straight to `record-saved`, so
+      // gating on `storage !== "audio"` prevents a misleading "Transcribing…"
+      // flash. record-saved/record-error remain the authoritative resolvers.
       if (this.storage !== "audio") this.transcribing = true;
     });
     await api.onRecordSaved((ev) => {
