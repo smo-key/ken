@@ -362,8 +362,9 @@ pub mod test_support {
     use std::path::{Path, PathBuf};
 
     /// Behaviours: complete | fail | hang | block | headless-fail |
-    /// stream-die | stream-stall — selected via a `behavior` file next to the
-    /// script (per-tempdir, so parallel tests never race).
+    /// stream-die | stream-stall | stream-hang | stream-fail — selected via a
+    /// `behavior` file next to the script (per-tempdir, so parallel tests
+    /// never race).
     pub fn write_fake_claude(dir: &Path, behavior: &str) -> PathBuf {
         std::fs::write(dir.join("behavior"), behavior).unwrap();
         let path = dir.join("claude");
@@ -375,6 +376,7 @@ SESSION=""
 PROMPT=""
 HEADLESS=0
 STREAM_INPUT=0
+OUTFMT=""
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   case "${args[$i]}" in
@@ -384,7 +386,8 @@ for ((i=0; i<${#args[@]}; i++)); do
         case "$next" in --*|"") ;; *) PROMPT="$next"; i=$((i+1));; esac;;
     --input-format)
         [ "${args[$((i+1))]}" = "stream-json" ] && STREAM_INPUT=1; i=$((i+1));;
-    --permission-mode|--output-format) i=$((i+1));;
+    --permission-mode) i=$((i+1));;
+    --output-format) OUTFMT="${args[$((i+1))]}"; i=$((i+1));;
     --verbose) ;;
     *) if [ -z "$PROMPT" ]; then PROMPT="${args[$i]}"; fi;;
   esac
@@ -414,6 +417,43 @@ if [ "$STREAM_INPUT" = "1" ]; then
     fi
   done
   exit 0
+fi
+
+# Headless streamed output: `-p <prompt> --output-format stream-json --verbose`.
+# Emits the same event shapes chat parses, writes staged outputs, then a
+# terminal result. Behaviours reuse the BEHAVIOR file.
+if [ "$HEADLESS" = "1" ] && [ "$OUTFMT" = "stream-json" ]; then
+  STAGING=$(echo "$PROMPT" | grep -o 'STAGING_DIR=[^ ]*' | head -1 | cut -d= -f2)
+  echo '{"type":"system","subtype":"init","session_id":"'"$SESSION"'"}'
+  case "$BEHAVIOR" in
+    stream-hang) sleep 300;;
+    stream-fail)
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes/a.md"}}]}}'
+      echo '{"type":"result","subtype":"error_during_execution","is_error":true}'
+      exit 4;;
+    *)
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes/a.md"}}]}}'
+      echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
+      # Stage the same People.md the object-mode path writes (for ingest apply).
+      if [ -n "$STAGING" ]; then
+        mkdir -p "$STAGING/knowledge" 2>/dev/null
+        printf '%s' '# People
+
+- Priya Natarajan — owns billing cutover
+' > "$STAGING/knowledge/People.md"
+      fi
+      # Automation phase-1 announces a proposal file to write.
+      PROPOSAL=$(echo "$PROMPT" | grep -o 'PROPOSAL_FILE=[^ ]*' | head -1 | cut -d= -f2-)
+      if [ -n "$PROPOSAL" ]; then
+        mkdir -p "$(dirname "$PROPOSAL")" 2>/dev/null
+        printf '%s' '## Proposed actions
+
+- Create Jira issue: follow up on billing cutover
+' > "$PROPOSAL"
+      fi
+      echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+      exit 0;;
+  esac
 fi
 
 # Staging dir is announced in the prompt as: STAGING_DIR=<path>
