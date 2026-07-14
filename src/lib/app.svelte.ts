@@ -51,6 +51,7 @@ export type Screen =
   | "review"
   | "ingests"
   | "map"
+  | "record"
   | "timeline"
   | "settings";
 

@@ -8,6 +8,7 @@
   import Layers from "@lucide/svelte/icons/layers";
   import Network from "@lucide/svelte/icons/network";
   import Clock from "@lucide/svelte/icons/clock";
+  import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
 
   const items: { key: Screen; icon: Component; label: string }[] = [
@@ -17,6 +18,7 @@
     { key: "ingests", icon: Layers, label: "Ingests" },
     { key: "map", icon: Network, label: "Map" },
     { key: "timeline", icon: Clock, label: "Timeline" },
+    { key: "record", icon: Mic, label: "Record" },
   ];
 </script>
 

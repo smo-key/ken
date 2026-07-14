@@ -11,6 +11,7 @@
   import IngestsScreen from "../screens/IngestsScreen.svelte";
   import MapScreen from "../screens/MapScreen.svelte";
   import TimelineScreen from "../screens/TimelineScreen.svelte";
+  import RecordScreen from "../screens/RecordScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
   import { SvelteSet } from "svelte/reactivity";
 
@@ -55,6 +56,9 @@
       {/if}
       {#if visited.has("timeline")}
         <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
+      {/if}
+      {#if visited.has("record")}
+        <div class="pane" hidden={app.screen !== "record"}><RecordScreen /></div>
       {/if}
       {#if visited.has("settings")}
         <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
