@@ -299,14 +299,25 @@ impl IngestEngine {
                             }
                             RunKind::Automation => {
                                 // Automation dispatch lands with the automation
-                                // tasks; no automation job is enqueued yet.
-                                unreachable!("automation jobs are not enqueued yet");
+                                // tasks; no automation job is enqueued yet. Skip
+                                // (never panic) so a mis-wired enqueue can't kill
+                                // the worker and silently stop all ingests.
+                                eprintln!(
+                                    "ken-core engine: dropped automation job '{}' — dispatch not implemented yet",
+                                    key.slug
+                                );
                             }
                         }
                     }
                 }
             }
-            // Drain the in-flight run on shutdown (Drop cancels its token first).
+            // Drain the in-flight run on shutdown — cancel first so a run
+            // dispatched in the Shutdown race window (Drop saw `current == None`
+            // and its cancel no-opped) still stops promptly instead of hanging
+            // the join for the run's full duration.
+            if let Some((_, token)) = current_thread.lock().unwrap().as_ref() {
+                token.cancel();
+            }
             if let Some(h) = run_handle.take() {
                 let _ = h.join();
             }
