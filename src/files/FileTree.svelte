@@ -3,6 +3,8 @@
   import StarOff from "@lucide/svelte/icons/star-off";
   import Eye from "@lucide/svelte/icons/eye";
   import X from "@lucide/svelte/icons/x";
+  import FilePlus from "@lucide/svelte/icons/file-plus";
+  import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
   import { showUnreadFilter } from "./filesHeader";
@@ -13,7 +15,9 @@
   } from "../lib/ui/ContextMenu.svelte";
   import ContextMenu from "../lib/ui/ContextMenu.svelte";
   import { canDrop, drag } from "./dnd.svelte";
+  import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
+  import InlineNameRow from "./InlineNameRow.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
   let { width }: { width: number } = $props();
@@ -56,6 +60,24 @@
       },
     ];
     openContextMenu(e.clientX, e.clientY, items);
+  }
+
+  // Right-click on the tree's empty/root area (not a row — rows own their menus).
+  function onRootMenu(e: MouseEvent) {
+    if (e.target !== e.currentTarget) return;
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, [
+      {
+        label: "New document",
+        icon: FilePlus,
+        onSelect: () => treeEdit.beginCreate("new-document", ""),
+      },
+      {
+        label: "New folder",
+        icon: FolderPlus,
+        onSelect: () => treeEdit.beginCreate("new-folder", ""),
+      },
+    ]);
   }
 
   // Root drop zone — only the empty area of the tree (not rows).
@@ -150,10 +172,14 @@
     class:drop-root={drag.over === ""}
     role="tree"
     tabindex="-1"
+    oncontextmenu={onRootMenu}
     ondragover={onRootDragOver}
     ondragleave={onRootDragLeave}
     ondrop={onRootDrop}
   >
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === ""}
+      <InlineNameRow indent={8} />
+    {/if}
     {#each tree as node (node.relPath)}
       <TreeNodeRow {node} depth={0} expandAll={unreadOnly} />
     {/each}

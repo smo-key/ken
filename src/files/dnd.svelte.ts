@@ -13,6 +13,7 @@ class DragState {
 
   reset() {
     this.from = null;
+    this.fromKind = "file";
     this.over = null;
   }
 }

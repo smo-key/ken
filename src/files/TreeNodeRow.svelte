@@ -7,12 +7,17 @@
   import CloudIcon from "@lucide/svelte/icons/cloud";
   import SquareArrowOutUpRight from "@lucide/svelte/icons/square-arrow-out-up-right";
   import Check from "@lucide/svelte/icons/check";
+  import Pencil from "@lucide/svelte/icons/pencil";
+  import FilePlus from "@lucide/svelte/icons/file-plus";
+  import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import { app } from "../lib/app.svelte";
   import { api } from "../lib/api";
   import type { TreeNode } from "../lib/tree";
   import { openContextMenu, type MenuEntry } from "../lib/ui/ContextMenu.svelte";
   import { canDrop, drag, parentOf } from "./dnd.svelte";
+  import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
+  import InlineNameRow from "./InlineNameRow.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
   let {
@@ -57,6 +62,32 @@
         label: "Open in default app",
         icon: ExternalLink,
         onSelect: () => void api.openExternal(node.relPath),
+      },
+      "separator",
+      ...(isFolder
+        ? ([
+            {
+              label: "New document",
+              icon: FilePlus,
+              onSelect: () => {
+                open = true; // creation happens inside this folder — show it
+                treeEdit.beginCreate("new-document", node.relPath);
+              },
+            },
+            {
+              label: "New folder",
+              icon: FolderPlus,
+              onSelect: () => {
+                open = true;
+                treeEdit.beginCreate("new-folder", node.relPath);
+              },
+            },
+          ] as MenuEntry[])
+        : []),
+      {
+        label: "Rename",
+        icon: Pencil,
+        onSelect: () => treeEdit.beginRename(node.relPath),
       },
       ...(isUnread
         ? ([
@@ -116,14 +147,26 @@
   }
 </script>
 
-{#if isFolder}
+{#if treeEdit.mode === "rename" && treeEdit.target === node.relPath}
+  <InlineNameRow indent={8 + depth * 18 + (isFolder ? 0 : 10)} />
+{:else if isFolder}
   <button
     class="row folder"
     class:excluded={node.excluded}
     class:drop-target={isDropTarget}
     style:padding-left={`${8 + depth * 18}px`}
+    draggable="true"
     onclick={() => (open = !open)}
     oncontextmenu={rowMenu}
+    ondragstart={(e) => {
+      drag.from = node.relPath;
+      drag.fromKind = "folder";
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", node.relPath);
+      }
+    }}
+    ondragend={() => drag.reset()}
     ondragover={onDragOver}
     ondragleave={onDragLeave}
     ondrop={onDrop}
@@ -138,6 +181,9 @@
     {/if}
   </button>
   {#if open && !node.excluded}
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
+      <InlineNameRow indent={8 + (depth + 1) * 18} />
+    {/if}
     {#each node.children as child (child.relPath)}
       <TreeNodeRow node={child} depth={depth + 1} {expandAll} />
     {/each}
@@ -155,6 +201,7 @@
     oncontextmenu={rowMenu}
     ondragstart={(e) => {
       drag.from = node.relPath;
+      drag.fromKind = "file";
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = "move";
         e.dataTransfer.setData("text/plain", node.relPath);
