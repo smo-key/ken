@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub struct Db {
     conn: Connection,
@@ -270,6 +270,24 @@ impl Db {
                 self.conn
                     .execute_batch("ALTER TABLE chats ADD COLUMN model TEXT;")?;
             }
+        }
+        if version < 8 {
+            // Per-file extraction bookkeeping for the incremental Map. One row
+            // per indexed file: the hash we last extracted, when, and the
+            // outcome. Enqueue = a 'pending' row; the worker drains oldest-first.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS extractions (
+                    rel_path     TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    extracted_at INTEGER,
+                    status       TEXT NOT NULL,
+                    error        TEXT
+                );
+                CREATE INDEX IF NOT EXISTS extractions_status
+                    ON extractions(status);
+                "#,
+            )?;
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -923,6 +941,104 @@ impl Db {
         Ok(rows)
     }
 
+    // --- incremental extraction queue (Map worker bookkeeping) ---
+
+    /// Enqueue a file for extraction unless its content is already extracted.
+    /// Returns true if a `pending` row was written (a new file or a changed
+    /// hash), false if an identical hash is already `done`.
+    pub fn enqueue_extraction_if_changed(
+        &mut self,
+        rel_path: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        let already_done: bool = self.conn.query_row(
+            "SELECT 1 FROM extractions
+             WHERE rel_path = ?1 AND content_hash = ?2 AND status = 'done'",
+            params![rel_path, content_hash],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        if already_done {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO extractions (rel_path, content_hash, status)
+             VALUES (?1, ?2, 'pending')
+             ON CONFLICT(rel_path) DO UPDATE SET
+               content_hash = ?2, status = 'pending', error = NULL",
+            params![rel_path, content_hash],
+        )?;
+        Ok(true)
+    }
+
+    /// The oldest `pending` file (insertion order via implicit rowid) and the
+    /// hash to stamp when it completes.
+    pub fn next_pending_extraction(&self) -> Result<Option<(String, String)>> {
+        match self.conn.query_row(
+            "SELECT rel_path, content_hash FROM extractions
+             WHERE status = 'pending' ORDER BY rowid LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn mark_extraction_done(
+        &mut self,
+        rel_path: &str,
+        content_hash: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO extractions (rel_path, content_hash, extracted_at, status)
+             VALUES (?1, ?2, ?3, 'done')
+             ON CONFLICT(rel_path) DO UPDATE SET
+               content_hash = ?2, extracted_at = ?3, status = 'done', error = NULL",
+            params![rel_path, content_hash, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_extraction_error(
+        &mut self,
+        rel_path: &str,
+        message: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE extractions
+             SET status = 'error', error = ?2, extracted_at = ?3
+             WHERE rel_path = ?1",
+            params![rel_path, message, at],
+        )?;
+        Ok(())
+    }
+
+    /// `(files extracted, indexed files)` — the Map coverage line's numerator
+    /// and denominator. A file counts once it has a successful `extracted_at`
+    /// on record and is not currently in `error`; it keeps counting after a
+    /// content change re-queues it (`pending` with the prior `extracted_at`
+    /// preserved) until the re-run overwrites or it errors.
+    pub fn extraction_coverage(&self) -> Result<(i64, i64)> {
+        let done: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM extractions
+             WHERE extracted_at IS NOT NULL AND status <> 'error'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((done, self.indexed_file_count()?))
+    }
+
+    pub fn remove_extraction(&mut self, rel_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM extractions WHERE rel_path = ?1",
+            params![rel_path],
+        )?;
+        Ok(())
+    }
+
     // --- knowledge model (entities, edges, events — derived read model
     //     for the Map and Timeline screens; replaced wholesale on build) ---
 
@@ -1276,6 +1392,46 @@ fn name_snippet(rel_path: &str, lowered_tokens: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_queue_tracks_pending_done_and_coverage() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Two indexed files, one metadata-only (must not count toward total).
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.upsert_file("c.png", "png", 1, 1, "metadata_only", None, "").unwrap();
+
+        // New hashes enqueue; the queue drains oldest-first.
+        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
+        assert!(db.enqueue_extraction_if_changed("b.md", "h2").unwrap());
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 2));
+        assert_eq!(
+            db.next_pending_extraction().unwrap(),
+            Some(("a.md".into(), "h1".into()))
+        );
+
+        // Marking a.md done advances the queue and lifts coverage.
+        db.mark_extraction_done("a.md", "h1", 100).unwrap();
+        assert_eq!(db.extraction_coverage().unwrap(), (1, 2));
+        assert_eq!(
+            db.next_pending_extraction().unwrap(),
+            Some(("b.md".into(), "h2".into()))
+        );
+
+        // Re-enqueuing the same done hash is a no-op; a changed hash re-queues.
+        assert!(!db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
+        assert!(db.enqueue_extraction_if_changed("a.md", "h1b").unwrap());
+        assert_eq!(db.extraction_coverage().unwrap(), (1, 2)); // still 'done' count until re-run overwrites
+
+        // Errors stay out of the pending queue but keep the row.
+        db.mark_extraction_error("b.md", "boom", 101).unwrap();
+        db.mark_extraction_done("a.md", "h1b", 102).unwrap();
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
+
+        // Removing an extraction row drops it entirely.
+        db.remove_extraction("a.md").unwrap();
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 2));
+    }
 
     fn seeded() -> Db {
         let mut db = Db::open_in_memory().unwrap();
