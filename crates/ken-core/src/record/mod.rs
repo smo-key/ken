@@ -205,6 +205,89 @@ pub fn metadata_header(
     )
 }
 
+/// One channel's timed cues with an optional speaker label (`None` suppresses
+/// labels for a single-source recording).
+#[derive(Debug, Clone, Copy)]
+pub struct LabeledChannel<'a> {
+    pub label: Option<&'a str>,
+    pub cues: &'a [transcript::Cue],
+}
+
+#[derive(Debug, Clone)]
+struct Turn {
+    label: Option<String>,
+    start: Duration,
+    text: String,
+}
+
+/// Flatten every channel's cues into turns, dropping blank text and trimming.
+/// A stable sort by start keeps earlier channels ahead on ties (Me before Them,
+/// given the caller passes Me first).
+fn ordered_turns(channels: &[LabeledChannel]) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    for ch in channels {
+        for c in ch.cues {
+            let text = c.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            turns.push(Turn {
+                label: ch.label.map(str::to_string),
+                start: c.start,
+                text: text.to_string(),
+            });
+        }
+    }
+    turns.sort_by(|a, b| a.start.cmp(&b.start));
+    turns
+}
+
+/// Join back-to-back turns from the SAME labeled speaker into one paragraph.
+/// Only labeled speakers coalesce; unlabeled (single-source) turns stay per-cue
+/// so a solo transcript keeps its natural line breaks.
+fn coalesce(turns: Vec<Turn>) -> Vec<Turn> {
+    let mut out: Vec<Turn> = Vec::new();
+    for t in turns {
+        if let Some(last) = out.last_mut() {
+            if t.label.is_some() && last.label == t.label {
+                last.text.push(' ');
+                last.text.push_str(&t.text);
+                continue;
+            }
+        }
+        out.push(t);
+    }
+    out
+}
+
+fn stamp(d: Duration) -> String {
+    dur_hms(d)
+}
+
+/// Merge one or two labeled, timestamped channels into a single markdown
+/// transcript. Turns are ordered by start; a labeled turn is
+/// `**Label** [m:ss] text`, an unlabeled turn is `[m:ss] text`; turns are
+/// separated by a blank line and the doc ends with a newline. Empty input →
+/// empty string.
+pub fn merge_transcript(channels: &[LabeledChannel]) -> String {
+    let turns = coalesce(ordered_turns(channels));
+    if turns.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (i, t) in turns.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        match &t.label {
+            Some(label) => out.push_str(&format!("**{label}** [{}] {}", stamp(t.start), t.text)),
+            None => out.push_str(&format!("[{}] {}", stamp(t.start), t.text)),
+        }
+    }
+    out.push('\n');
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -310,6 +393,94 @@ mod tests {
         assert!(r.is_capturing());
         r.pause(500);
         assert!(!r.is_capturing());
+    }
+
+    fn cue(start_ms: u64, end_ms: u64, text: &str) -> transcript::Cue {
+        transcript::Cue {
+            start: Duration::from_millis(start_ms),
+            end: Duration::from_millis(end_ms),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn merge_interleaves_two_channels_by_start_and_labels() {
+        let me = vec![cue(0, 2000, "hi there"), cue(6000, 8000, "sounds good")];
+        let them = vec![cue(2500, 4000, "thanks for joining")];
+        let md = merge_transcript(&[
+            LabeledChannel { label: Some("Me"), cues: &me },
+            LabeledChannel { label: Some("Them"), cues: &them },
+        ]);
+        let expected = "\
+**Me** [0:00] hi there
+
+**Them** [0:02] thanks for joining
+
+**Me** [0:06] sounds good
+";
+        assert_eq!(md, expected);
+    }
+
+    #[test]
+    fn merge_breaks_ties_me_before_them() {
+        let me = vec![cue(1000, 2000, "first")];
+        let them = vec![cue(1000, 2000, "second")];
+        let md = merge_transcript(&[
+            LabeledChannel { label: Some("Me"), cues: &me },
+            LabeledChannel { label: Some("Them"), cues: &them },
+        ]);
+        assert_eq!(md, "**Me** [0:01] first\n\n**Them** [0:01] second\n");
+    }
+
+    #[test]
+    fn merge_coalesces_consecutive_same_speaker_turns() {
+        let me = vec![cue(0, 1000, "one"), cue(1000, 2000, "two"), cue(2000, 3000, "three")];
+        let them = vec![cue(1000, 2000, "interject")];
+        let md = merge_transcript(&[
+            LabeledChannel { label: Some("Me"), cues: &me },
+            LabeledChannel { label: Some("Them"), cues: &them },
+        ]);
+        // Ordered by start (stable, Me pushed before Them): one@0(Me),
+        // two@1(Me), interject@1(Them), three@2(Me). Adjacent Me turns
+        // "one"+"two" coalesce; Them breaks the run; Me "three" is its own turn.
+        let expected = "\
+**Me** [0:00] one two
+
+**Them** [0:01] interject
+
+**Me** [0:02] three
+";
+        assert_eq!(md, expected);
+    }
+
+    #[test]
+    fn merge_single_channel_has_no_labels_but_keeps_timestamps() {
+        let only = vec![cue(0, 2000, "solo line"), cue(4000, 5000, "next line")];
+        let md = merge_transcript(&[LabeledChannel { label: None, cues: &only }]);
+        // No labels; single-source turns are NOT coalesced (readability per cue).
+        assert_eq!(md, "[0:00] solo line\n\n[0:04] next line\n");
+    }
+
+    #[test]
+    fn merge_skips_empty_channel_and_blank_cues() {
+        let me = vec![cue(0, 1000, "  hello  "), cue(1000, 2000, "   ")];
+        let them: Vec<transcript::Cue> = vec![];
+        let md = merge_transcript(&[
+            LabeledChannel { label: Some("Me"), cues: &me },
+            LabeledChannel { label: Some("Them"), cues: &them },
+        ]);
+        // Blank cue dropped; text trimmed; empty channel contributes nothing.
+        assert_eq!(md, "**Me** [0:00] hello\n");
+    }
+
+    #[test]
+    fn merge_of_nothing_is_empty() {
+        assert_eq!(merge_transcript(&[]), "");
+        let empty: Vec<transcript::Cue> = vec![];
+        assert_eq!(
+            merge_transcript(&[LabeledChannel { label: Some("Me"), cues: &empty }]),
+            ""
+        );
     }
 
     #[test]
