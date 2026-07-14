@@ -1,9 +1,11 @@
 <script lang="ts">
-  import SlidersHorizontal from "@lucide/svelte/icons/sliders-horizontal";
+  import Upload from "@lucide/svelte/icons/upload";
   import StarOff from "@lucide/svelte/icons/star-off";
   import Eye from "@lucide/svelte/icons/eye";
   import X from "@lucide/svelte/icons/x";
   import { app } from "../lib/app.svelte";
+  import { imports } from "../lib/imports.svelte";
+  import { showUnreadFilter } from "./filesHeader";
   import { buildTree } from "../lib/tree";
   import {
     openContextMenu,
@@ -101,16 +103,37 @@
     </div>
   {/if}
 
-  <div class="tree-head">
-    Files
-    <button
-      class="icon-btn"
-      data-tooltip="Manage folders"
-      aria-label="Manage folders"
-      onclick={() => (app.screen = "settings")}
-    >
-      <SlidersHorizontal size={15} strokeWidth={1.75} />
-    </button>
+  <div class="tree-head files-head">
+    <span class="ttl">Files</span>
+    <div class="head-actions">
+      {#if showUnreadFilter(app.unread.length, app.filesFilter)}
+        <div class="filter" role="tablist" aria-label="Filter files">
+          <button
+            class="seg"
+            class:on={app.filesFilter === "all"}
+            role="tab"
+            aria-selected={app.filesFilter === "all"}
+            onclick={() => (app.filesFilter = "all")}
+          >All</button>
+          <button
+            class="seg"
+            class:on={app.filesFilter === "unread"}
+            role="tab"
+            aria-selected={app.filesFilter === "unread"}
+            onclick={() => (app.filesFilter = "unread")}
+          >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
+        </div>
+      {/if}
+      <button
+        class="icon-btn"
+        data-tooltip="Import file"
+        aria-label="Import file"
+        disabled={imports.importing}
+        onclick={() => void imports.startImport()}
+      >
+        <Upload size={15} strokeWidth={1.75} />
+      </button>
+    </div>
   </div>
 
   {#if drag.error}
@@ -163,12 +186,61 @@
   .tree-head {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     padding: 2px 10px 8px;
     font-size: 11px;
     font-weight: 700;
     color: var(--ink-tertiary);
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+  /* The Files header stays visually pinned: sticky to the top of the scrolling
+     .tree column so it never scrolls away with Favorites and the tree. A solid
+     ground covers content sliding under it. */
+  .files-head {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--paper);
+    justify-content: space-between;
+    /* extend the ground to the column edges under the sticky row */
+    margin: 0 -8px;
+    padding-left: 18px;
+    padding-right: 12px;
+  }
+  .files-head .ttl {
+    flex: none;
+  }
+  .head-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    /* header uppercases its text; keep control labels normal-case */
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
+  }
+  .filter {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    overflow: hidden;
+  }
+  .filter .seg {
+    padding: 2px 8px;
+    border: none;
+    background: var(--surface);
+    color: var(--ink-secondary);
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .filter .seg:hover {
+    background: var(--sunken);
+  }
+  .filter .seg.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
   }
   .favorites {
     margin-bottom: 10px;
