@@ -92,6 +92,14 @@ describe("resolveColor", () => {
     expect(Math.min(r, g, b)).toBeGreaterThan(0xC0);
   });
 
+  it("applies tint (lighten toward white) to a scheme color", () => {
+    // accent1 4472C4, tint 40000 → ch*0.4 + 255*0.6:
+    // R 68*0.4+153=180.2→B4, G 114*0.4+153=198.6→C7, B 196*0.4+153=231.4→E7
+    expect(resolveColor(colorEl(
+      `<a:solidFill><a:schemeClr val="accent1"><a:tint val="40000"/></a:schemeClr></a:solidFill>`), t))
+      .toBe("#B4C7E7");
+  });
+
   it("emits rgba when alpha is present", () => {
     expect(resolveColor(colorEl(
       `<a:solidFill><a:srgbClr val="FF0000"><a:alpha val="50000"/></a:srgbClr></a:solidFill>`), t))
@@ -271,7 +279,10 @@ describe("parseSlide — group transforms", () => {
   });
 
   it("composes nested groups", () => {
-    // outer sx=2 (off 0), inner sx=2 (off 0) → net sx=4.
+    // outer sx=2 with off.x=914400, inner sx=2 (off 0) → net sx=4.
+    // The outer's nonzero off pins the composition direction: parent∘local
+    // gives b = s_outer*b_inner + b_outer = 914400 EMU; the wrong order
+    // (local∘parent) would give 2*914400 = 1828800 EMU.
     const inner =
       `<p:grpSp><p:grpSpPr><a:xfrm>` +
         `<a:off x="0" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
@@ -282,13 +293,14 @@ describe("parseSlide — group transforms", () => {
       `</p:grpSp>`;
     const xml = slide(
       `<p:grpSp><p:grpSpPr><a:xfrm>` +
-        `<a:off x="0" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
+        `<a:off x="914400" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
         `<a:chOff x="0" y="0"/><a:chExt cx="1828800" cy="914400"/>` +
       `</a:xfrm></p:grpSpPr>` + inner + `</p:grpSp>`,
     );
     const [s] = parseSlide(xml).shapes;
-    // 4 * 228600 = 914400 EMU → 96 px
-    expect(s.x).toBe(96);
+    // slideX = 4*228600 + 914400 = 1828800 EMU → 192 px (288 px if composed backwards)
+    expect(s.x).toBe(192);
+    expect(s.y).toBe(0);
     expect(s.w).toBe(96); // 4 * 228600 / 9525
   });
 
