@@ -1397,7 +1397,8 @@ fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: Stri
         )
     };
     let ffmpeg = transcript::discover_ffmpeg();
-    let model = transcript::model_path(&base);
+    let model = model::selected_model_path(&base, model::ModelCategory::Transcription)
+        .unwrap_or_else(|| transcript::model_path(&base));
     if let Some(blocker) = transcript::transcription_blocker(ffmpeg.is_some(), model.is_file(), &model) {
         return Err(blocker);
     }
@@ -1450,7 +1451,8 @@ fn enqueue_transcriptions(app: &AppHandle, state: &SharedState, rels: &[String])
     let Some(ffmpeg) = transcript::discover_ffmpeg() else {
         return; // no ffmpeg → quiet no-op
     };
-    let model = transcript::model_path(&base);
+    let model = model::selected_model_path(&base, model::ModelCategory::Transcription)
+        .unwrap_or_else(|| transcript::model_path(&base));
     if !model.is_file() {
         return; // no model → quiet no-op
     }

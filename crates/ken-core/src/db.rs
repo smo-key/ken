@@ -1568,6 +1568,30 @@ mod tests {
     }
 
     #[test]
+    fn user_message_persists_and_reloads() {
+        // A user turn is appended and returned by chat_messages, so a transcript
+        // reload always includes the user's own message (the §9 vanish is purely
+        // a frontend echo-timing issue, not lost persistence).
+        let mut db = Db::open_in_memory().unwrap();
+        let chat_id = "c-persist";
+        db.upsert_chat(&ChatRow {
+            id: chat_id.into(),
+            title: "Persist".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 100,
+            last_active_at: 100,
+            archived: false,
+            model: None,
+        })
+        .unwrap();
+        db.append_chat_message(chat_id, "user", "hello there", 100).unwrap();
+        let msgs = db.chat_messages(chat_id).unwrap();
+        assert!(msgs.iter().any(|m| m.role == "user" && m.content == "hello there"));
+    }
+
+    #[test]
     fn chat_model_defaults_none_and_persists() {
         let mut db = Db::open_in_memory().unwrap();
         let chat = ChatRow {
