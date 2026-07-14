@@ -308,6 +308,25 @@ describe("parseSlide — custom geometry", () => {
     expect(s.pathH).toBe(100);
     expect(s.geomPath).toBe("M 0 0 L 50 0 Z M 60 60 L 90 60 Z");
   });
+
+  it("rescales a contour whose own w/h differ from the first path's space", () => {
+    // First contour defines the 100×100 viewBox; the second declares 200×200,
+    // so its coords must be halved into the first's space (200,200 → 100,100).
+    const mixed =
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:custGeom><a:pathLst>` +
+      `<a:path w="100" h="100"><a:moveTo><a:pt x="0" y="0"/></a:moveTo>` +
+      `<a:lnTo><a:pt x="50" y="0"/></a:lnTo><a:close/></a:path>` +
+      `<a:path w="200" h="200"><a:moveTo><a:pt x="0" y="0"/></a:moveTo>` +
+      `<a:lnTo><a:pt x="200" y="200"/></a:lnTo><a:close/></a:path>` +
+      `</a:pathLst></a:custGeom>` +
+      `<a:solidFill><a:srgbClr val="F2F2F2"/></a:solidFill></p:spPr></p:sp>`;
+    const [s] = parseSlide(slide(mixed)).shapes;
+    expect(s.kind).toBe("custgeom");
+    expect(s.pathW).toBe(100);
+    expect(s.pathH).toBe(100);
+    expect(s.geomPath).toBe("M 0 0 L 50 0 Z M 0 0 L 100 100 Z");
+  });
 });
 
 describe("parseSlide — group transforms", () => {

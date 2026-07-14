@@ -527,19 +527,30 @@ function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | nul
   const geom = firstChildTag(spPr, "a:custGeom");
   const path = geom && firstChildTag(geom, "a:path");
   if (!path) return null;
-  // All a:path contours share one path space (w/h taken from the first), so we
-  // concatenate every contour's commands into a single d rather than the first
-  // only — degrading to null only when NOTHING drawable results.
+  // Each a:path contour may declare its OWN w/h coordinate space. We take the
+  // first path's w/h as the viewBox and normalize every later contour's coords
+  // into that space (scale by firstW/thisW, firstH/thisH) so all contours
+  // concatenate into one correct d — degrading to null only when NOTHING
+  // drawable results. A later path with a zero w/h is skipped.
   const w = Number(path.getAttribute("w")) || 0;
   const h = Number(path.getAttribute("h")) || 0;
   const pathLst = path.parentElement;
   const paths = pathLst
     ? Array.from(pathLst.children).filter((c) => c.tagName === "a:path")
     : [path];
-  const pt = (el: Element | null) =>
-    el ? `${Number(el.getAttribute("x") ?? 0)} ${Number(el.getAttribute("y") ?? 0)}` : "0 0";
   const cmds: string[] = [];
   for (const p of paths) {
+    const pw = Number(p.getAttribute("w")) || 0;
+    const ph = Number(p.getAttribute("h")) || 0;
+    // Skip a contour whose own space is unusable while the first's isn't; the
+    // first path's zero w/h is caught by the nothing-drawable degrade below.
+    if (p !== path && (!pw || !ph)) continue;
+    const sx = p === path || pw === w ? 1 : w / pw;
+    const sy = p === path || ph === h ? 1 : h / ph;
+    const pt = (el: Element | null) =>
+      el
+        ? `${Number(el.getAttribute("x") ?? 0) * sx} ${Number(el.getAttribute("y") ?? 0) * sy}`
+        : "0 0";
     for (const seg of Array.from(p.children)) {
       const pts = Array.from(seg.getElementsByTagName("a:pt"));
       switch (seg.tagName) {
