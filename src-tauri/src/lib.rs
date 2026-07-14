@@ -7,6 +7,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use ken_core::assistant::{self, OneshotOutcome};
+use ken_core::automation::{self, Automation};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::cloud;
 use ken_core::db::{
@@ -233,8 +234,12 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                     let mut db = ingest_chat_db.lock().unwrap();
                     let row = db.get_chat(sid).ok().flatten().unwrap_or(ChatRow {
                         id: sid.clone(),
-                        title: format!("Ingest — {}", ev.slug),
-                        kind: "ingest".into(),
+                        title: if ev.kind == "automation" {
+                            format!("Automation — {}", ev.slug)
+                        } else {
+                            format!("Ingest — {}", ev.slug)
+                        },
+                        kind: ev.kind.clone(),
                         pinned: false,
                         status: status.into(),
                         created_at: now,
@@ -2002,6 +2007,116 @@ fn pending_approvals(state: State<SharedState>) -> CmdResult<Vec<RunRow>> {
     active.db.runs_with_status("pending_approval").map_err(err)
 }
 
+// ---------- automations ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationDetail {
+    automation: Automation,
+    runs: Vec<RunRow>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationForm {
+    slug: Option<String>,
+    name: String,
+    globs: Vec<String>,
+    prompt: String,
+    #[serde(default)]
+    auto_apply: bool,
+    #[serde(default = "default_true_cmd")]
+    enabled: bool,
+}
+fn default_true_cmd() -> bool {
+    true
+}
+
+#[tauri::command]
+fn list_automations(state: State<SharedState>) -> CmdResult<Vec<Automation>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    automation::list_ok(&active.project).map_err(err)
+}
+
+#[tauri::command]
+fn get_automation(state: State<SharedState>, slug: String) -> CmdResult<AutomationDetail> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let automation = automation::load_slug(&active.project, &slug).map_err(err)?;
+    let runs = active.db.list_runs_of_kind(&slug, "automation", 20).map_err(err)?;
+    Ok(AutomationDetail { automation, runs })
+}
+
+#[tauri::command]
+fn save_automation(state: State<SharedState>, form: AutomationForm) -> CmdResult<Automation> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let slug = match form.slug {
+        Some(s) => s,
+        None => {
+            let base = kebab(&form.name);
+            let mut slug = base.clone();
+            let mut n = 2;
+            while automation::automation_path(&active.project.root, &slug).exists() {
+                slug = format!("{base}-{n}");
+                n += 1;
+            }
+            slug
+        }
+    };
+    // Preserve unknown frontmatter on edit.
+    let mut a = automation::load_slug(&active.project, &slug).unwrap_or_else(|_| Automation {
+        slug: slug.clone(),
+        name: String::new(),
+        globs: vec![],
+        prompt: String::from("-"),
+        auto_apply: false,
+        enabled: true,
+        extra: Default::default(),
+    });
+    a.name = form.name;
+    a.globs = form.globs;
+    a.prompt = form.prompt;
+    a.auto_apply = form.auto_apply;
+    a.enabled = form.enabled;
+    automation::save(&active.project, &a).map_err(err)?;
+    automation::load_slug(&active.project, &a.slug).map_err(err)
+}
+
+#[tauri::command]
+fn delete_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    automation::delete(&active.project, &slug).map_err(err)
+}
+
+#[tauri::command]
+fn run_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    active.engine.run_automation(&slug);
+    Ok(())
+}
+
+#[tauri::command]
+fn approve_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    engine::approve_automation_proposal(&active.engine, &mut active.db, item_id).map_err(err)?;
+    let _ = app.emit("review-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn discard_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    engine::discard_automation_proposal(&mut active.db, item_id).map_err(err)?;
+    let _ = app.emit("review-changed", ());
+    Ok(())
+}
+
 // ---------- review inbox ----------
 
 #[derive(Serialize)]
@@ -3742,6 +3857,13 @@ pub fn run() {
             approve_run,
             discard_run,
             pending_approvals,
+            list_automations,
+            get_automation,
+            save_automation,
+            delete_automation,
+            run_automation,
+            approve_automation_proposal,
+            discard_automation_proposal,
             review_inbox,
             resolve_review_item,
             ignore_file,

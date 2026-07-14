@@ -24,7 +24,7 @@ pub struct Automation {
     pub auto_apply: bool,
     pub enabled: bool,
     #[serde(skip)]
-    pub(crate) extra: serde_yaml::Mapping,
+    pub extra: serde_yaml::Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
