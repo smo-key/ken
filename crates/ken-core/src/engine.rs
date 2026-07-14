@@ -362,6 +362,8 @@ fn execute(
             &plan.prompt,
             hooks,
             &token,
+            // Blocked detection is only live under hidden-TUI; the headless
+            // streaming branch ignores on_blocked by design (no startup gates).
             blocked_event,
             move |line: &str| {
                 act_emit(IngestEvent {

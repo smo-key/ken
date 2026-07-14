@@ -475,7 +475,8 @@ pub mod test_support {
     use std::path::{Path, PathBuf};
 
     /// Behaviours: complete | fail | hang | block | headless-fail |
-    /// stream-die | stream-stall | stream-hang | stream-fail — selected via a
+    /// stream-die | stream-stall | stream-hang | stream-fail |
+    /// stream-die-plain — selected via a
     /// `behavior` file next to the script (per-tempdir, so parallel tests
     /// never race).
     pub fn write_fake_claude(dir: &Path, behavior: &str) -> PathBuf {
@@ -540,6 +541,11 @@ if [ "$HEADLESS" = "1" ] && [ "$OUTFMT" = "stream-json" ]; then
   echo '{"type":"system","subtype":"init","session_id":"'"$SESSION"'"}'
   case "$BEHAVIOR" in
     stream-hang) sleep 300;;
+    stream-die-plain)
+      # Real-CLI crash shape: plain-text stdout (not stream-json), nonzero
+      # exit, NO terminal result event — must map to Failed, not Completed.
+      echo "boom: not json"
+      exit 3;;
     stream-fail)
       echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes/a.md"}}]}}'
       echo '{"type":"result","subtype":"error_during_execution","is_error":true}'
@@ -884,6 +890,26 @@ mod tests {
         assert!(staging.join("knowledge/People.md").is_file());
         let lines = seen.lock().unwrap().clone();
         assert!(lines.iter().any(|l| l.contains("Read notes/a.md")), "{lines:?}");
+    }
+
+    /// Real-CLI crash shape on the streaming path: plain-text stdout, nonzero
+    /// exit, no stream-json result event — the `(false, None)` arm must report
+    /// Failed, never Completed.
+    #[test]
+    fn headless_streaming_fails_on_nonzero_exit_without_result_event() {
+        let (dir, bin, hooks) = setup("stream-die-plain");
+        let outcome = run_ingest_session(
+            &cfg(&bin, RunnerMode::Headless, 30),
+            dir.path(),
+            "sess-stream-die-plain",
+            "prompt",
+            &hooks,
+            &CancelToken::new(),
+            || {},
+            |_l: &str| {},
+        )
+        .unwrap();
+        assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
     }
 
     #[test]
