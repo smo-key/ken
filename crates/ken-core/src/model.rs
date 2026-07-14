@@ -181,15 +181,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// **Deprecated compatibility shim (retire in Task 10).** Runtime discovery is
-/// gone; this returns the curated transcription specs (ignoring the source) so
-/// `src-tauri` keeps compiling until its model commands are rewired onto
-/// [`catalog`]/[`category_specs`]/[`selected`].
-#[deprecated(note = "use catalog()/category_specs(); removed when src-tauri is rewired (Task 10)")]
-pub fn discover_models<S: ByteSource>(_source: &S) -> Vec<ModelSpec> {
-    category_specs(ModelCategory::Transcription)
-}
-
 // ---------- installed-state + target path ----------
 
 /// Where a model file installs to. Derived from `transcript.rs`'s own path

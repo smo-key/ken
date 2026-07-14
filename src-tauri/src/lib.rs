@@ -96,10 +96,8 @@ struct AppState {
     /// Model downloads are app-global (they live under the app-data dir, not a
     /// project), so their bookkeeping hangs off the top-level state: the set of
     /// model ids downloading right now (guards a second concurrent download of
-    /// the same id) and a cache of the runtime-discovered model listing so we
-    /// don't re-hit the network on every status/download call.
+    /// the same id).
     model_downloads: Arc<Mutex<std::collections::HashSet<String>>>,
-    model_cache: Arc<Mutex<Option<Vec<model::ModelSpec>>>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -1524,6 +1522,13 @@ struct ModelStatusDto {
     expected_bytes: u64,
     /// The recommended default, pre-selected in the UI.
     recommended: bool,
+    /// "transcription" | "language"
+    category: String,
+    /// "recommended" | "advanced"
+    tier: String,
+    blurb: String,
+    /// Whether this is the selected model for its category.
+    selected: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -1541,29 +1546,30 @@ struct ModelError {
     message: String,
 }
 
-fn status_dto(base_dir: &std::path::Path, spec: &model::ModelSpec) -> ModelStatusDto {
-    let size = model::installed_size(base_dir, spec);
+fn status_dto(
+    base_dir: &std::path::Path,
+    entry: &model::CatalogEntry,
+    selected_id: &str,
+) -> ModelStatusDto {
+    let size = model::installed_size(base_dir, &entry.spec);
     ModelStatusDto {
-        id: spec.id.clone(),
-        name: spec.name.clone(),
+        id: entry.spec.id.clone(),
+        name: entry.spec.name.clone(),
         installed: size.is_some(),
         size_bytes: size,
-        expected_bytes: spec.expected_bytes,
-        recommended: spec.recommended,
+        expected_bytes: entry.spec.expected_bytes,
+        recommended: entry.spec.recommended,
+        category: match entry.category {
+            model::ModelCategory::Transcription => "transcription".into(),
+            model::ModelCategory::Language => "language".into(),
+        },
+        tier: match entry.tier {
+            model::ModelTier::Recommended => "recommended".into(),
+            model::ModelTier::Advanced => "advanced".into(),
+        },
+        blurb: entry.blurb.to_string(),
+        selected: entry.spec.id == selected_id,
     }
-}
-
-/// The runtime-discovered model listing, cached so we hit the network at most
-/// once per session. Discovery falls back to the recommended model offline.
-fn discovered_specs(
-    cache: &Arc<Mutex<Option<Vec<model::ModelSpec>>>>,
-) -> Vec<model::ModelSpec> {
-    if let Some(cached) = cache.lock().unwrap().clone() {
-        return cached;
-    }
-    let specs = model::discover_models(&model::HttpSource);
-    *cache.lock().unwrap() = Some(specs.clone());
-    specs
 }
 
 /// Status of the recommended model only — cheap and offline (just a file
@@ -1572,20 +1578,36 @@ fn discovered_specs(
 #[tauri::command]
 fn model_status(state: State<SharedState>) -> CmdResult<ModelStatusDto> {
     let base = { state.lock().unwrap().base_dir.clone() };
-    Ok(status_dto(&base, &model::recommended()))
+    let rec = model::catalog()
+        .into_iter()
+        .find(|e| e.category == model::ModelCategory::Transcription && e.spec.recommended)
+        .expect("recommended transcription model");
+    let selected_id = model::selected(&base, model::ModelCategory::Transcription).id;
+    Ok(status_dto(&base, &rec, &selected_id))
 }
 
-/// All models available to download, discovered from the whisper.cpp repo
-/// (recommended first). Hits the network once, then serves from cache; degrades
-/// to the recommended model alone when offline.
+/// All curated models available to download, in catalog order. Fully offline
+/// (just file checks): each entry carries its category, tier, blurb, and whether
+/// it is the selected model for its category.
 #[tauri::command]
 fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
-    let (base, cache) = {
-        let guard = state.lock().unwrap();
-        (guard.base_dir.clone(), guard.model_cache.clone())
-    };
-    let specs = discovered_specs(&cache);
-    Ok(specs.iter().map(|s| status_dto(&base, s)).collect())
+    let base = { state.lock().unwrap().base_dir.clone() };
+    let sel_trans = model::selected(&base, model::ModelCategory::Transcription).id;
+    // The language selection is resolved lazily, per language entry: while the
+    // language catalog is empty `model::selected(_, Language)` has no recommended
+    // fallback and would panic, so we never call it until a language entry exists.
+    Ok(model::catalog()
+        .iter()
+        .map(|e| {
+            let selected_id = match e.category {
+                model::ModelCategory::Transcription => sel_trans.clone(),
+                model::ModelCategory::Language => {
+                    model::selected(&base, model::ModelCategory::Language).id
+                }
+            };
+            status_dto(&base, e, &selected_id)
+        })
+        .collect())
 }
 
 /// Start downloading a model. Returns immediately; progress and completion flow
@@ -1596,13 +1618,9 @@ fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
 /// own thread (like `spawn_transcription`).
 #[tauri::command]
 fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
-    let (base, downloads, cache) = {
+    let (base, downloads) = {
         let guard = state.lock().unwrap();
-        (
-            guard.base_dir.clone(),
-            guard.model_downloads.clone(),
-            guard.model_cache.clone(),
-        )
+        (guard.base_dir.clone(), guard.model_downloads.clone())
     };
     {
         let mut in_flight = downloads.lock().unwrap();
@@ -1613,14 +1631,8 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
 
     let app = app.clone();
     std::thread::spawn(move || {
-        // Recommended resolves without the network so the default works
-        // offline; other ids come from the discovered listing.
-        let spec = if id == model::RECOMMENDED_FILE {
-            Some(model::recommended())
-        } else {
-            discovered_specs(&cache).into_iter().find(|s| s.id == id)
-        };
-        let Some(spec) = spec else {
+        // The curated catalog resolves every downloadable model offline.
+        let Some(spec) = model::find_spec(&id) else {
             let _ = app.emit(
                 "model-download-error",
                 ModelError { id: id.clone(), message: "Unknown model.".into() },
@@ -1666,16 +1678,29 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
 #[tauri::command]
 fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
     let base = { state.lock().unwrap().base_dir.clone() };
-    // Only the file name is needed to locate the install; build a minimal spec.
-    let spec = model::ModelSpec {
+    // Prefer the catalog spec; fall back to a minimal one so an unknown id (e.g.
+    // a stale install) can still be removed by file name.
+    let spec = model::find_spec(&id).unwrap_or_else(|| model::ModelSpec {
         id: id.clone(),
         name: id.clone(),
         file: id.clone(),
         url: String::new(),
         expected_bytes: 0,
-        recommended: id == model::RECOMMENDED_FILE,
-    };
+        recommended: false,
+    });
     model::remove(&base, &spec).map_err(err)
+}
+
+/// Persist the user's chosen model for a category ("transcription" | "language").
+#[tauri::command]
+fn set_model_selection(state: State<SharedState>, category: String, id: String) -> CmdResult<()> {
+    let base = { state.lock().unwrap().base_dir.clone() };
+    let cat = match category.as_str() {
+        "transcription" => model::ModelCategory::Transcription,
+        "language" => model::ModelCategory::Language,
+        other => return Err(format!("unknown model category: {other}")),
+    };
+    model::set_selected(&base, cat, &id).map_err(err)
 }
 
 // ---------- ingest commands ----------
@@ -3379,7 +3404,6 @@ pub fn run() {
         hooks: None,
         active: None,
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
-        model_cache: Arc::new(Mutex::new(None)),
     }));
 
     tauri::Builder::default()
@@ -3435,6 +3459,7 @@ pub fn run() {
             list_models,
             download_model,
             remove_model,
+            set_model_selection,
             list_ingests,
             get_ingest,
             save_ingest,

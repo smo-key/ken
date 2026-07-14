@@ -326,6 +326,13 @@ export interface ModelStatus {
   expectedBytes: number;
   /** The recommended default, pre-selected in the UI. */
   recommended: boolean;
+  /** "transcription" | "language" */
+  category: "transcription" | "language";
+  /** "recommended" | "advanced" */
+  tier: "recommended" | "advanced";
+  blurb: string;
+  /** Whether this is the selected model for its category. */
+  selected: boolean;
 }
 
 /** Payload of the `model-download-progress` event. */
@@ -430,6 +437,8 @@ export const api = {
   /// Starts a download; progress/completion arrive via `model-download-progress`.
   downloadModel: (id: string) => invoke<void>("download_model", { id }),
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
+  setModelSelection: (category: "transcription" | "language", id: string) =>
+    invoke<void>("set_model_selection", { category, id }),
 
   listIngests: () => invoke<IngestSummary[]>("list_ingests"),
   getIngest: (slug: string) => invoke<IngestDetail>("get_ingest", { slug }),
