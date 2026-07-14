@@ -289,6 +289,25 @@ describe("parseSlide — custom geometry", () => {
     expect(s.fill).toBeUndefined();
     expect(s.line?.color).toBe("#333333");
   });
+
+  it("concatenates every a:path contour in the pathLst into one d string", () => {
+    // Two separate moveTo/lnTo/close subpaths share the same path space; the
+    // parser should emit both as two M…Z runs in a single d, not just the first.
+    const twoContour =
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:custGeom><a:pathLst>` +
+      `<a:path w="100" h="100"><a:moveTo><a:pt x="0" y="0"/></a:moveTo>` +
+      `<a:lnTo><a:pt x="50" y="0"/></a:lnTo><a:close/></a:path>` +
+      `<a:path w="100" h="100"><a:moveTo><a:pt x="60" y="60"/></a:moveTo>` +
+      `<a:lnTo><a:pt x="90" y="60"/></a:lnTo><a:close/></a:path>` +
+      `</a:pathLst></a:custGeom>` +
+      `<a:solidFill><a:srgbClr val="F2F2F2"/></a:solidFill></p:spPr></p:sp>`;
+    const [s] = parseSlide(slide(twoContour)).shapes;
+    expect(s.kind).toBe("custgeom");
+    expect(s.pathW).toBe(100);
+    expect(s.pathH).toBe(100);
+    expect(s.geomPath).toBe("M 0 0 L 50 0 Z M 60 60 L 90 60 Z");
+  });
 });
 
 describe("parseSlide — group transforms", () => {

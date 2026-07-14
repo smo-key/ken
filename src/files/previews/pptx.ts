@@ -527,22 +527,30 @@ function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | nul
   const geom = firstChildTag(spPr, "a:custGeom");
   const path = geom && firstChildTag(geom, "a:path");
   if (!path) return null;
+  // All a:path contours share one path space (w/h taken from the first), so we
+  // concatenate every contour's commands into a single d rather than the first
+  // only — degrading to null only when NOTHING drawable results.
   const w = Number(path.getAttribute("w")) || 0;
   const h = Number(path.getAttribute("h")) || 0;
+  const pathLst = path.parentElement;
+  const paths = pathLst
+    ? Array.from(pathLst.children).filter((c) => c.tagName === "a:path")
+    : [path];
   const pt = (el: Element | null) =>
     el ? `${Number(el.getAttribute("x") ?? 0)} ${Number(el.getAttribute("y") ?? 0)}` : "0 0";
   const cmds: string[] = [];
-  for (const seg of Array.from(path.children)) {
-    const pts = Array.from(seg.getElementsByTagName("a:pt"));
-    switch (seg.tagName) {
-      case "a:moveTo":   cmds.push(`M ${pt(pts[0])}`); break;
-      case "a:lnTo":     cmds.push(`L ${pt(pts[0])}`); break;
-      case "a:cubicBezTo": cmds.push(`C ${pt(pts[0])} ${pt(pts[1])} ${pt(pts[2])}`); break;
-      case "a:quadBezTo":  cmds.push(`Q ${pt(pts[0])} ${pt(pts[1])}`); break;
-      case "a:close":    cmds.push("Z"); break;
-      // a:arcTo (wR/hR/stAng/swAng) is rare and absent from the diagnosed deck;
-      // v1 approximates it by a line to its listed a:pt if present, else skips.
-      case "a:arcTo":    if (pts[0]) cmds.push(`L ${pt(pts[0])}`); break;
+  for (const p of paths) {
+    for (const seg of Array.from(p.children)) {
+      const pts = Array.from(seg.getElementsByTagName("a:pt"));
+      switch (seg.tagName) {
+        case "a:moveTo":   cmds.push(`M ${pt(pts[0])}`); break;
+        case "a:lnTo":     cmds.push(`L ${pt(pts[0])}`); break;
+        case "a:cubicBezTo": cmds.push(`C ${pt(pts[0])} ${pt(pts[1])} ${pt(pts[2])}`); break;
+        case "a:quadBezTo":  cmds.push(`Q ${pt(pts[0])} ${pt(pts[1])}`); break;
+        case "a:close":    cmds.push("Z"); break;
+        // arcTo is skipped (no a:pt child in the schema); v1 degrade.
+        case "a:arcTo":    break;
+      }
     }
   }
   if (!cmds.length || !w || !h) return null;
