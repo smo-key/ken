@@ -205,6 +205,29 @@ pub fn metadata_header(
     )
 }
 
+/// A live audio source. The backend owns its own capture thread (cpal `Stream`
+/// is `!Send`), calling `sink` with device-native interleaved f32 frames plus
+/// the device's sample rate and channel count. `stop` ends capture. Behind this
+/// seam the session's per-callback work (`ingest_frames`) is tested with a fake.
+pub trait CaptureSource: Send {
+    fn start(&mut self, sink: Box<dyn FnMut(&[f32], u32, u16) + Send>) -> Result<()>;
+    fn stop(&mut self);
+}
+
+/// The per-callback core: downmix one device block to mono, resample it to
+/// 16 kHz through the source's running resampler, and return the 16 kHz samples
+/// (ready to write to the WAV) plus this block's meter level. Hardware-free.
+pub fn ingest_frames(
+    resampler: &mut LinearResampler,
+    interleaved: &[f32],
+    channels: u16,
+) -> (Vec<f32>, f32) {
+    let mono = downmix_to_mono(interleaved, channels);
+    let out = resampler.process(&mono);
+    let level = rms(&out);
+    (out, level)
+}
+
 /// Body used when the storage choice is "audio" (WAVs kept, no transcription).
 pub const AUDIO_ONLY_NOTE: &str =
     "_This recording's audio was saved without a transcript._\n";
@@ -501,6 +524,54 @@ mod tests {
         // Audio-only note stands in for an absent transcript.
         let audio = build_document(&header, AUDIO_ONLY_NOTE);
         assert!(audio.contains("audio was saved without a transcript"));
+    }
+
+    /// A hardware-free source: on `start` it hands the sink one synthesized
+    /// stereo block at 48 kHz, then reports stopped.
+    struct FakeSource {
+        started: bool,
+    }
+    impl CaptureSource for FakeSource {
+        fn start(&mut self, mut sink: Box<dyn FnMut(&[f32], u32, u16) + Send>) -> Result<()> {
+            self.started = true;
+            // 480 stereo frames (10ms @48k) of a constant 0.5 in both channels.
+            let block: Vec<f32> = std::iter::repeat(0.5).take(480 * 2).collect();
+            sink(&block, 48_000, 2);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.started = false;
+        }
+    }
+
+    #[test]
+    fn ingest_pipeline_downmixes_resamples_and_meters() {
+        // Drive one callback through the same helper the live session uses.
+        let mut resampler = LinearResampler::new(48_000, TARGET_RATE);
+        let stereo: Vec<f32> = std::iter::repeat(0.5).take(480 * 2).collect();
+        let (out, level) = ingest_frames(&mut resampler, &stereo, 2);
+        // 480 frames @48k -> ~160 samples @16k.
+        assert!((out.len() as i64 - 160).abs() <= 2, "len {}", out.len());
+        // Constant 0.5 survives downmix + resample.
+        for s in &out {
+            assert!((s - 0.5).abs() < 1e-3);
+        }
+        // RMS of a constant 0.5 signal is 0.5.
+        assert!((level - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fake_source_feeds_the_sink() {
+        use std::sync::{Arc, Mutex};
+        let mut src = FakeSource { started: false };
+        let seen = Arc::new(Mutex::new(Vec::<(usize, u32, u16)>::new()));
+        let seen2 = seen.clone();
+        src.start(Box::new(move |data, rate, ch| {
+            seen2.lock().unwrap().push((data.len(), rate, ch));
+        }))
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), &[(480 * 2, 48_000, 2)]);
+        src.stop();
     }
 
     #[test]
