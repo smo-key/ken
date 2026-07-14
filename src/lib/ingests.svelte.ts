@@ -13,6 +13,11 @@ import {
 /** Run statuses that mean "the run is over". */
 const TERMINAL: LiveStatus[] = ["fresh", "failed", "discarded", "cancelled", "pending_approval"];
 
+/** Only ingest-kind events belong to this store; automations route elsewhere. */
+export function routesToIngest(ev: IngestEvent): boolean {
+  return ev.kind === "ingest";
+}
+
 class IngestsStore {
   summaries = $state<IngestSummary[]>([]);
   selected = $state<string | null>(null);
@@ -30,6 +35,11 @@ class IngestsStore {
     return this.live[slug]?.status ?? null;
   }
 
+  /** The raw live event for a slug (activity/elapsed/eta), or null. */
+  liveEvent(slug: string): IngestEvent | null {
+    return this.live[slug] ?? null;
+  }
+
   async init() {
     await api.onIngestRunChanged((ev) => void this.onEvent(ev));
     await this.refresh();
@@ -37,6 +47,10 @@ class IngestsStore {
   }
 
   private async onEvent(ev: IngestEvent) {
+    // Automation events share the channel but belong to the automations store.
+    if (!routesToIngest(ev)) return;
+    // queued/waiting/running are non-terminal: keep the transient marker so the
+    // detail pane can render the live caption; only TERMINAL drops it + refreshes.
     this.live = { ...this.live, [ev.slug]: ev };
     if (TERMINAL.includes(ev.status)) {
       await this.refresh();
