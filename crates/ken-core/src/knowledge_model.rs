@@ -26,6 +26,18 @@ const MAX_PROMPT_FILES: usize = 400;
 const MAX_ENTITIES: usize = 200;
 const MAX_EVENTS: usize = 150;
 
+/// Per-file sanity caps for incremental extraction — bound the junk one bad
+/// generation can inject. Deliberately NOT a global cap; the whole model grows
+/// with the corpus.
+pub const FILE_MAX_ENTITIES: usize = 40;
+pub const FILE_MAX_RELATIONS: usize = 60;
+pub const FILE_MAX_EVENTS: usize = 20;
+
+/// The file's extracted text is truncated to this many characters before
+/// prompting — ~6k tokens at 4 chars/token, comfortably inside the local
+/// model's context alongside the instructions.
+pub const EXTRACT_CHAR_BUDGET: usize = 24_000;
+
 /// Corpus-wide reading is slower than a digest.
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -96,6 +108,64 @@ Indexed source files:\n"
         p.push_str(&format!("- …and {} more\n", files.len() - MAX_PROMPT_FILES));
     }
     p
+}
+
+/// A deterministic 64-bit FNV-1a of the extracted text, hex-encoded. Stored in
+/// `extractions.content_hash` to detect when a re-index actually changed a
+/// file's content (mtime/size churn without content change is common on sync
+/// clients, and must not re-run extraction).
+pub fn content_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The per-file extraction prompt: read ONE file's already-extracted text and
+/// answer with a single strict-JSON delta. Shapes match `parse_delta_value`:
+/// entities carry no sources (the merge attributes them to this file), and
+/// relations name entities by their display name.
+pub fn compose_file_prompt(rel_path: &str, text: &str, today: &str) -> String {
+    // Budget the whole prompt, not just the body: the instructions must fit
+    // "alongside" the document inside EXTRACT_CHAR_BUDGET. Build the fixed
+    // preamble first, then let the body fill whatever characters remain.
+    let head = format!(
+        "You are Ken, extracting the knowledge in ONE document for a project's \
+Map and Timeline. Today's date is {today}.\n\n\
+Read the document below (path: {rel_path}) and output ONLY a JSON object — no \
+prose before or after, no code fences — shaped exactly like this:\n\
+{{\n\
+  \"entities\": [\n\
+    {{\"kind\": \"person|organization|topic|decision|other\", \
+\"name\": \"short display name\", \"summary\": \"one plain sentence\"}}\n\
+  ],\n\
+  \"relations\": [\n\
+    {{\"a\": \"one entity's name\", \"b\": \"another entity's name\", \
+\"label\": \"short relation\"}}\n\
+  ],\n\
+  \"events\": [\n\
+    {{\"date\": \"yyyy-mm-dd\", \"category\": \"one lowercase word\", \
+\"text\": \"one plain sentence\"}}\n\
+  ]\n\
+}}\n\n\
+Rules:\n\
+- At most {FILE_MAX_ENTITIES} entities, {FILE_MAX_RELATIONS} relations, and \
+{FILE_MAX_EVENTS} events — only what THIS document grounds; never invent.\n\
+- relations.a and relations.b must each name an entity in your list.\n\
+- Dates are best effort — omit events with no inferable yyyy-mm-dd date.\n\n\
+Document:\n"
+    );
+    // Reserve the preamble (and the trailing newline) so the full prompt stays
+    // within budget.
+    let body_budget = EXTRACT_CHAR_BUDGET.saturating_sub(head.chars().count() + 1);
+    let body: String = if text.chars().count() > body_budget {
+        text.chars().take(body_budget).collect()
+    } else {
+        text.to_string()
+    };
+    format!("{head}{body}\n")
 }
 
 /// Parse an extraction answer tolerantly: find the JSON object (fences
@@ -458,6 +528,39 @@ fn valid_date(d: &str) -> bool {
 mod tests {
     use super::*;
     use crate::runner::test_support::write_fake_claude;
+
+    #[test]
+    fn content_hash_is_stable_and_sensitive() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("hello "));
+        // 16 lowercase hex digits.
+        let h = content_hash("anything");
+        assert_eq!(h.len(), 16);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn file_prompt_is_single_file_and_strict() {
+        let p = compose_file_prompt("notes/kickoff.md", "We hired Priya.", "2026-07-14");
+        assert!(p.contains("notes/kickoff.md"));
+        assert!(p.contains("We hired Priya."));
+        assert!(p.contains("ONLY a JSON object"));
+        assert!(p.contains("\"relations\""));
+        assert!(p.contains("\"events\""));
+        assert!(p.contains("person|organization|topic|decision|other"));
+        assert!(p.contains("yyyy-mm-dd"));
+        assert!(p.contains("2026-07-14"));
+        // Per-file caps are stated so the model self-limits.
+        assert!(p.contains("40 entities"));
+    }
+
+    #[test]
+    fn file_prompt_truncates_to_budget() {
+        let big = "x".repeat(EXTRACT_CHAR_BUDGET + 5_000);
+        let p = compose_file_prompt("big.md", &big, "2026-07-14");
+        // The document body is capped; the surrounding instructions are small.
+        assert!(p.matches('x').count() <= EXTRACT_CHAR_BUDGET);
+    }
 
     // ---------- auto-build policy ----------
 
