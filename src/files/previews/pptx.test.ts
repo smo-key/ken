@@ -235,6 +235,75 @@ describe("parseSlide — images and shapes", () => {
   });
 });
 
+describe("parseSlide — group transforms", () => {
+  it("passes child coords through an identity group unchanged", () => {
+    // off==chOff, ext==chExt → transform is the identity.
+    const xml = slide(
+      `<p:grpSp><p:grpSpPr><a:xfrm>` +
+        `<a:off x="914400" y="0"/><a:ext cx="1828800" cy="914400"/>` +
+        `<a:chOff x="914400" y="0"/><a:chExt cx="1828800" cy="914400"/>` +
+      `</a:xfrm></p:grpSpPr>` +
+      `<p:sp><p:spPr><a:xfrm><a:off x="1371600" y="457200"/><a:ext cx="457200" cy="457200"/></a:xfrm>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr></p:sp>` +
+      `</p:grpSp>`,
+    );
+    const [s] = parseSlide(xml).shapes;
+    expect(s.x).toBe(144); // 1371600 EMU / 9525
+    expect(s.y).toBe(48);
+    expect(s.w).toBe(48);
+  });
+
+  it("scales and translates child coords by the group's ext/chExt+off/chOff", () => {
+    // off=(914400,0) chOff=(0,0) ext=2*chExt → sx=2, bx=914400 EMU.
+    const xml = slide(
+      `<p:grpSp><p:grpSpPr><a:xfrm>` +
+        `<a:off x="914400" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
+        `<a:chOff x="0" y="0"/><a:chExt cx="1828800" cy="914400"/>` +
+      `</a:xfrm></p:grpSpPr>` +
+      `<p:sp><p:spPr><a:xfrm><a:off x="457200" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr></p:sp>` +
+      `</p:grpSp>`,
+    );
+    const [s] = parseSlide(xml).shapes;
+    // slideX = 2*457200 + 914400 = 1828800 EMU → 192 px
+    expect(s.x).toBe(192);
+    expect(s.w).toBe(192); // 2 * 914400 / 9525
+  });
+
+  it("composes nested groups", () => {
+    // outer sx=2 (off 0), inner sx=2 (off 0) → net sx=4.
+    const inner =
+      `<p:grpSp><p:grpSpPr><a:xfrm>` +
+        `<a:off x="0" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
+        `<a:chOff x="0" y="0"/><a:chExt cx="1828800" cy="914400"/>` +
+      `</a:xfrm></p:grpSpPr>` +
+      `<p:sp><p:spPr><a:xfrm><a:off x="228600" y="0"/><a:ext cx="228600" cy="228600"/></a:xfrm>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr></p:sp>` +
+      `</p:grpSp>`;
+    const xml = slide(
+      `<p:grpSp><p:grpSpPr><a:xfrm>` +
+        `<a:off x="0" y="0"/><a:ext cx="3657600" cy="1828800"/>` +
+        `<a:chOff x="0" y="0"/><a:chExt cx="1828800" cy="914400"/>` +
+      `</a:xfrm></p:grpSpPr>` + inner + `</p:grpSp>`,
+    );
+    const [s] = parseSlide(xml).shapes;
+    // 4 * 228600 = 914400 EMU → 96 px
+    expect(s.x).toBe(96);
+    expect(s.w).toBe(96); // 4 * 228600 / 9525
+  });
+
+  it("passes rot and flip through onto the shape", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm rot="5400000" flipH="1">` +
+        `<a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr></p:sp>`,
+    );
+    const [s] = parseSlide(xml).shapes;
+    expect(s.rot).toBe(90);   // 5400000 / 60000
+    expect(s.flipH).toBe(true);
+  });
+});
+
 describe("parseSlide — the repo fixture deck", () => {
   it("still reads text from a bare slide that has no positions at all", () => {
     // Mirrors crates/ken-core/fixtures/.../deck.pptx slide1 (no xfrm, no rels).

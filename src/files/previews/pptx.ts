@@ -52,6 +52,11 @@ export interface Shape {
   geom?: "rect" | "ellipse" | "roundRect";
   isTitle: boolean;
   anchor: "top" | "center" | "bottom";
+  /** Clockwise rotation in degrees (from a:xfrm rot, 60000ths of a degree). */
+  rot?: number;
+  /** Horizontal / vertical flip flags (from a:xfrm flipH/flipV). */
+  flipH?: boolean;
+  flipV?: boolean;
 }
 
 export interface ParsedSlide {
@@ -153,6 +158,66 @@ function xfrmOf(sp: Element): Pick<Shape, "x" | "y" | "w" | "h"> {
     y: emuToPx(Number(off.getAttribute("y") ?? 0)),
     w: emuToPx(Number(ext.getAttribute("cx") ?? 0)),
     h: emuToPx(Number(ext.getAttribute("cy") ?? 0)),
+  };
+}
+
+/** Per-shape rotation/flip, read off its own a:xfrm and passed through verbatim. */
+function rotFlipOf(el: Element): Pick<Shape, "rot" | "flipH" | "flipV"> {
+  const xfrm = firstChildTag(el, "a:xfrm");
+  if (!xfrm) return {};
+  const out: Pick<Shape, "rot" | "flipH" | "flipV"> = {};
+  const rot = Number(xfrm.getAttribute("rot"));
+  if (rot) out.rot = rot / 60000; // 60000ths of a degree → degrees
+  if (xfrm.getAttribute("flipH") === "1") out.flipH = true;
+  if (xfrm.getAttribute("flipV") === "1") out.flipV = true;
+  return out;
+}
+
+// A group's a:xfrm maps child-space coords into slide space via an affine
+// slide = s*child + b (per axis). Contexts compose so nested groups stack.
+interface Ctx { sx: number; sy: number; bx: number; by: number; }
+const IDENTITY: Ctx = { sx: 1, sy: 1, bx: 0, by: 0 };
+
+/** Read a group's own a:xfrm (under p:grpSpPr) and compose it onto the parent ctx. */
+function groupCtx(grp: Element, parent: Ctx): Ctx {
+  const grpPr = firstChildTag(grp, "p:grpSpPr") ?? grp;
+  const xfrm = firstChildTag(grpPr, "a:xfrm");
+  if (!xfrm) return parent;
+  const off = firstChildTag(xfrm, "a:off");
+  const ext = firstChildTag(xfrm, "a:ext");
+  const chOff = firstChildTag(xfrm, "a:chOff");
+  const chExt = firstChildTag(xfrm, "a:chExt");
+  if (!off || !ext || !chOff || !chExt) return parent;
+  const num = (el: Element, a: string) => Number(el.getAttribute(a) ?? 0);
+  const chcx = num(chExt, "cx"), chcy = num(chExt, "cy");
+  const sx = chcx ? num(ext, "cx") / chcx : 1;
+  const sy = chcy ? num(ext, "cy") / chcy : 1;
+  // local (px): slide = s * child + b, with b = off - chOff*s
+  const local: Ctx = {
+    sx, sy,
+    bx: emuToPx(num(off, "x") - num(chOff, "x") * sx),
+    by: emuToPx(num(off, "y") - num(chOff, "y") * sy),
+  };
+  // compose parent ∘ local: s = ps*ls, b = ps*lb + pb
+  return {
+    sx: parent.sx * local.sx,
+    sy: parent.sy * local.sy,
+    bx: parent.sx * local.bx + parent.bx,
+    by: parent.sy * local.by + parent.by,
+  };
+}
+
+/** Apply a ctx to an already-EMU→px shape box. Identity is a no-op. */
+function applyCtx(
+  ctx: Ctx,
+  box: Pick<Shape, "x" | "y" | "w" | "h">,
+): Pick<Shape, "x" | "y" | "w" | "h"> {
+  if (box.x === null || box.y === null) return box; // unpositioned stays unpositioned
+  return {
+    x: ctx.bx + ctx.sx * box.x,
+    y: ctx.by + ctx.sy * box.y,
+    w: box.w === null ? null : box.w * ctx.sx,
+    h: box.h === null ? null : box.h * ctx.sy,
   };
 }
 
@@ -405,7 +470,7 @@ const GEOM: Record<string, Shape["geom"]> = {
   roundRect: "roundRect",
 };
 
-function parseSp(sp: Element, theme?: ThemeContext): Shape | null {
+function parseSp(sp: Element, theme?: ThemeContext, ctx: Ctx = IDENTITY): Shape | null {
   const paragraphs = paragraphsOf(sp, theme);
   const spPr = firstChildTag(sp, "p:spPr");
   const fill = resolveColor(spPr, theme);
@@ -426,7 +491,8 @@ function parseSp(sp: Element, theme?: ThemeContext): Shape | null {
 
   return {
     kind: "shape",
-    ...xfrmOf(sp),
+    ...applyCtx(ctx, xfrmOf(sp)),
+    ...rotFlipOf(sp),
     paragraphs,
     fill,
     geom,
@@ -435,11 +501,12 @@ function parseSp(sp: Element, theme?: ThemeContext): Shape | null {
   };
 }
 
-function parsePic(pic: Element): Shape | null {
+function parsePic(pic: Element, ctx: Ctx = IDENTITY): Shape | null {
   const embedId = relAttr(firstChildTag(pic, "a:blip") ?? pic, "embed");
   return {
     kind: "image",
-    ...xfrmOf(pic),
+    ...applyCtx(ctx, xfrmOf(pic)),
+    ...rotFlipOf(pic),
     paragraphs: [],
     embedId: embedId ?? undefined,
     isTitle: false,
@@ -453,20 +520,21 @@ export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide 
     doc.getElementsByTagName("p:spTree")[0] ?? doc.documentElement;
   const shapes: Shape[] = [];
   // Walk direct children in authored order so z-order is preserved. Group
-  // shapes (p:grpSp) are flattened one level; nested groups are uncommon.
-  const walk = (parent: Element) => {
+  // shapes (p:grpSp) carry an a:xfrm that maps their child coordinate space into
+  // slide space; we compose that onto the running ctx so nested groups stack.
+  const walk = (parent: Element, ctx: Ctx) => {
     for (const el of Array.from(parent.children)) {
       if (el.tagName === "p:sp") {
-        const s = parseSp(el, theme);
+        const s = parseSp(el, theme, ctx);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:pic") {
-        const s = parsePic(el);
+        const s = parsePic(el, ctx);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:grpSp") {
-        walk(el);
+        walk(el, groupCtx(el, ctx));
       }
     }
   };
-  walk(tree);
+  walk(tree, IDENTITY);
   return { shapes };
 }
