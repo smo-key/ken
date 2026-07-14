@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { ingests, statusCaption } from "../lib/ingests.svelte";
+  import { liveCaption, countdownFrom, type Tone } from "../lib/liveRun";
   import { timeAgo } from "../lib/format";
   import IngestForm from "../ingests/IngestForm.svelte";
   import TemplateGallery from "../ingests/TemplateGallery.svelte";
@@ -36,6 +37,76 @@
   const isRunning = $derived(
     liveForSelected === "running" || liveForSelected === "blocked",
   );
+
+  // A local clock so the elapsed timer and queued countdown advance smoothly
+  // between the (coarser) server events. It only ticks while something is live.
+  let nowTick = $state(Date.now());
+  $effect(() => {
+    const ticking = Object.values(ingests.live).some(
+      (e) => e.status === "running" || e.status === "queued",
+    );
+    if (!ticking) return;
+    nowTick = Date.now();
+    const id = setInterval(() => (nowTick = Date.now()), 1000);
+    return () => clearInterval(id);
+  });
+
+  // Per-run anchors so ticking is stable across re-renders. Non-reactive on
+  // purpose — the reactive inputs are `ingests.live` and `nowTick`.
+  const seenEvent = new Map<string, unknown>();
+  const startMsByRun = new Map<string, number>();
+  const deadlineByRun = new Map<string, number>();
+
+  type LiveDisplay =
+    | { kind: "running"; head: string; path: string | null; timer: string; tone: Tone }
+    | { kind: "queued"; label: string; count: string; tone: Tone }
+    | { kind: "plain"; label: string; tone: Tone };
+
+  /** Split "Read notes/a.md" into a verb head and a mono file-path tail. */
+  function splitActivity(act: string): { head: string; path: string | null } {
+    const sp = act.indexOf(" ");
+    if (sp > 0) {
+      const rest = act.slice(sp + 1);
+      if (/[\/.]/.test(rest)) return { head: act.slice(0, sp), path: rest };
+    }
+    return { head: act, path: null };
+  }
+
+  /** Live caption for a slug, with a locally-ticking timer/countdown. */
+  function liveDisplay(slug: string): LiveDisplay | null {
+    const ev = ingests.liveEvent(slug);
+    if (!ev) return null;
+    const isNew = seenEvent.get(slug) !== ev;
+    if (isNew) seenEvent.set(slug, ev);
+
+    if (ev.status === "running") {
+      const key = `${slug}:${ev.runId}`;
+      // Prefer the server's elapsedSecs when a fresh event carries it; else keep
+      // the captured start and let nowTick advance the timer.
+      if ((isNew && ev.elapsedSecs != null) || !startMsByRun.has(key)) {
+        startMsByRun.set(key, Date.now() - (ev.elapsedSecs ?? 0) * 1000);
+      }
+      const start = startMsByRun.get(key)!;
+      const elapsed = Math.max(0, Math.floor((nowTick - start) / 1000));
+      const act = ev.activity?.trim();
+      const { head, path } = act ? splitActivity(act) : { head: "running…", path: null };
+      return { kind: "running", head, path, timer: `${elapsed}s`, tone: "busy" };
+    }
+    if (ev.status === "queued") {
+      const key = `${slug}:${ev.runId}`;
+      if (isNew || !deadlineByRun.has(key)) {
+        deadlineByRun.set(key, Date.now() + (ev.etaSecs ?? 0) * 1000);
+      }
+      return {
+        kind: "queued",
+        label: "queued — starts in",
+        count: countdownFrom(deadlineByRun.get(key)!, nowTick),
+        tone: "attention",
+      };
+    }
+    const c = liveCaption(ev);
+    return { kind: "plain", label: c.label, tone: c.tone };
+  }
 
   function toneColor(tone: string): string {
     switch (tone) {
@@ -149,7 +220,9 @@
     {#each ingests.summaries as s (s.entry.kind === "ok" ? s.entry.recipe.slug : s.entry.error.slug)}
       {@const slug = s.entry.kind === "ok" ? s.entry.recipe.slug : s.entry.error.slug}
       {@const name = s.entry.kind === "ok" ? s.entry.recipe.name : s.entry.error.slug}
-      {@const cap = statusCaption(s, ingests.liveStatus(slug))}
+      {@const live = liveDisplay(slug)}
+      {@const cap = statusCaption(s, null)}
+      {@const tone = live ? live.tone : cap.tone}
       <button
         class="row"
         class:active={ingests.selected === slug}
@@ -158,9 +231,21 @@
       >
         <span class="row-top">
           {name}
-          <span class="dot" style:background={toneColor(cap.tone)}></span>
+          <span class="dot" style:background={toneColor(tone)}></span>
         </span>
-        <span class="row-caption">{cap.label}</span>
+        {#if live?.kind === "running"}
+          <span class="row-caption live">
+            <span class="act">{live.head}</span>{#if live.path}<span class="mono path"> {live.path}</span>{/if}<span class="timer"> · {live.timer}</span>
+          </span>
+        {:else if live?.kind === "queued"}
+          <span class="row-caption live">
+            <span class="act">{live.label}</span><span class="timer"> {live.count}</span>
+          </span>
+        {:else if live?.kind === "plain"}
+          <span class="row-caption live"><span class="act">{live.label}</span></span>
+        {:else}
+          <span class="row-caption">{cap.label}</span>
+        {/if}
       </button>
     {/each}
 
@@ -179,15 +264,10 @@
   <!-- detail pane -->
   <div class="detail">
     {#if detail}
-      {@const broken = false}
+      {@const liveSel = liveDisplay(detail.recipe.slug)}
       <div class="detail-inner">
         <div class="detail-head">
           <h1>{detail.recipe.name}</h1>
-          {#if liveForSelected === "blocked"}
-            <span class="badge attention">blocked on you</span>
-          {:else if liveForSelected === "running"}
-            <span class="badge busy">running…</span>
-          {/if}
           <span class="spacer"></span>
           <button class="btn btn-small" onclick={() => openEdit(detail.recipe.slug)}>
             Edit
@@ -202,6 +282,19 @@
             </button>
           {/if}
         </div>
+
+        {#if liveSel}
+          <div class="live-line" style:color={toneColor(liveSel.tone)}>
+            <span class="live-dot" style:background={toneColor(liveSel.tone)}></span>
+            {#if liveSel.kind === "running"}
+              <span class="act">{liveSel.head}</span>{#if liveSel.path}<span class="mono path"> {liveSel.path}</span>{/if}<span class="timer"> · {liveSel.timer}</span>
+            {:else if liveSel.kind === "queued"}
+              <span class="act">{liveSel.label}</span><span class="timer"> {liveSel.count}</span>
+            {:else}
+              <span class="act">{liveSel.label}</span>
+            {/if}
+          </div>
+        {/if}
 
         {#if detail.recipe.description}
           <p class="desc">{detail.recipe.description}</p>
@@ -455,25 +548,31 @@
     font-size: 24px;
     font-weight: 500;
   }
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    height: 22px;
-    padding: 0 9px;
-    border-radius: 11px;
-    font-size: 11.5px;
-    font-weight: 600;
-  }
-  .badge.attention {
-    background: color-mix(in srgb, var(--needs-input) 12%, transparent);
-    color: var(--needs-input-text);
-  }
-  .badge.busy {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-    color: var(--accent);
-  }
   .spacer {
     flex: 1;
+  }
+  .live-line {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin: -4px 0 2px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .live-line .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    align-self: center;
+    flex: none;
+  }
+  /* Live caption parts, shared by the list row and the detail line. */
+  .act,
+  .path {
+    color: var(--ink-secondary);
+  }
+  .timer {
+    color: var(--ink-tertiary);
   }
   .desc {
     margin: -6px 0 0;
