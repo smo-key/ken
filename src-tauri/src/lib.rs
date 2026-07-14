@@ -2147,11 +2147,12 @@ struct ReviewInbox {
 fn inbox_rank(kind: &str) -> u8 {
     match kind {
         "approval" => 0,
-        "conflict" | "conflict-copy" => 1,
-        "stored" => 2,
-        "broken-recipe" => 3,
-        "failed-file" => 4,
-        _ => 5, // stale
+        "automation-proposal" => 1,
+        "conflict" | "conflict-copy" => 2,
+        "stored" => 3,
+        "broken-recipe" => 4,
+        "failed-file" => 5,
+        _ => 6, // stale
     }
 }
 
@@ -2159,7 +2160,7 @@ fn inbox_rank(kind: &str) -> u8 {
 /// (conflicts render their own detail); anything else stays generic.
 fn stored_kind(kind: &str) -> String {
     match kind {
-        "conflict" | "conflict-copy" => kind.to_string(),
+        "conflict" | "conflict-copy" | "automation-proposal" => kind.to_string(),
         _ => "stored".to_string(),
     }
 }
