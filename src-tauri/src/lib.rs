@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::scan::{self, ScanStats};
 use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
+use ken_core::record::{self, CaptureSource, LinearResampler, RecorderState, Source};
 use ken_core::transcript;
 use ken_core::user_state::{self, UserState};
 use ken_core::watch::{self, WatchHandle};
@@ -102,6 +103,9 @@ struct AppState {
     /// Monotonic id for ⌘K quick answers; a newer query bumps it so the
     /// in-flight generation's token callback sees a mismatch and cancels.
     qa_gen: Arc<AtomicU64>,
+    /// The single in-progress recording, if any (app-global: one recorder at a
+    /// time). Holds its own state/writers behind its mutex.
+    record: Arc<Mutex<Option<RecordSession>>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -905,6 +909,582 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(abs.to_string_lossy(), None::<&str>)
         .map_err(err)
+}
+
+// ===========================================================================
+// Record: on-device meeting recorder session, commands, and throttled events.
+// The pure logic (state machine, downmix, resampler, WAV wrappers, merge) lives
+// in `ken_core::record`; this owns the live session and wires backends →
+// downmix/resample → WAV writers → transcription → project write.
+// ===========================================================================
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioDeviceDto {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordPermissionsDto {
+    mic: record::PermissionStatus,
+    screen: record::PermissionStatus,
+    mic_settings_url: String,
+    screen_settings_url: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordLevel {
+    source: Source,
+    rms: f32,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordStateDto {
+    phase: record::Phase,
+    elapsed_ms: u64,
+    mic: bool,
+    system: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordSaved {
+    rel_path: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordErrorDto {
+    message: String,
+    can_retry: bool,
+}
+
+/// One live recording. Owns the phase/timing state, the per-source WAV writers
+/// and resamplers, the meter throttles, and the capture backends. All mutation
+/// happens under `AppState.record`'s mutex except the audio callbacks, which
+/// write through `Arc<Mutex<..>>` channel state created at start.
+struct RecordSession {
+    state: RecorderState,
+    started: Instant,
+    tmp_dir: PathBuf,
+    project_root: PathBuf,
+    // Per-source capture backends (stopped on finish).
+    mic: Option<Box<dyn CaptureSource>>,
+    system: Option<Box<dyn CaptureSource>>,
+    // Shared writer/meter state each callback appends to. Retained through
+    // stop so `record_stop` can read each channel's WAV path after finalizing.
+    mic_chan: Option<Arc<Mutex<ChannelWriter>>>,
+    system_chan: Option<Arc<Mutex<ChannelWriter>>>,
+}
+
+/// A single source's WAV writer + resampler + meter throttle. The audio
+/// callback locks this, downmixes/resamples the device block, writes 16 kHz
+/// samples, and (throttled) emits a level event. The writer is an `Option` so
+/// the stop path can flush the resampler tail and `finalize()` it under the
+/// same mutex — and so a late callback arriving after finalize simply no-ops.
+struct ChannelWriter {
+    writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+    resampler: LinearResampler,
+    /// The resampler is created lazily on the first callback, when the device's
+    /// true rate is known.
+    resampler_ready: bool,
+    path: PathBuf,
+    paused: bool,
+    last_emit: Instant,
+    app: AppHandle,
+    source: Source,
+}
+
+impl ChannelWriter {
+    fn new(
+        writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+        path: PathBuf,
+        app: AppHandle,
+        source: Source,
+    ) -> Self {
+        ChannelWriter {
+            writer: Some(writer),
+            resampler: LinearResampler::new(record::TARGET_RATE, record::TARGET_RATE), // replaced on first feed
+            resampler_ready: false,
+            path,
+            paused: false,
+            last_emit: Instant::now(),
+            app,
+            source,
+        }
+    }
+
+    fn feed(&mut self, device: &[f32], rate: u32, channels: u16) {
+        if self.paused {
+            return;
+        }
+        // Create the resampler on the first callback, when the true device rate
+        // is known.
+        if !self.resampler_ready {
+            self.resampler = LinearResampler::new(rate, record::TARGET_RATE);
+            self.resampler_ready = true;
+        }
+        let mono = record::downmix_to_mono(device, channels);
+        let samples = self.resampler.process(&mono);
+        let level = record::rms(&samples);
+        if let Some(w) = self.writer.as_mut() {
+            for s in &samples {
+                let _ = w.write_sample(record::f32_to_i16(*s));
+            }
+        }
+        // ~10 Hz meter, throttled per source.
+        if self.last_emit.elapsed().as_millis() >= 100 {
+            self.last_emit = Instant::now();
+            let _ = self
+                .app
+                .emit("record-level", RecordLevel { source: self.source, rms: level });
+        }
+    }
+
+    /// Flush the resampler's trailing sample (handoff: `ingest_frames` never
+    /// flushed, so the tail of a recording was lost) and finalize the WAV.
+    fn finalize_flush(&mut self) {
+        if self.resampler_ready {
+            let tail = self.resampler.finish();
+            if let Some(w) = self.writer.as_mut() {
+                for s in &tail {
+                    let _ = w.write_sample(record::f32_to_i16(*s));
+                }
+            }
+        }
+        if let Some(w) = self.writer.take() {
+            let _ = w.finalize();
+        }
+    }
+}
+
+/// A single input device's `(id, name)`.
+#[tauri::command]
+fn record_input_devices() -> CmdResult<Vec<AudioDeviceDto>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(record::mac::list_input_devices()
+            .into_iter()
+            .map(|(id, name)| AudioDeviceDto { id, name })
+            .collect())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+fn record_permissions() -> CmdResult<RecordPermissionsDto> {
+    #[cfg(target_os = "macos")]
+    let (mic, screen) = (record::mac::mic_permission(), record::mac::screen_permission());
+    #[cfg(not(target_os = "macos"))]
+    let (mic, screen) = (
+        record::PermissionStatus::Unsupported,
+        record::PermissionStatus::Unsupported,
+    );
+    Ok(RecordPermissionsDto {
+        mic,
+        screen,
+        mic_settings_url: record::MIC_SETTINGS_URL.into(),
+        screen_settings_url: record::SCREEN_SETTINGS_URL.into(),
+    })
+}
+
+#[tauri::command]
+fn record_request_permission(kind: String) -> CmdResult<()> {
+    #[cfg(target_os = "macos")]
+    match kind.as_str() {
+        "mic" => record::mac::request_mic(),
+        "screen" => {
+            let _ = record::mac::request_screen();
+        }
+        _ => return Err("unknown permission".into()),
+    }
+    let _ = kind;
+    Ok(())
+}
+
+/// Open a macOS System Settings privacy deep link. Routed through Rust (rather
+/// than the JS opener) because the frontend `opener:default` capability scope
+/// does not permit the `x-apple.systempreferences:` scheme; a server-side
+/// `open_url` bypasses that scope. `open_external` can't be reused — it resolves
+/// its argument against the project root as a file path.
+#[tauri::command]
+fn record_open_settings(app: AppHandle, url: String) -> CmdResult<()> {
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(url, None::<&str>)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn record_start(
+    app: AppHandle,
+    state: State<SharedState>,
+    mic: bool,
+    system: bool,
+    device_id: Option<String>,
+) -> CmdResult<()> {
+    if !mic && !system {
+        return Err("Pick at least one source to record.".into());
+    }
+    let (root, base) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("Open a project first.")?;
+        (active.project.root.clone(), guard.base_dir.clone())
+    };
+    let slot = { state.lock().unwrap().record.clone() };
+    // Guard against a second recording.
+    {
+        let existing = slot.lock().unwrap();
+        if existing.is_some() {
+            return Err("A recording is already in progress.".into());
+        }
+    }
+    let id = uuid::Uuid::new_v4();
+    let tmp_dir = base.join("record").join(id.to_string());
+    std::fs::create_dir_all(&tmp_dir).map_err(err)?;
+
+    let now = Instant::now();
+    let mut sess = RecordSession {
+        state: RecorderState::new(),
+        started: now,
+        tmp_dir: tmp_dir.clone(),
+        project_root: root,
+        mic: None,
+        system: None,
+        mic_chan: None,
+        system_chan: None,
+    };
+    sess.state.start(0, mic, system);
+
+    // Build each requested channel's writer + backend. If a backend fails to
+    // start, tear down anything already started and clean the temp dir.
+    #[cfg(target_os = "macos")]
+    {
+        let mut build = || -> CmdResult<()> {
+            if mic {
+                let path = tmp_dir.join("me.wav");
+                let writer = record::create_wav(&path).map_err(err)?;
+                let chan =
+                    Arc::new(Mutex::new(ChannelWriter::new(writer, path, app.clone(), Source::Mic)));
+                let chan2 = chan.clone();
+                let mut src = Box::new(record::mac::MicSource::new(device_id.clone()));
+                src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
+                    .map_err(err)?;
+                sess.mic = Some(src);
+                sess.mic_chan = Some(chan);
+            }
+            if system {
+                let path = tmp_dir.join("them.wav");
+                let writer = record::create_wav(&path).map_err(err)?;
+                let chan = Arc::new(Mutex::new(ChannelWriter::new(
+                    writer,
+                    path,
+                    app.clone(),
+                    Source::System,
+                )));
+                let chan2 = chan.clone();
+                let mut src = Box::new(record::mac::SystemAudioSource::new());
+                src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
+                    .map_err(err)?;
+                sess.system = Some(src);
+                sess.system_chan = Some(chan);
+            }
+            Ok(())
+        };
+        if let Err(e) = build() {
+            stop_backends(&mut sess);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+    }
+
+    let dto = RecordStateDto { phase: sess.state.phase, elapsed_ms: 0, mic, system };
+    *slot.lock().unwrap() = Some(sess);
+    let _ = app.emit("record-state", dto);
+    Ok(())
+}
+
+#[tauri::command]
+fn record_pause(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    with_session(&state, |sess| {
+        let now = sess.started.elapsed().as_millis() as u64;
+        sess.state.pause(now);
+        set_paused(sess, true);
+        Ok(state_dto(sess))
+    })
+    .map(|dto| {
+        let _ = app.emit("record-state", dto);
+    })
+}
+
+#[tauri::command]
+fn record_resume(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    with_session(&state, |sess| {
+        let now = sess.started.elapsed().as_millis() as u64;
+        sess.state.resume(now);
+        set_paused(sess, false);
+        Ok(state_dto(sess))
+    })
+    .map(|dto| {
+        let _ = app.emit("record-state", dto);
+    })
+}
+
+#[tauri::command]
+fn record_cancel(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let slot = { state.lock().unwrap().record.clone() };
+    let sess = slot.lock().unwrap().take();
+    if let Some(mut sess) = sess {
+        stop_backends(&mut sess);
+        let _ = std::fs::remove_dir_all(&sess.tmp_dir);
+    }
+    let _ = app.emit(
+        "record-state",
+        RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn record_stop(app: AppHandle, state: State<SharedState>, storage: String) -> CmdResult<()> {
+    let slot = { state.lock().unwrap().record.clone() };
+    let mut sess = slot.lock().unwrap().take().ok_or("No recording to stop.")?;
+    let now = sess.started.elapsed().as_millis() as u64;
+    sess.state.stop(now);
+    let duration = Duration::from_millis(sess.state.elapsed_ms(now));
+    stop_backends(&mut sess); // stops capture, flushes resampler tails, finalizes WAVs
+
+    let _ = app.emit("record-transcribing", ());
+    // Do the slow transcription + write off the command thread.
+    let root = sess.project_root.clone();
+    let base = { state.lock().unwrap().base_dir.clone() };
+    let mic_wav = sess.mic_chan.as_ref().map(|c| c.lock().unwrap().path.clone());
+    let system_wav = sess.system_chan.as_ref().map(|c| c.lock().unwrap().path.clone());
+    let mic_on = sess.state.mic;
+    let system_on = sess.state.system;
+    let tmp_dir = sess.tmp_dir.clone();
+    let inner = state.inner().clone();
+
+    std::thread::spawn(move || {
+        let outcome = finish_recording(
+            &app, &inner, &root, &base, &tmp_dir, &storage, mic_on, system_on, mic_wav, system_wav,
+            duration,
+        );
+        if let Err(e) = outcome {
+            // Unexpected failure (e.g. couldn't create the Recordings dir). The
+            // transcription-failure path is handled inside `finish_recording`
+            // and does not surface here. Keep the temp WAVs so nothing is lost.
+            let _ = app.emit("record-error", RecordErrorDto { message: e, can_retry: true });
+            let _ = app.emit(
+                "record-state",
+                RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
+            );
+        }
+    });
+    Ok(())
+}
+
+fn with_session<T>(
+    state: &State<SharedState>,
+    f: impl FnOnce(&mut RecordSession) -> CmdResult<T>,
+) -> CmdResult<T> {
+    let slot = { state.lock().unwrap().record.clone() };
+    let mut guard = slot.lock().unwrap();
+    let sess = guard.as_mut().ok_or("No recording in progress.")?;
+    f(sess)
+}
+
+fn state_dto(sess: &RecordSession) -> RecordStateDto {
+    let now = sess.started.elapsed().as_millis() as u64;
+    RecordStateDto {
+        phase: sess.state.phase,
+        elapsed_ms: sess.state.elapsed_ms(now),
+        mic: sess.state.mic,
+        system: sess.state.system,
+    }
+}
+
+fn set_paused(sess: &mut RecordSession, paused: bool) {
+    if let Some(c) = &sess.mic_chan {
+        c.lock().unwrap().paused = paused;
+    }
+    if let Some(c) = &sess.system_chan {
+        c.lock().unwrap().paused = paused;
+    }
+}
+
+/// Stop both backends, then flush + finalize each channel's WAV. The channel
+/// handles are kept on the session so callers can read the WAV paths afterward.
+fn stop_backends(sess: &mut RecordSession) {
+    if let Some(mut s) = sess.mic.take() {
+        s.stop();
+    }
+    if let Some(mut s) = sess.system.take() {
+        s.stop();
+    }
+    if let Some(c) = &sess.mic_chan {
+        c.lock().unwrap().finalize_flush();
+    }
+    if let Some(c) = &sess.system_chan {
+        c.lock().unwrap().finalize_flush();
+    }
+}
+
+/// Off-thread finish: move the audio into the project, (optionally) transcribe,
+/// write the markdown doc, and index everything. Honors the storage choice and
+/// the failure rule (transcription failure keeps the audio, emits
+/// `record-error{ canRetry: true }`, deletes nothing).
+#[allow(clippy::too_many_arguments)]
+fn finish_recording(
+    app: &AppHandle,
+    state: &SharedState,
+    root: &Path,
+    _base: &Path,
+    tmp_dir: &Path,
+    storage: &str,
+    mic_on: bool,
+    system_on: bool,
+    mic_wav: Option<PathBuf>,
+    system_wav: Option<PathBuf>,
+    duration: Duration,
+) -> CmdResult<()> {
+    use chrono::{Datelike, Local, Timelike};
+    let now = Local::now();
+    let (y, mo, d, h, mi) = (now.year(), now.month(), now.day(), now.hour(), now.minute());
+    let recordings = root.join("Recordings");
+    std::fs::create_dir_all(&recordings).map_err(err)?;
+    let stem = record::recording_stem(y, mo, d, h, mi);
+    let md_name = record::unique_name(&recordings, &stem, "md");
+    let md_stem = md_name.trim_end_matches(".md").to_string();
+    let header = record::metadata_header(y, mo, d, h, mi, duration, mic_on, system_on);
+    let single = mic_on ^ system_on;
+
+    // Move the WAVs into the project up front so the audio is preserved no matter
+    // what happens during transcription ("keeps audio regardless of choice,
+    // deletes nothing"). For a successful transcript-only run they are deleted
+    // afterward. Returns each moved WAV's (abs path, project-relative path).
+    let move_wav = |src: &Option<PathBuf>, suffix: &str| -> CmdResult<Option<(PathBuf, String)>> {
+        let Some(src) = src else { return Ok(None) };
+        if !src.is_file() {
+            return Ok(None);
+        }
+        let wav_stem = if single { md_stem.clone() } else { format!("{md_stem} - {suffix}") };
+        let name = record::unique_name(&recordings, &wav_stem, "wav");
+        let dest = recordings.join(&name);
+        // The temp WAV lives under app-data; the project may be on another
+        // volume (e.g. Dropbox), so fall back to copy+remove on a cross-device
+        // rename rather than failing.
+        match std::fs::rename(src, &dest) {
+            Ok(()) => {}
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                std::fs::copy(src, &dest).map_err(err)?;
+                let _ = std::fs::remove_file(src);
+            }
+            Err(e) => return Err(err(e)),
+        }
+        Ok(Some((dest, format!("Recordings/{name}"))))
+    };
+    let mut mic_moved = move_wav(&mic_wav, "Me")?;
+    let mut sys_moved = move_wav(&system_wav, "Them")?;
+
+    let md_rel = format!("Recordings/{md_name}");
+    let mut failure: Option<String> = None;
+
+    let body = if storage == "audio" {
+        record::AUDIO_ONLY_NOTE.to_string()
+    } else {
+        // Transcribe each present channel from its moved location.
+        let model = transcript::model_path(_base);
+        let transcribe_all = || -> CmdResult<String> {
+            if !model.is_file() {
+                return Err("Download a transcription model in Settings to make transcripts.".into());
+            }
+            let mut me_cues = Vec::new();
+            let mut them_cues = Vec::new();
+            if let Some((p, _)) = &mic_moved {
+                let samples = record::read_wav_f32(p).map_err(err)?;
+                me_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+            }
+            if let Some((p, _)) = &sys_moved {
+                let samples = record::read_wav_f32(p).map_err(err)?;
+                them_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+            }
+            let channels: Vec<record::LabeledChannel> = if single {
+                vec![record::LabeledChannel {
+                    label: None,
+                    cues: if mic_on { &me_cues } else { &them_cues },
+                }]
+            } else {
+                vec![
+                    record::LabeledChannel { label: Some("Me"), cues: &me_cues },
+                    record::LabeledChannel { label: Some("Them"), cues: &them_cues },
+                ]
+            };
+            Ok(record::merge_transcript(&channels))
+        };
+        match transcribe_all() {
+            Ok(body) => {
+                // Transcript-only success: the audio was a temp — remove it now.
+                if storage == "transcript" {
+                    if let Some((p, _)) = mic_moved.take() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    if let Some((p, _)) = sys_moved.take() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                body
+            }
+            Err(e) => {
+                // Failure rule: keep the audio, note it in the doc, flag retry.
+                failure = Some(e.clone());
+                format!("{}\n_Transcription failed: {e}_\n", record::AUDIO_ONLY_NOTE)
+            }
+        }
+    };
+
+    let doc = record::build_document(&header, &body);
+    std::fs::write(recordings.join(&md_name), &doc).map_err(err)?;
+    let _ = std::fs::remove_dir_all(tmp_dir);
+
+    let mic_rel = mic_moved.map(|(_, rel)| rel);
+    let sys_rel = sys_moved.map(|(_, rel)| rel);
+
+    // Index the new files so they're searchable + automation-eligible.
+    {
+        let mut guard = state.lock().unwrap();
+        if let Some(active) = guard.active.as_mut() {
+            let _ = scan::refresh_path(&active.project, &mut active.db, &md_rel);
+            for rel in [mic_rel, sys_rel].into_iter().flatten() {
+                let _ = scan::refresh_path(&active.project, &mut active.db, &rel);
+            }
+        }
+    }
+    let _ = app.emit("index-updated", ScanStats::default());
+
+    if let Some(e) = failure {
+        let _ = app.emit(
+            "record-error",
+            RecordErrorDto {
+                message: format!("Saved the audio; transcription failed: {e}"),
+                can_retry: true,
+            },
+        );
+    } else {
+        let _ = app.emit("record-saved", RecordSaved { rel_path: md_rel });
+    }
+    let _ = app.emit(
+        "record-state",
+        RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
+    );
+    Ok(())
 }
 
 /// `errno` for a cross-device rename on Unix; `fs::rename` fails with this when
@@ -3791,6 +4371,7 @@ pub fn run() {
         active: None,
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
         qa_gen: Arc::new(AtomicU64::new(0)),
+        record: Arc::new(Mutex::new(None)),
     }));
 
     tauri::Builder::default()
@@ -3904,6 +4485,15 @@ pub fn run() {
             cancel_research,
             research_output_options,
             llm_status,
+            record_input_devices,
+            record_permissions,
+            record_request_permission,
+            record_open_settings,
+            record_start,
+            record_pause,
+            record_resume,
+            record_stop,
+            record_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ken");

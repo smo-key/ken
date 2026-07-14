@@ -21,3 +21,6 @@ ignore = "0.4"
 base64 = "0.22"
 uuid.workspace = true
 chrono = "0.4"
+# The record session names `hound::WavWriter` as a struct field type, so hound
+# must be a direct dependency here (not just transitively via ken-core).
+hound = "3.5"
