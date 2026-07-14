@@ -1,1 +1,1 @@
-{"version":1,"tasks":[{"id":"term-mrjdvfnf-1","name":"Start","kind":"terminal","command":"pnpm tauri dev","cwd":null}]}
+{"version":1,"tasks":[{"id":"term-mrjdvfnf-1","name":"Start","kind":"terminal","command":"make dev","cwd":null,"closeOnComplete":false},{"id":"term-mrl4wzk6-1","name":"Setup","kind":"terminal","command":"make setup","cwd":null,"closeOnComplete":false}]}

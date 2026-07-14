@@ -27,7 +27,13 @@ hound = "3.5"
 # network the app performs (a deliberate, user-initiated fetch). ureq is a tiny
 # blocking client using rustls (no OpenSSL/native-tls); default features would
 # pull gzip/json/charset we don't need, so it's trimmed to just TLS.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# `native-certs` makes ureq verify against the operating system's trust store
+# (rustls-native-certs — still rustls, NOT native-tls/OpenSSL) instead of only
+# ureq's compiled-in Mozilla root list. A desktop app should trust whatever the
+# user's OS trusts: without this, machines behind a TLS-inspecting corporate
+# proxy (which re-signs certs with a private root installed in the OS keychain)
+# fail the download with `invalid peer certificate: UnknownIssuer`.
+ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
 # On-device speech-to-text for video transcripts. Bundles whisper.cpp and
 # builds it from source (needs cmake + a C/C++ toolchain), so it is gated
 # behind a default feature: everything else in ken-core still builds if the

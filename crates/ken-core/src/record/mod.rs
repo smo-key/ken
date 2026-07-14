@@ -98,7 +98,11 @@ impl LinearResampler {
             out.push(s as f32);
             self.pos += self.step;
         }
-        let drop = self.pos as usize;
+        // The loop only guarantees `pos + 1 >= buf.len()` on exit, so `pos` can
+        // sit up to `step` past the end (48k/512-frame blocks land there every
+        // time). Clamp the drain and keep the remainder in `pos`: it stays the
+        // read offset into the *next* chunk, so no sample is skipped or repeated.
+        let drop = (self.pos as usize).min(self.buf.len());
         if drop > 0 {
             self.buf.drain(0..drop);
             self.pos -= drop as f64;
@@ -641,6 +645,58 @@ mod tests {
         }
         // ~10 * 441 input @44.1k = 0.1s -> ~1600 output samples (±a few).
         assert!((out.len() as i64 - 1600).abs() < 8, "len {}", out.len());
+    }
+
+    #[test]
+    fn resampler_survives_48k_512_frame_blocks() {
+        // cpal's 512-frame callback at 48k is the real-world shape that used to
+        // overshoot the read position past the buffer and abort the process.
+        let mut r = LinearResampler::new(48_000, 16_000);
+        let mut out = Vec::new();
+        for c in 0..8 {
+            let chunk: Vec<f32> = (0..512).map(|i| ((c * 512 + i) as f32) / 4096.0).collect();
+            out.extend(r.process(&chunk));
+        }
+        out.extend(r.finish());
+        // 8 * 512 input @48k -> ~1/3 as many samples @16k.
+        assert!((out.len() as i64 - 8 * 512 / 3).abs() <= 2, "len {}", out.len());
+    }
+
+    #[test]
+    fn resampler_chunked_matches_single_call() {
+        // Phase must carry across chunk boundaries: splitting the input into
+        // 512-sample blocks has to yield the same stream as one big call.
+        let input: Vec<f32> = (0..2048)
+            .map(|i| (i as f32 * 0.017).sin() * 0.8)
+            .collect();
+
+        let mut chunked = LinearResampler::new(48_000, 16_000);
+        let mut a = Vec::new();
+        for chunk in input.chunks(512) {
+            a.extend(chunked.process(chunk));
+        }
+        a.extend(chunked.finish());
+
+        let mut whole = LinearResampler::new(48_000, 16_000);
+        let mut b = whole.process(&input);
+        b.extend(whole.finish());
+
+        assert_eq!(a.len(), b.len(), "chunked {} vs whole {}", a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-5, "sample {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn resampler_finishes_from_an_overshot_tail() {
+        // A 4-sample block @48k leaves one unconsumed input sample; `finish`
+        // duplicates it, which pushes the read position past the buffer.
+        let mut r = LinearResampler::new(48_000, 16_000);
+        let out = r.process(&[0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(out.len(), 1);
+        let tail = r.finish();
+        assert_eq!(tail.len(), 1);
+        assert!((tail[0] - 0.4).abs() < 1e-6, "tail {}", tail[0]);
     }
 
     #[test]

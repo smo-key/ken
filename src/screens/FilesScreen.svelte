@@ -2,7 +2,6 @@
   import Pin from "@lucide/svelte/icons/pin";
   import PinOff from "@lucide/svelte/icons/pin-off";
   import X from "@lucide/svelte/icons/x";
-  import CheckCheck from "@lucide/svelte/icons/check-check";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
   import {
@@ -60,20 +59,6 @@
   <FileTree width={sidebarWidth} />
   <SidebarResizer width={sidebarWidth} {windowWidth} />
   <div class="content">
-    <div class="toolbar">
-      <div class="unread-controls">
-        {#if app.unread.length > 0}
-          <button
-            class="mark-all"
-            title="Mark every changed file as viewed"
-            onclick={() => void app.markAllSeen()}
-          >
-            <CheckCheck size={14} strokeWidth={1.75} />
-            <span>Mark all as viewed</span>
-          </button>
-        {/if}
-      </div>
-    </div>
     {#if app.fileTabs.length > 0}
       <div class="tabstrip" onwheel={onWheel}>
         {#each app.fileTabs as tab (tab.path)}
@@ -152,37 +137,6 @@
     flex-direction: column;
     min-height: 0;
     background: var(--surface);
-  }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex: none;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    background: var(--paper);
-  }
-  .unread-controls {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: none;
-  }
-  .mark-all {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 10px;
-    border-radius: var(--radius-control);
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--ink);
-    font-size: 12.5px;
-    font-weight: 500;
-  }
-  .mark-all:hover {
-    background: var(--sunken);
   }
   .tabstrip {
     display: flex;

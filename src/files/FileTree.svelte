@@ -1,5 +1,6 @@
 <script lang="ts">
   import Upload from "@lucide/svelte/icons/upload";
+  import CheckCheck from "@lucide/svelte/icons/check-check";
   import StarOff from "@lucide/svelte/icons/star-off";
   import Eye from "@lucide/svelte/icons/eye";
   import X from "@lucide/svelte/icons/x";
@@ -7,7 +8,7 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
-  import { showUnreadFilter } from "./filesHeader";
+  import { showMarkAllViewed, showUnreadFilter } from "./filesHeader";
   import { buildTree } from "../lib/tree";
   import {
     openContextMenu,
@@ -146,6 +147,16 @@
           >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
         </div>
       {/if}
+      {#if showMarkAllViewed(app.unread.length)}
+        <button
+          class="icon-btn"
+          data-tooltip="Mark every changed file as viewed"
+          aria-label="Mark all as viewed"
+          onclick={() => void app.markAllSeen()}
+        >
+          <CheckCheck size={15} strokeWidth={1.75} />
+        </button>
+      {/if}
       <button
         class="icon-btn"
         data-tooltip="Import file"
@@ -204,10 +215,17 @@
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    padding: 12px 8px 10px;
+    /* No top padding: sticky offsets resolve against this scroll container's
+       padding box, so any padding here would park .files-head that far below the
+       top of the scrollport and let rows scroll through the gap above it. The
+       resting inset rides on the first row instead. */
+    padding: 0 8px 10px;
     overflow-y: auto;
     overflow-x: hidden;
     font-size: 13px;
+  }
+  .tree > :first-child {
+    padding-top: 12px;
   }
   .tree-head {
     display: flex;
@@ -220,9 +238,10 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  /* The Files header stays visually pinned: sticky to the top of the scrolling
-     .tree column so it never scrolls away with Favorites and the tree. A solid
-     ground covers content sliding under it. */
+  /* The Files header stays visually pinned: sticky flush to the top of the
+     scrolling .tree column (which carries no top padding, so there is nowhere
+     for rows to show above it) so it never scrolls away with Favorites and the
+     tree. A solid ground covers content sliding under it. */
   .files-head {
     position: sticky;
     top: 0;
@@ -315,17 +334,21 @@
     content: attr(data-tooltip);
     position: absolute;
     top: calc(100% + 6px);
-    left: 50%;
-    transform: translateX(-50%);
+    /* These buttons live at the right edge of a column that clips overflow-x, so
+       the bubble hangs from their right edge and wraps inside the narrowest
+       sidebar (190px) rather than running off it. */
+    right: 0;
+    width: max-content;
+    max-width: 160px;
     background: var(--ink);
     color: var(--surface);
     font-size: 11px;
     font-weight: 500;
     letter-spacing: 0;
+    line-height: 1.35;
     text-transform: none;
     padding: 3px 7px;
     border-radius: 6px;
-    white-space: nowrap;
     pointer-events: none;
     opacity: 0;
     transition: opacity 0.12s ease;

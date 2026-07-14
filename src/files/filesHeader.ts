@@ -7,3 +7,9 @@ export type FilesFilter = "all" | "unread";
 export function showUnreadFilter(unreadCount: number, filter: FilesFilter): boolean {
   return unreadCount > 0 || filter === "unread";
 }
+
+// "Mark all as viewed" is quieter still — unlike the filter it has nothing to do
+// once the list is clear, so it goes away even in the unread view.
+export function showMarkAllViewed(unreadCount: number): boolean {
+  return unreadCount > 0;
+}
