@@ -103,3 +103,14 @@ export function renameTab(state: TabState, from: string, to: string): TabState {
     active: state.active === from ? to : state.active,
   };
 }
+
+/** Rewrite tab paths after a move: an exact file move renames one tab; a folder
+ *  move renames every tab under the old prefix. */
+export function renameTabsForMove(state: TabState, from: string, to: string): TabState {
+  const map = (p: string) =>
+    p === from ? to : p.startsWith(from + "/") ? to + p.slice(from.length) : p;
+  return {
+    tabs: state.tabs.map((t) => ({ ...t, path: map(t.path) })),
+    active: state.active === null ? null : map(state.active),
+  };
+}

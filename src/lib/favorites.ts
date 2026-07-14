@@ -36,6 +36,21 @@ export function renameFavorite(
   return list.map((f) => (f.path === from ? { ...f, path: to } : f));
 }
 
+/** Rewrite favorite paths after a move (file or folder — prefix-aware). */
+export function renameFavoritesForMove(
+  list: Favorite[],
+  from: string,
+  to: string,
+): Favorite[] {
+  return list.map((f) =>
+    f.path === from
+      ? { ...f, path: to }
+      : f.path.startsWith(from + "/")
+        ? { ...f, path: to + f.path.slice(from.length) }
+        : f,
+  );
+}
+
 export function loadFavorites(projectId: string): Favorite[] {
   try {
     const raw = localStorage.getItem(key(projectId));

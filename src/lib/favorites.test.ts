@@ -4,6 +4,7 @@ import {
   pruneFavorites,
   removeFavorite,
   renameFavorite,
+  renameFavoritesForMove,
   type Favorite,
 } from "./favorites";
 
@@ -34,5 +35,21 @@ describe("favorites helpers", () => {
     const list = [file("a.md"), file("b.md")];
     const moved = renameFavorite(list, "a.md", "sub/a.md");
     expect(moved.map((f) => f.path)).toEqual(["sub/a.md", "b.md"]);
+  });
+});
+
+describe("renameFavoritesForMove", () => {
+  it("renames exact and prefixed favorite paths on a folder move", () => {
+    const list = [
+      { path: "Meetings", kind: "folder" as const },
+      { path: "Meetings/notes.md", kind: "file" as const },
+      { path: "Research", kind: "folder" as const },
+    ];
+    const out = renameFavoritesForMove(list, "Meetings", "Archive/Meetings");
+    expect(out.map((f) => f.path)).toEqual([
+      "Archive/Meetings",
+      "Archive/Meetings/notes.md",
+      "Research",
+    ]);
   });
 });

@@ -13,7 +13,7 @@ import {
   loadFavorites,
   pruneFavorites,
   removeFavorite,
-  renameFavorite,
+  renameFavoritesForMove,
   saveFavorites,
   type Favorite,
 } from "./favorites";
@@ -39,7 +39,7 @@ import {
   closeTab as reduceCloseTab,
   makePersistent as reduceMakePersistent,
   openTab as reduceOpenTab,
-  renameTab as reduceRenameTab,
+  renameTabsForMove,
   setPinned as reduceSetPinned,
   type FileTab,
   type TabState,
@@ -424,16 +424,15 @@ class AppStore {
     this.searchOpen = false;
   }
 
-  /** Move a file: update its open tab, favorites, and the active selection. */
+  /** Move a file or folder: update open tabs, favorites, and the selection.
+   *  Folder moves rewrite every tab/favorite under the old prefix. */
   async moveFile(fromRel: string, toRel: string) {
     await api.moveFile(fromRel, toRel);
     this.applyTabState(
-      reduceRenameTab({ tabs: this.fileTabs, active: this.activeTab }, fromRel, toRel),
+      renameTabsForMove({ tabs: this.fileTabs, active: this.activeTab }, fromRel, toRel),
     );
-    if (this.isFavorite(fromRel)) {
-      this.favorites = renameFavorite(this.favorites, fromRel, toRel);
-      if (this.project) saveFavorites(this.project.id, this.favorites);
-    }
+    this.favorites = renameFavoritesForMove(this.favorites, fromRel, toRel);
+    if (this.project) saveFavorites(this.project.id, this.favorites);
     await this.refreshTree();
   }
 }

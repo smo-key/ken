@@ -5,6 +5,7 @@ import {
   makePersistent,
   openTab,
   renameTab,
+  renameTabsForMove,
   setPinned,
   type TabState,
 } from "./tabs";
@@ -78,5 +79,33 @@ describe("tab reducers", () => {
     s = renameTab(s, "a.md", "sub/a.md");
     expect(s.tabs[0].path).toBe("sub/a.md");
     expect(s.active).toBe("sub/a.md");
+  });
+});
+
+describe("renameTabsForMove", () => {
+  it("renames an exact file move, including the active path", () => {
+    let s = openTab(empty, "a.md", true);
+    s = renameTabsForMove(s, "a.md", "sub/a.md");
+    expect(s.tabs.map((t) => t.path)).toEqual(["sub/a.md"]);
+    expect(s.active).toBe("sub/a.md");
+  });
+
+  it("renames every tab under a moved folder's prefix", () => {
+    let s = openTab(empty, "Meetings/a.md", true);
+    s = openTab(s, "Meetings/2026/b.md", true);
+    s = openTab(s, "Research/c.md", true);
+    s = renameTabsForMove(s, "Meetings", "Archive/Meetings");
+    expect(s.tabs.map((t) => t.path)).toEqual([
+      "Archive/Meetings/a.md",
+      "Archive/Meetings/2026/b.md",
+      "Research/c.md",
+    ]);
+    expect(s.active).toBe("Research/c.md");
+  });
+
+  it("does not touch a sibling sharing the name prefix", () => {
+    let s = openTab(empty, "Meetings Archive/x.md", true);
+    s = renameTabsForMove(s, "Meetings", "Old");
+    expect(s.tabs[0].path).toBe("Meetings Archive/x.md");
   });
 });
