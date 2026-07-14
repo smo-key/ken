@@ -887,6 +887,32 @@ pub fn discard_run(project: &Project, db: &mut Db, run_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Approve a staged automation proposal: resolve the review item and queue the
+/// phase-2 "execute exactly these approved actions" run through the engine.
+pub fn approve_automation_proposal(engine: &IngestEngine, db: &mut Db, item_id: i64) -> Result<()> {
+    let item = db
+        .get_review_item(item_id)?
+        .ok_or_else(|| Error::Other("proposal not found".into()))?;
+    if item.kind != "automation-proposal" || item.status != "open" {
+        return Err(Error::Other("this isn't an open automation proposal".into()));
+    }
+    let slug = item.source_ref.clone();
+    db.resolve_review_item(item_id, now_epoch())?;
+    engine.apply_automation(&slug, &item.body);
+    Ok(())
+}
+
+/// Discard a proposal: resolve it, run nothing.
+pub fn discard_automation_proposal(db: &mut Db, item_id: i64) -> Result<()> {
+    let item = db
+        .get_review_item(item_id)?
+        .ok_or_else(|| Error::Other("proposal not found".into()))?;
+    if item.kind != "automation-proposal" || item.status != "open" {
+        return Err(Error::Other("this isn't an open automation proposal".into()));
+    }
+    db.resolve_review_item(item_id, now_epoch())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,5 +1332,36 @@ mod tests {
         r.engine.apply_automation("weekly", "## Proposed actions\n- do the thing");
         let done = wait_status(&r.events, "fresh", 20);
         assert_eq!(done.kind, "automation");
+    }
+
+    #[test]
+    fn approve_proposal_resolves_item_and_queues_apply() {
+        let r = rig_with_automation("complete", false);
+        r.engine.run_automation("weekly");
+        wait_status(&r.events, "fresh", 20);
+        let item_id = {
+            let db = Db::open_at(&r.db_path).unwrap();
+            db.list_open_review_items().unwrap().iter()
+                .find(|i| i.kind == "automation-proposal").unwrap().id
+        };
+        let mut db = Db::open_at(&r.db_path).unwrap();
+        approve_automation_proposal(&r.engine, &mut db, item_id).unwrap();
+        // Item resolved…
+        assert_eq!(db.get_review_item(item_id).unwrap().unwrap().status, "resolved");
+        // …and a phase-2 automation run happens.
+        let done = wait_status(&r.events, "fresh", 20);
+        assert_eq!(done.kind, "automation");
+    }
+
+    #[test]
+    fn discard_proposal_just_resolves() {
+        let r = rig_with_automation("complete", false);
+        r.engine.run_automation("weekly");
+        wait_status(&r.events, "fresh", 20);
+        let mut db = Db::open_at(&r.db_path).unwrap();
+        let id = db.list_open_review_items().unwrap().iter()
+            .find(|i| i.kind == "automation-proposal").unwrap().id;
+        discard_automation_proposal(&mut db, id).unwrap();
+        assert_eq!(db.get_review_item(id).unwrap().unwrap().status, "resolved");
     }
 }
