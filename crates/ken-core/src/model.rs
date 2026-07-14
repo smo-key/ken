@@ -1,21 +1,20 @@
-//! Downloading the on-device Whisper model(s) from within the app.
+//! Downloading the on-device model(s) from within the app.
 //!
-//! There is no hand-maintained model list here: the available models are
-//! *discovered* at runtime by listing the whisper.cpp Hugging Face repo's
-//! `ggml-*.bin` files, so new models the upstream repo ships appear without a
-//! source change. A single named default — the recommended base English model
-//! — is the one constant we keep, and it doubles as the offline fallback when
-//! the listing can't be fetched.
+//! The available models are a small, curated [`catalog`] rather than a runtime
+//! discovery of the upstream repo: each entry carries a [`ModelCategory`]
+//! (Transcription / Language), a [`ModelTier`] (Recommended / Advanced), a
+//! Settings blurb, and its download identity ([`ModelSpec`]). The recommended
+//! transcription model doubles as the offline fallback and the model the
+//! transcript feature gates on. A per-category choice is persisted machine-wide
+//! in `base_dir/models/selection.json` ([`ModelSelection`]).
 //!
 //! The network is isolated behind the [`ByteSource`] seam so the streaming,
 //! progress, verify, and atomic-install logic is unit-tested against an
-//! in-memory fake without ever touching the network. The pure pieces
-//! (listing-parse, progress math, emit throttle, verify) carry the tests.
+//! in-memory fake without ever touching the network. The pure pieces (catalog,
+//! progress math, emit throttle, verify) carry the tests.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
-use serde::Deserialize;
 
 use crate::{transcript, Error, Result};
 
@@ -32,18 +31,19 @@ pub const RECOMMENDED_FILE: &str = transcript::MODEL_FILE;
 /// against the server's advertised length. Approximate is fine here.
 pub const RECOMMENDED_BYTES: u64 = 147_951_465;
 
-/// The HF repo tree API — a JSON array of the repo's files, with per-file sizes.
-fn tree_url() -> String {
-    format!("https://huggingface.co/api/models/{REPO}/tree/main")
-}
-
 /// The direct download URL for one model file in the repo.
 pub fn resolve_url(file: &str) -> String {
     format!("https://huggingface.co/{REPO}/resolve/main/{file}")
 }
 
-/// One downloadable model. Discovered at runtime (or the recommended fallback);
-/// `id` is the file name, which is stable and unique within the repo.
+/// The advanced transcription model — Whisper Large v3 Turbo.
+pub const WHISPER_LARGE_TURBO_FILE: &str = "ggml-large-v3-turbo.bin";
+/// Display/offline-floor size only (~1.6 GB); real downloads verify against the
+/// server's Content-Length.
+pub const WHISPER_LARGE_TURBO_BYTES: u64 = 1_624_555_275;
+
+/// One downloadable model's download identity. `id` is the file name, which is
+/// stable and unique within the repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     pub id: String,
@@ -54,22 +54,101 @@ pub struct ModelSpec {
     pub recommended: bool,
 }
 
-/// The recommended model, resolved from the stable default constant. This is
-/// the offline fallback and the model the transcript feature gates on.
-pub fn recommended() -> ModelSpec {
+/// Which use a model serves. Serialized lowercase for the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelCategory {
+    Transcription,
+    Language,
+}
+
+/// The two tiers offered per category: the safe default and the heavier option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    Recommended,
+    Advanced,
+}
+
+/// One curated, downloadable model with its category, tier, and Settings blurb.
+/// `spec` is the unchanged download identity (id/file/url/size/recommended).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub category: ModelCategory,
+    pub tier: ModelTier,
+    pub blurb: &'static str,
+    pub spec: ModelSpec,
+}
+
+fn spec(file: &str, name: &str, bytes: u64, recommended: bool) -> ModelSpec {
     ModelSpec {
-        id: RECOMMENDED_FILE.to_string(),
-        name: display_name(RECOMMENDED_FILE),
-        file: RECOMMENDED_FILE.to_string(),
-        url: resolve_url(RECOMMENDED_FILE),
-        expected_bytes: RECOMMENDED_BYTES,
-        recommended: true,
+        id: file.to_string(),
+        name: name.to_string(),
+        file: file.to_string(),
+        url: resolve_url(file),
+        expected_bytes: bytes,
+        recommended,
     }
+}
+
+/// The transcription pair. Recommended = Whisper Base (English); Advanced =
+/// Whisper Large v3 Turbo.
+fn transcription_catalog() -> Vec<CatalogEntry> {
+    vec![
+        CatalogEntry {
+            category: ModelCategory::Transcription,
+            tier: ModelTier::Recommended,
+            blurb: "fast, accurate for meetings",
+            spec: spec(RECOMMENDED_FILE, "Whisper Base (English)", RECOMMENDED_BYTES, true),
+        },
+        CatalogEntry {
+            category: ModelCategory::Transcription,
+            tier: ModelTier::Advanced,
+            blurb: "best accuracy, understands more languages, slower",
+            spec: spec(WHISPER_LARGE_TURBO_FILE, "Whisper Large v3 Turbo", WHISPER_LARGE_TURBO_BYTES, false),
+        },
+    ]
+}
+
+/// Language models (Answers & Map) are appended by the local-LLM plan; the
+/// category and structure exist now so that plan only adds entries here.
+fn language_catalog() -> Vec<CatalogEntry> {
+    Vec::new()
+}
+
+/// Every curated model, in display order (Transcription, then Language).
+pub fn catalog() -> Vec<CatalogEntry> {
+    let mut entries = transcription_catalog();
+    entries.extend(language_catalog());
+    entries
+}
+
+/// The specs in one category, in catalog order.
+pub fn category_specs(category: ModelCategory) -> Vec<ModelSpec> {
+    catalog()
+        .into_iter()
+        .filter(|e| e.category == category)
+        .map(|e| e.spec)
+        .collect()
+}
+
+/// Locate a spec by its file-name id across the whole catalog.
+pub fn find_spec(id: &str) -> Option<ModelSpec> {
+    catalog().into_iter().map(|e| e.spec).find(|s| s.id == id)
+}
+
+/// The recommended transcription model — the offline fallback and the model the
+/// transcript feature gates on when nothing is selected/installed.
+pub fn recommended() -> ModelSpec {
+    category_specs(ModelCategory::Transcription)
+        .into_iter()
+        .find(|s| s.recommended)
+        .expect("transcription catalog has a recommended entry")
 }
 
 /// A readable label derived from the file name (`ggml-base.en.bin` → "Base
 /// (English)") — a derivation, not a maintained mapping, so unknown models
-/// still get a sensible name.
+/// still get a sensible name. Retained for building specs from a bare file id.
+#[allow(dead_code)]
 fn display_name(file: &str) -> String {
     let tag = file
         .strip_prefix("ggml-")
@@ -102,78 +181,13 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-// ---------- runtime discovery (listing behind the seam) ----------
-
-/// One entry of the HF tree API. LFS-tracked binaries carry their real size and
-/// sha under `lfs`; the top-level `size` is the small pointer file for those.
-#[derive(Deserialize)]
-struct TreeEntry {
-    #[serde(rename = "type")]
-    kind: String,
-    path: String,
-    #[serde(default)]
-    size: u64,
-    #[serde(default)]
-    lfs: Option<Lfs>,
-}
-
-#[derive(Deserialize)]
-struct Lfs {
-    #[serde(default)]
-    size: u64,
-}
-
-/// Parse the HF tree JSON into model specs — pure, so it's tested without the
-/// network. Keeps only `ggml-*.bin` files; prefers the LFS size (the real
-/// bytes) over the pointer size. The recommended default is flagged.
-pub fn parse_model_listing(json: &str) -> Result<Vec<ModelSpec>> {
-    let entries: Vec<TreeEntry> = serde_json::from_str(json)
-        .map_err(|e| Error::Other(format!("couldn't read the model listing: {e}")))?;
-    let mut specs: Vec<ModelSpec> = entries
-        .into_iter()
-        .filter(|e| e.kind == "file" && is_model_file(&e.path))
-        .map(|e| {
-            let bytes = e.lfs.as_ref().map(|l| l.size).filter(|s| *s > 0).unwrap_or(e.size);
-            ModelSpec {
-                id: e.path.clone(),
-                name: display_name(&e.path),
-                file: e.path.clone(),
-                url: resolve_url(&e.path),
-                expected_bytes: bytes,
-                recommended: e.path == RECOMMENDED_FILE,
-            }
-        })
-        .collect();
-    // Surface the recommended model first so the UI can pre-select it.
-    specs.sort_by(|a, b| b.recommended.cmp(&a.recommended).then(a.file.cmp(&b.file)));
-    Ok(specs)
-}
-
-fn is_model_file(path: &str) -> bool {
-    path.starts_with("ggml-") && path.ends_with(".bin") && !path.contains('/')
-}
-
-/// Discover the available models by listing the repo. Falls back to just the
-/// recommended model if the listing can't be fetched or parsed, so the feature
-/// works offline. Guarantees the recommended model is present.
-pub fn discover_models<S: ByteSource>(source: &S) -> Vec<ModelSpec> {
-    let discovered = fetch_listing(source).and_then(|json| parse_model_listing(&json).ok());
-    match discovered {
-        Some(mut specs) if !specs.is_empty() => {
-            if !specs.iter().any(|s| s.file == RECOMMENDED_FILE) {
-                specs.insert(0, recommended());
-            }
-            specs
-        }
-        _ => vec![recommended()],
-    }
-}
-
-fn fetch_listing<S: ByteSource>(source: &S) -> Option<String> {
-    let (_, mut reader) = source.open(&tree_url()).ok()?;
-    let mut buf = String::new();
-    reader.read_to_string(&mut buf).ok()?;
-    Some(buf)
+/// **Deprecated compatibility shim (retire in Task 10).** Runtime discovery is
+/// gone; this returns the curated transcription specs (ignoring the source) so
+/// `src-tauri` keeps compiling until its model commands are rewired onto
+/// [`catalog`]/[`category_specs`]/[`selected`].
+#[deprecated(note = "use catalog()/category_specs(); removed when src-tauri is rewired (Task 10)")]
+pub fn discover_models<S: ByteSource>(_source: &S) -> Vec<ModelSpec> {
+    category_specs(ModelCategory::Transcription)
 }
 
 // ---------- installed-state + target path ----------
@@ -205,6 +219,90 @@ pub fn remove(base_dir: &Path, spec: &ModelSpec) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::io(&path, e)),
     }
+}
+
+// ---------- persisted per-category selection ----------
+
+/// Machine-level, per-category model selection. Persisted under
+/// `base_dir/models/selection.json` (models install machine-wide, so the choice
+/// is machine-wide too). Best-effort like the registry: missing/corrupt → default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelSelection {
+    #[serde(default)]
+    pub transcription: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+fn selection_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("models").join("selection.json")
+}
+
+impl ModelSelection {
+    pub fn load(base_dir: &Path) -> ModelSelection {
+        match std::fs::read_to_string(selection_path(base_dir)) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => ModelSelection::default(),
+        }
+    }
+
+    pub fn save(&self, base_dir: &Path) -> Result<()> {
+        let path = selection_path(base_dir);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| Error::Other(e.to_string()))?;
+        std::fs::write(&path, json + "\n").map_err(|e| Error::io(&path, e))
+    }
+
+    fn get(&self, category: ModelCategory) -> Option<&str> {
+        match category {
+            ModelCategory::Transcription => self.transcription.as_deref(),
+            ModelCategory::Language => self.language.as_deref(),
+        }
+    }
+
+    fn set(&mut self, category: ModelCategory, id: &str) {
+        match category {
+            ModelCategory::Transcription => self.transcription = Some(id.to_string()),
+            ModelCategory::Language => self.language = Some(id.to_string()),
+        }
+    }
+}
+
+/// The spec the UI treats as selected for a category: the persisted choice if it
+/// is a real catalog entry, else the category's Recommended.
+pub fn selected(base_dir: &Path, category: ModelCategory) -> ModelSpec {
+    let specs = category_specs(category);
+    if let Some(id) = ModelSelection::load(base_dir).get(category) {
+        if let Some(hit) = specs.iter().find(|s| s.id == id) {
+            return hit.clone();
+        }
+    }
+    specs
+        .into_iter()
+        .find(|s| s.recommended)
+        .expect("every category has a recommended entry")
+}
+
+/// The on-disk path of the model to actually USE for a category: the selected
+/// model if installed, else any installed model in the category, else None.
+pub fn selected_model_path(base_dir: &Path, category: ModelCategory) -> Option<PathBuf> {
+    let chosen = selected(base_dir, category);
+    if installed_size(base_dir, &chosen).is_some() {
+        return Some(target_path(base_dir, &chosen));
+    }
+    category_specs(category)
+        .into_iter()
+        .find(|s| installed_size(base_dir, s).is_some())
+        .map(|s| target_path(base_dir, &s))
+}
+
+/// Persist a category's selection.
+pub fn set_selected(base_dir: &Path, category: ModelCategory, id: &str) -> Result<()> {
+    let mut sel = ModelSelection::load(base_dir);
+    sel.set(category, id);
+    sel.save(base_dir)
 }
 
 // ---------- progress math + emit throttle (pure) ----------
@@ -381,19 +479,10 @@ mod tests {
     struct FakeSource {
         body: Vec<u8>,
         content_length: Option<u64>,
-        /// A canned listing JSON returned for the tree URL, if set.
-        listing: Option<String>,
     }
 
     impl ByteSource for FakeSource {
-        fn open(&self, url: &str) -> Result<(Option<u64>, Box<dyn Read + Send>)> {
-            if url.contains("/api/models/") {
-                let json = self
-                    .listing
-                    .clone()
-                    .ok_or_else(|| Error::Other("no listing".into()))?;
-                return Ok((None, Box::new(Cursor::new(json.into_bytes()))));
-            }
+        fn open(&self, _url: &str) -> Result<(Option<u64>, Box<dyn Read + Send>)> {
             Ok((self.content_length, Box::new(Cursor::new(self.body.clone()))))
         }
     }
@@ -415,7 +504,89 @@ mod tests {
         assert_eq!(r.file, "ggml-base.en.bin");
         assert!(r.recommended);
         assert!(r.url.contains("ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"));
-        assert_eq!(r.name, "Base (English)");
+        assert_eq!(r.name, "Whisper Base (English)");
+    }
+
+    #[test]
+    fn catalog_has_the_transcription_pair() {
+        let cat = catalog();
+        let trans: Vec<_> = cat
+            .iter()
+            .filter(|e| e.category == ModelCategory::Transcription)
+            .collect();
+        assert_eq!(trans.len(), 2, "one recommended + one advanced transcription model");
+        let rec = trans.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
+        assert_eq!(rec.spec.file, "ggml-base.en.bin");
+        assert_eq!(rec.spec.name, "Whisper Base (English)");
+        assert_eq!(rec.spec.expected_bytes, 147_951_465);
+        assert!(rec.spec.recommended);
+        let adv = trans.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
+        assert_eq!(adv.spec.file, "ggml-large-v3-turbo.bin");
+        assert_eq!(adv.spec.name, "Whisper Large v3 Turbo");
+        assert!(!adv.spec.recommended);
+        // Blurbs are the exact Settings copy.
+        assert_eq!(rec.blurb, "fast, accurate for meetings");
+        assert_eq!(adv.blurb, "best accuracy, understands more languages, slower");
+    }
+
+    #[test]
+    fn recommended_still_resolves_to_base_english() {
+        let r = recommended();
+        assert_eq!(r.file, "ggml-base.en.bin");
+        assert!(r.recommended);
+        assert!(r.url.contains("ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"));
+    }
+
+    #[test]
+    fn find_spec_locates_catalog_models_and_rejects_unknown() {
+        assert_eq!(find_spec("ggml-large-v3-turbo.bin").unwrap().name, "Whisper Large v3 Turbo");
+        assert!(find_spec("ggml-nonsense.bin").is_none());
+    }
+
+    #[test]
+    fn selected_defaults_to_recommended_then_honours_a_valid_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // No selection saved → the category's Recommended.
+        assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-base.en.bin");
+        // A valid choice persists and is returned.
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
+        assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-large-v3-turbo.bin");
+        // An unknown persisted id degrades back to Recommended (never a broken spec).
+        set_selected(base, ModelCategory::Transcription, "ggml-bogus.bin").unwrap();
+        assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-base.en.bin");
+    }
+
+    #[test]
+    fn selected_model_path_prefers_selection_then_any_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // Nothing installed → None (gating shows the download help).
+        assert!(selected_model_path(base, ModelCategory::Transcription).is_none());
+
+        // Install the ADVANCED model only, but leave the selection at Recommended.
+        let adv = find_spec("ggml-large-v3-turbo.bin").unwrap();
+        let p = target_path(base, &adv);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"weights").unwrap();
+        // Selection (base.en) isn't installed → fall back to the installed advanced one.
+        assert_eq!(selected_model_path(base, ModelCategory::Transcription), Some(p.clone()));
+
+        // Now select the installed advanced model → its path.
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
+        assert_eq!(selected_model_path(base, ModelCategory::Transcription), Some(p));
+    }
+
+    #[test]
+    fn model_selection_roundtrips_and_defaults_on_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
+        let loaded = ModelSelection::load(base);
+        assert_eq!(loaded.transcription.as_deref(), Some("ggml-large-v3-turbo.bin"));
+        // Corrupt file → defaults, never an error.
+        std::fs::write(base.join("models").join("selection.json"), "{ not json").unwrap();
+        assert_eq!(ModelSelection::load(base), ModelSelection::default());
     }
 
     #[test]
@@ -423,50 +594,6 @@ mod tests {
         let base = Path::new("/data/ken");
         // The download must land exactly where the transcriber looks.
         assert_eq!(target_path(base, &recommended()), transcript::model_path(base));
-    }
-
-    #[test]
-    fn listing_parse_keeps_ggml_bins_prefers_lfs_size_and_flags_recommended() {
-        let json = r#"[
-            {"type":"file","path":"README.md","size":1200},
-            {"type":"file","path":"ggml-tiny.en.bin","size":133,"lfs":{"size":77704715}},
-            {"type":"file","path":"ggml-base.en.bin","size":133,"lfs":{"size":147951465}},
-            {"type":"directory","path":"examples"},
-            {"type":"file","path":"models/extra.txt","size":10}
-        ]"#;
-        let specs = parse_model_listing(json).unwrap();
-        assert_eq!(specs.len(), 2, "only top-level ggml-*.bin files");
-        // Recommended sorts first for pre-selection.
-        assert_eq!(specs[0].file, "ggml-base.en.bin");
-        assert!(specs[0].recommended);
-        // Real (LFS) size, not the pointer size.
-        assert_eq!(specs[0].expected_bytes, 147951465);
-        assert!(!specs[1].recommended);
-        assert_eq!(specs[1].expected_bytes, 77704715);
-    }
-
-    #[test]
-    fn discover_falls_back_to_recommended_when_listing_unavailable() {
-        let source = FakeSource { body: vec![], content_length: None, listing: None };
-        let specs = discover_models(&source);
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].file, RECOMMENDED_FILE);
-    }
-
-    #[test]
-    fn discover_uses_the_listing_when_present() {
-        let listing = r#"[
-            {"type":"file","path":"ggml-base.en.bin","size":1,"lfs":{"size":147951465}},
-            {"type":"file","path":"ggml-small.en.bin","size":1,"lfs":{"size":487601967}}
-        ]"#;
-        let source = FakeSource {
-            body: vec![],
-            content_length: None,
-            listing: Some(listing.into()),
-        };
-        let specs = discover_models(&source);
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].file, "ggml-base.en.bin");
     }
 
     #[test]
@@ -514,7 +641,6 @@ mod tests {
         let source = FakeSource {
             body: body.clone(),
             content_length: Some(5000),
-            listing: None,
         };
         let spec = spec_for(RECOMMENDED_FILE, 5000);
 
@@ -547,7 +673,6 @@ mod tests {
         let source = FakeSource {
             body: vec![1u8; 3000],
             content_length: Some(5000),
-            listing: None,
         };
         let spec = spec_for(RECOMMENDED_FILE, 5000);
 
