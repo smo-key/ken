@@ -90,9 +90,13 @@ export type RunStatus =
   | "discarded"
   | "cancelled";
 
+/** Persisted statuses plus transient live-only ones (never in the DB set). */
+export type LiveStatus = RunStatus | "queued" | "waiting";
+
 export interface RunRow {
   id: number;
   slug: string;
+  kind: "ingest" | "automation";
   sessionId: string | null;
   startedAt: number;
   finishedAt: number | null;
@@ -116,10 +120,37 @@ export interface IngestDetail {
 }
 
 export interface IngestEvent {
+  kind: "ingest" | "automation";
   slug: string;
   runId: number;
-  status: RunStatus;
+  status: LiveStatus;
   detail: string | null;
+  activity?: string | null;
+  elapsedSecs?: number | null;
+  etaSecs?: number | null;
+}
+
+export interface Automation {
+  slug: string;
+  name: string;
+  globs: string[];
+  prompt: string;
+  autoApply: boolean;
+  enabled: boolean;
+}
+
+export interface AutomationForm {
+  slug?: string;
+  name: string;
+  globs: string[];
+  prompt: string;
+  autoApply: boolean;
+  enabled: boolean;
+}
+
+export interface AutomationDetail {
+  automation: Automation;
+  runs: RunRow[];
 }
 
 export interface IngestForm {
@@ -141,7 +172,8 @@ export type InboxKind =
   | "broken-recipe"
   | "stored"
   | "conflict"
-  | "conflict-copy";
+  | "conflict-copy"
+  | "automation-proposal";
 
 export interface InboxItem {
   /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
@@ -465,6 +497,19 @@ export const api = {
   cancelRun: (slug: string) => invoke<void>("cancel_run", { slug }),
   approveRun: (runId: number) => invoke<void>("approve_run", { runId }),
   discardRun: (runId: number) => invoke<void>("discard_run", { runId }),
+
+  listAutomations: () => invoke<Automation[]>("list_automations"),
+  getAutomation: (slug: string) =>
+    invoke<AutomationDetail>("get_automation", { slug }),
+  saveAutomation: (form: AutomationForm) =>
+    invoke<Automation>("save_automation", { form }),
+  deleteAutomation: (slug: string) =>
+    invoke<void>("delete_automation", { slug }),
+  runAutomation: (slug: string) => invoke<void>("run_automation", { slug }),
+  approveAutomationProposal: (itemId: number) =>
+    invoke<void>("approve_automation_proposal", { itemId }),
+  discardAutomationProposal: (itemId: number) =>
+    invoke<void>("discard_automation_proposal", { itemId }),
   pendingApprovals: () => invoke<RunRow[]>("pending_approvals"),
   reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
   resolveReviewItem: (id: number) =>

@@ -32,6 +32,7 @@ export type InboxAction =
 export function actionsFor(kind: InboxKind): InboxAction[] {
   switch (kind) {
     case "approval":
+    case "automation-proposal":
       return ["approve", "discard"];
     case "stale":
       return ["run-now"];
@@ -125,6 +126,7 @@ export function numericId(item: InboxItem): number {
 export function dotFor(kind: InboxKind): string {
   switch (kind) {
     case "approval":
+    case "automation-proposal":
       return "var(--accent)";
     case "stored":
       return "var(--needs-input)";

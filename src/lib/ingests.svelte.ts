@@ -6,12 +6,12 @@ import {
   type IngestDetail,
   type IngestEvent,
   type IngestSummary,
+  type LiveStatus,
   type RunRow,
-  type RunStatus,
 } from "./api";
 
 /** Run statuses that mean "the run is over". */
-const TERMINAL: RunStatus[] = ["fresh", "failed", "discarded", "cancelled", "pending_approval"];
+const TERMINAL: LiveStatus[] = ["fresh", "failed", "discarded", "cancelled", "pending_approval"];
 
 class IngestsStore {
   summaries = $state<IngestSummary[]>([]);
@@ -26,7 +26,7 @@ class IngestsStore {
     return this.pending;
   }
 
-  liveStatus(slug: string): RunStatus | null {
+  liveStatus(slug: string): LiveStatus | null {
     return this.live[slug]?.status ?? null;
   }
 
@@ -94,7 +94,7 @@ export const ingests = new IngestsStore();
 /** Plain-language caption for an ingest's current state. */
 export function statusCaption(
   s: IngestSummary,
-  live: RunStatus | null,
+  live: LiveStatus | null,
   now = Date.now(),
 ): { label: string; tone: "healthy" | "busy" | "attention" | "danger" | "muted" } {
   if (s.entry.kind === "broken") {
