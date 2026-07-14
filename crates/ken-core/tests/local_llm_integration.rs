@@ -21,6 +21,10 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 #[test]
 #[ignore = "needs a real GGUF via KEN_TEST_LLM_MODEL"]
+// token_to_bytes/Special are deprecated wrappers; kept deliberately — token_to_bytes
+// already does the token_to_piece_bytes buffer-resize loop internally. Task 4 decides
+// whether to inline.
+#[allow(deprecated)]
 fn loads_a_real_model_and_generates_a_few_tokens() {
     let Ok(path) = std::env::var("KEN_TEST_LLM_MODEL") else {
         eprintln!("set KEN_TEST_LLM_MODEL to run this");
