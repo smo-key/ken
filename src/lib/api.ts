@@ -392,6 +392,50 @@ export interface ModelDownloadError {
   message: string;
 }
 
+// ---- Record (on-device meeting recorder) ----
+
+export type RecordPhase = "idle" | "recording" | "paused" | "stopped";
+export type PermissionStatus =
+  | "granted"
+  | "denied"
+  | "notDetermined"
+  | "unsupported";
+export type RecordSourceName = "mic" | "system";
+export type RecordStorage = "transcript" | "audio" | "both";
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+}
+
+export interface RecordPermissions {
+  mic: PermissionStatus;
+  screen: PermissionStatus;
+  micSettingsUrl: string;
+  screenSettingsUrl: string;
+}
+
+export interface RecordLevelEvent {
+  source: RecordSourceName;
+  rms: number;
+}
+
+export interface RecordStateEvent {
+  phase: RecordPhase;
+  elapsedMs: number;
+  mic: boolean;
+  system: boolean;
+}
+
+export interface RecordSavedEvent {
+  relPath: string;
+}
+
+export interface RecordErrorEvent {
+  message: string;
+  canRetry: boolean;
+}
+
 /** What `video_transcript` knows about a clip's captions right now. */
 export interface VideoTranscript {
   /** WebVTT text, or null while generating / when there is none. */
@@ -631,4 +675,53 @@ export const api = {
     fn: (ev: ModelDownloadError) => void,
   ): Promise<UnlistenFn> =>
     listen<ModelDownloadError>("model-download-error", (e) => fn(e.payload)),
+
+  // ---- Record ----
+  recordInputDevices: () => invoke<AudioDevice[]>("record_input_devices"),
+  recordPermissions: () => invoke<RecordPermissions>("record_permissions"),
+  /**
+   * Ask for a permission, then re-read the current status. The mic prompt is
+   * async (fire-and-forget on the Rust side: its completion block does nothing),
+   * so the returned snapshot may still be `notDetermined` right after — callers
+   * should also re-poll `recordPermissions()` on window focus.
+   */
+  recordRequestPermission: async (
+    kind: "mic" | "screen",
+  ): Promise<RecordPermissions> => {
+    await invoke<void>("record_request_permission", { kind });
+    return invoke<RecordPermissions>("record_permissions");
+  },
+  recordStart: (mic: boolean, system: boolean, deviceId: string | null) =>
+    invoke<void>("record_start", { mic, system, deviceId }),
+  recordPause: () => invoke<void>("record_pause"),
+  recordResume: () => invoke<void>("record_resume"),
+  recordStop: (storage: RecordStorage) =>
+    invoke<void>("record_stop", { storage }),
+  recordCancel: () => invoke<void>("record_cancel"),
+  /**
+   * Open a macOS System Settings privacy deep link. Routed through Rust because
+   * the frontend opener capability scope forbids the `x-apple.systempreferences:`
+   * scheme.
+   */
+  openSettingsUrl: (url: string) =>
+    invoke<void>("record_open_settings", { url }),
+
+  onRecordLevel: (
+    fn: (ev: RecordLevelEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<RecordLevelEvent>("record-level", (e) => fn(e.payload)),
+  onRecordState: (
+    fn: (ev: RecordStateEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<RecordStateEvent>("record-state", (e) => fn(e.payload)),
+  onRecordTranscribing: (fn: () => void): Promise<UnlistenFn> =>
+    listen<null>("record-transcribing", () => fn()),
+  onRecordSaved: (
+    fn: (ev: RecordSavedEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<RecordSavedEvent>("record-saved", (e) => fn(e.payload)),
+  onRecordError: (
+    fn: (ev: RecordErrorEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<RecordErrorEvent>("record-error", (e) => fn(e.payload)),
 };
