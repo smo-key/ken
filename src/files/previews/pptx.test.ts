@@ -243,6 +243,54 @@ describe("parseSlide — images and shapes", () => {
   });
 });
 
+const FREEFORM = (fill: string) =>
+  `<p:sp><p:nvSpPr><p:cNvPr id="67" name="Freeform 66"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="10748564" y="3320490"/><a:ext cx="400478" cy="423695"/></a:xfrm>` +
+  `<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="l" t="t" r="r" b="b"/>` +
+  `<a:pathLst><a:path w="400478" h="423695">` +
+  `<a:moveTo><a:pt x="398839" y="216346"/></a:moveTo>` +
+  `<a:lnTo><a:pt x="391363" y="275864"/></a:lnTo>` +
+  `<a:cubicBezTo><a:pt x="373098" y="62924"/><a:pt x="408684" y="137803"/><a:pt x="398839" y="216346"/></a:cubicBezTo>` +
+  `<a:close/></a:path></a:pathLst></a:custGeom>` +
+  fill +
+  `<a:ln w="2747"><a:solidFill><a:srgbClr val="333333"/></a:solidFill></a:ln>` +
+  `</p:spPr><p:txBody><a:bodyPr/><a:p><a:endParaRPr/></a:p></p:txBody></p:sp>`;
+
+describe("parseSlide — custom geometry", () => {
+  it("builds an SVG path (M/L/C/Z) with viewBox dims from a:custGeom", () => {
+    const [s] = parseSlide(slide(FREEFORM(`<a:solidFill><a:srgbClr val="F2F2F2"/></a:solidFill>`))).shapes;
+    expect(s.kind).toBe("custgeom");
+    expect(s.pathW).toBe(400478);
+    expect(s.pathH).toBe(423695);
+    expect(s.geomPath).toBe(
+      "M 398839 216346 L 391363 275864 C 373098 62924 408684 137803 398839 216346 Z",
+    );
+    expect(s.fill).toBe("#F2F2F2");
+    expect(s.line?.color).toBe("#333333");
+    expect(s.line?.width).toBeCloseTo(2747 / 9525, 4);
+    // still positioned by its own xfrm
+    expect(s.x).toBeCloseTo(10748564 / 9525, 2);
+  });
+
+  it("resolves a schemeClr custGeom fill via the theme (survives, not dropped)", () => {
+    const theme = parseTheme(THEME1, MASTER1);
+    const xml = slide(FREEFORM(
+      `<a:solidFill><a:schemeClr val="accent1"/></a:solidFill>`));
+    const [s] = parseSlide(xml, theme).shapes;
+    expect(s.kind).toBe("custgeom");
+    expect(s.fill).toBe("#4472C4");
+  });
+
+  it("keeps an outlined, text-less, fill-less custGeom shape (line only)", () => {
+    const xml = slide(FREEFORM(`<a:noFill/>`));
+    const [s] = parseSlide(xml).shapes;
+    expect(s).toBeDefined();
+    expect(s.kind).toBe("custgeom");
+    expect(s.fill).toBeUndefined();
+    expect(s.line?.color).toBe("#333333");
+  });
+});
+
 describe("parseSlide — group transforms", () => {
   it("passes child coords through an identity group unchanged", () => {
     // off==chOff, ext==chExt → transform is the identity.

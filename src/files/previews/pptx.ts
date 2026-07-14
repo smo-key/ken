@@ -34,7 +34,37 @@ export interface Paragraph {
   bullet: boolean;
 }
 
-export type ShapeKind = "text" | "image" | "shape";
+export type ShapeKind = "text" | "image" | "shape" | "custgeom" | "table";
+
+/** Resolved outline: CSS colour + width in px. */
+export interface ShapeLine {
+  color: string;
+  width: number;
+}
+
+export interface TableCell {
+  paragraphs: Paragraph[];
+  /** Solid cell fill colour, when present. */
+  fill?: string;
+  gridSpan: number;
+  rowSpan: number;
+  /** Continuation of a horizontal span → the view skips it. */
+  hMerge: boolean;
+  /** Continuation of a vertical span → the view skips it. */
+  vMerge: boolean;
+  anchor: "top" | "center" | "bottom";
+}
+
+export interface TableRow {
+  /** Native px, or null when the row omits an explicit height. */
+  height: number | null;
+  cells: TableCell[];
+}
+
+export interface Table {
+  colWidths: number[];
+  rows: TableRow[];
+}
 
 export interface Shape {
   kind: ShapeKind;
@@ -50,6 +80,16 @@ export interface Shape {
   /** Solid fill colour of an autoshape box, when present. */
   fill?: string;
   geom?: "rect" | "ellipse" | "roundRect";
+  /** Resolved outline (a:ln), when present. */
+  line?: ShapeLine;
+  /** custGeom: SVG path string in path space (view scales it to the box). */
+  geomPath?: string;
+  /** custGeom: path-space viewBox width. */
+  pathW?: number;
+  /** custGeom: path-space viewBox height. */
+  pathH?: number;
+  /** Parsed table model for a p:graphicFrame table shape. */
+  table?: Table;
   isTitle: boolean;
   anchor: "top" | "center" | "bottom";
   /** Clockwise rotation in degrees (from a:xfrm rot, 60000ths of a degree). */
@@ -470,18 +510,53 @@ const GEOM: Record<string, Shape["geom"]> = {
   roundRect: "roundRect",
 };
 
+/** a:ln → resolved outline (px width + CSS colour), or undefined. */
+function parseLine(spPr: Element | null, theme?: ThemeContext): ShapeLine | undefined {
+  const ln = spPr && firstChildTag(spPr, "a:ln");
+  if (!ln) return undefined;
+  if (firstChildTag(ln, "a:noFill")) return undefined;
+  const color = resolveColor(ln, theme);
+  if (!color) return undefined;
+  const w = Number(ln.getAttribute("w"));
+  return { color, width: w ? emuToPx(w) : 1 };
+}
+
+/** a:custGeom → { d, w, h } SVG path in path space, or null if unusable. */
+function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | null {
+  const geom = firstChildTag(spPr, "a:custGeom");
+  const path = geom && firstChildTag(geom, "a:path");
+  if (!path) return null;
+  const w = Number(path.getAttribute("w")) || 0;
+  const h = Number(path.getAttribute("h")) || 0;
+  const pt = (el: Element | null) =>
+    el ? `${Number(el.getAttribute("x") ?? 0)} ${Number(el.getAttribute("y") ?? 0)}` : "0 0";
+  const cmds: string[] = [];
+  for (const seg of Array.from(path.children)) {
+    const pts = Array.from(seg.getElementsByTagName("a:pt"));
+    switch (seg.tagName) {
+      case "a:moveTo":   cmds.push(`M ${pt(pts[0])}`); break;
+      case "a:lnTo":     cmds.push(`L ${pt(pts[0])}`); break;
+      case "a:cubicBezTo": cmds.push(`C ${pt(pts[0])} ${pt(pts[1])} ${pt(pts[2])}`); break;
+      case "a:quadBezTo":  cmds.push(`Q ${pt(pts[0])} ${pt(pts[1])}`); break;
+      case "a:close":    cmds.push("Z"); break;
+      // a:arcTo (wR/hR/stAng/swAng) is rare and absent from the diagnosed deck;
+      // v1 approximates it by a line to its listed a:pt if present, else skips.
+      case "a:arcTo":    if (pts[0]) cmds.push(`L ${pt(pts[0])}`); break;
+    }
+  }
+  if (!cmds.length || !w || !h) return null;
+  return { d: cmds.join(" "), w, h };
+}
+
 function parseSp(sp: Element, theme?: ThemeContext, ctx: Ctx = IDENTITY): Shape | null {
   const paragraphs = paragraphsOf(sp, theme);
   const spPr = firstChildTag(sp, "p:spPr");
   const fill = resolveColor(spPr, theme);
-  const prst = spPr
-    ? firstChildTag(spPr, "a:prstGeom")?.getAttribute("prst")
-    : null;
-  const geom: Shape["geom"] | undefined = prst
-    ? (GEOM[prst] ?? "rect")
-    : undefined;
-  // Drop shapes that carry neither text nor any visible box.
-  if (paragraphs.length === 0 && !fill) return null;
+  const line = parseLine(spPr, theme);
+  const custom = spPr ? parseCustGeom(spPr) : null;
+
+  // Drop only shapes with nothing to draw: no text, no fill, no outline, no path.
+  if (paragraphs.length === 0 && !fill && !line && !custom) return null;
 
   const ph = placeholderType(sp);
   const isTitle = ph === "title" || ph === "ctrTitle";
@@ -489,12 +564,36 @@ function parseSp(sp: Element, theme?: ThemeContext, ctx: Ctx = IDENTITY): Shape 
   const anchor: Shape["anchor"] =
     anchorAttr === "ctr" ? "center" : anchorAttr === "b" ? "bottom" : "top";
 
+  if (custom) {
+    return {
+      kind: "custgeom",
+      ...applyCtx(ctx, xfrmOf(sp)),
+      ...rotFlipOf(sp),
+      paragraphs,
+      fill,
+      line,
+      isTitle,
+      anchor,
+      geomPath: custom.d,
+      pathW: custom.w,
+      pathH: custom.h,
+    };
+  }
+
+  const prst = spPr
+    ? firstChildTag(spPr, "a:prstGeom")?.getAttribute("prst")
+    : null;
+  const geom: Shape["geom"] | undefined = prst
+    ? (GEOM[prst] ?? "rect")
+    : undefined;
+
   return {
     kind: "shape",
     ...applyCtx(ctx, xfrmOf(sp)),
     ...rotFlipOf(sp),
     paragraphs,
     fill,
+    line,
     geom,
     isTitle,
     anchor,
