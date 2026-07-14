@@ -7,10 +7,12 @@
     parseRels,
     parseSlide,
     parseSlideSize,
+    parseTheme,
     resolvePath,
     slidePathsInOrder,
     type Shape,
     type SlideSize,
+    type ThemeContext,
   } from "./pptx";
   import PreviewLoading from "./PreviewLoading.svelte";
 
@@ -74,9 +76,18 @@
     parts.push(
       `justify-content:${shape.anchor === "center" ? "center" : shape.anchor === "bottom" ? "flex-end" : "flex-start"}`,
     );
-    if (shape.fill) parts.push(`background:${shape.fill}`);
-    if (shape.geom === "ellipse") parts.push("border-radius:50%");
-    else if (shape.geom === "roundRect") parts.push("border-radius:8%");
+    // custGeom paints its own fill in the SVG; tables paint per-cell — only the
+    // plain autoshape box gets a CSS background.
+    if (shape.fill && shape.kind === "shape") parts.push(`background:${shape.fill}`);
+    if (shape.kind === "shape" && shape.geom === "ellipse")
+      parts.push("border-radius:50%");
+    else if (shape.kind === "shape" && shape.geom === "roundRect")
+      parts.push("border-radius:8%");
+    const tf: string[] = [];
+    if (shape.rot) tf.push(`rotate(${shape.rot}deg)`);
+    if (shape.flipH) tf.push("scaleX(-1)");
+    if (shape.flipV) tf.push("scaleY(-1)");
+    if (tf.length) parts.push(`transform:${tf.join(" ")}`);
     return parts.join(";");
   }
 
@@ -101,6 +112,37 @@
         .file("ppt/_rels/presentation.xml.rels")
         ?.async("string");
       size = parseSlideSize(presXml);
+
+      // Load the deck theme once (first slide master + its theme part) so every
+      // slide's schemeClr colours resolve against the same palette.
+      async function loadTheme(): Promise<ThemeContext | undefined> {
+        const masterPath = Object.keys(zip.files)
+          .filter((n) => /^ppt\/slideMasters\/slideMaster\d+\.xml$/.test(n))
+          .sort()[0];
+        if (!masterPath) return undefined;
+        const masterXml = await zip.file(masterPath)?.async("string");
+        const mName = masterPath.slice(masterPath.lastIndexOf("/") + 1);
+        const mRelsXml = await zip
+          .file(`ppt/slideMasters/_rels/${mName}.rels`)
+          ?.async("string");
+        const mRels = mRelsXml ? parseRels(mRelsXml) : null;
+        // The theme relationship — grab the first rels target that points at a
+        // theme part (Type .../theme).
+        let themePath: string | undefined;
+        if (mRels) {
+          for (const target of mRels.values()) {
+            if (target.includes("theme")) {
+              themePath = resolvePath("ppt/slideMasters", target);
+              break;
+            }
+          }
+        }
+        const themeXml = themePath
+          ? await zip.file(themePath)?.async("string")
+          : undefined;
+        return parseTheme(themeXml, masterXml);
+      }
+      const theme = await loadTheme();
 
       let slidePaths = slidePathsInOrder(presXml, presRels);
       // Bare decks (no presentation part) still enumerate slide files directly.
@@ -139,7 +181,7 @@
         const xml = await zip.file(path)?.async("string");
         if (!xml) continue;
 
-        const { shapes } = parseSlide(xml);
+        const { shapes } = parseSlide(xml, theme);
         const dir = path.slice(0, path.lastIndexOf("/"));
         const name = path.slice(path.lastIndexOf("/") + 1);
         const relsXml = await zip
@@ -201,6 +243,57 @@
               <div class="shape" style={boxStyle(shape)}>
                 {#if shape.imgSrc}
                   <img src={shape.imgSrc} alt="" />
+                {:else if shape.kind === "custgeom" && shape.geomPath}
+                  <svg
+                    class="geom"
+                    viewBox="0 0 {shape.pathW} {shape.pathH}"
+                    preserveAspectRatio="none"
+                  >
+                    <path
+                      d={shape.geomPath}
+                      fill={shape.fill ?? "none"}
+                      stroke={shape.line?.color ?? "none"}
+                      stroke-width={shape.line ? shape.line.width : 0}
+                      vector-effect="non-scaling-stroke"
+                    />
+                  </svg>
+                {:else if shape.kind === "table" && shape.table}
+                  <table class="tbl">
+                    <colgroup>
+                      {#each shape.table.colWidths as cw, ci (ci)}<col
+                          style="width:{cw}px"
+                        />{/each}
+                    </colgroup>
+                    <tbody>
+                      {#each shape.table.rows as row, ri (ri)}
+                        <tr style={row.height ? `height:${row.height}px` : ""}>
+                          {#each row.cells as cell, ci (ci)}
+                            {#if !cell.hMerge && !cell.vMerge}
+                              <td
+                                colspan={cell.gridSpan}
+                                rowspan={cell.rowSpan}
+                                style="{cell.fill
+                                  ? `background:${cell.fill};`
+                                  : ''}vertical-align:{cell.anchor === 'center'
+                                  ? 'middle'
+                                  : cell.anchor === 'bottom'
+                                    ? 'bottom'
+                                    : 'top'}"
+                              >
+                                {#each cell.paragraphs as para, pi (pi)}
+                                  <p class="para" style="text-align:{para.align ?? 'left'}">
+                                    {#each para.runs as run, rii (rii)}<span
+                                        style={runStyle(run, shape)}>{run.text}</span
+                                      >{/each}
+                                  </p>
+                                {/each}
+                              </td>
+                            {/if}
+                          {/each}
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
                 {:else}
                   {#each shape.paragraphs as para, pi (pi)}
                     <p
@@ -298,6 +391,25 @@
     height: auto;
     max-height: 60%;
     object-position: left;
+  }
+  .geom {
+    width: 100%;
+    height: 100%;
+    display: block;
+    overflow: visible;
+  }
+  .tbl {
+    width: 100%;
+    height: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 14px;
+  }
+  .tbl td {
+    border: 1px solid #bbb;
+    padding: 2px 6px;
+    overflow: hidden;
+    word-break: break-word;
   }
   .para {
     margin: 0;
