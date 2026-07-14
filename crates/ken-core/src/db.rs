@@ -1104,6 +1104,21 @@ impl Db {
         Ok(())
     }
 
+    /// Return every `error` extraction row to `pending` so the worker retries
+    /// it. Called when the local model becomes ready (install / selection /
+    /// error recovery): files that errored under a transient model fault — the
+    /// batch-overflow bug, a bad load — recover without needing a content edit.
+    /// The content hash is preserved, so a still-failing file simply errors
+    /// again and won't wedge the queue. Returns how many rows were re-queued.
+    pub fn requeue_errored_extractions(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE extractions SET status = 'pending', error = NULL
+             WHERE status = 'error'",
+            [],
+        )?;
+        Ok(n)
+    }
+
     // --- knowledge model (entities, edges, events — derived read model
     //     for the Map and Timeline screens; replaced wholesale on build) ---
 
@@ -1817,6 +1832,35 @@ mod tests {
             (0, 1),
             "a file that only ever errored must not count as analyzed after re-enqueue"
         );
+    }
+
+    #[test]
+    fn requeue_errored_extractions_returns_error_rows_to_pending() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.upsert_file("c.md", "md", 1, 1, "indexed", None, "gamma").unwrap();
+        db.enqueue_extraction_if_changed("a.md", "ha").unwrap();
+        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
+        db.enqueue_extraction_if_changed("c.md", "hc").unwrap();
+        // a done, b errored, c still pending.
+        db.mark_extraction_done("a.md", "ha", 100).unwrap();
+        db.mark_extraction_error("b.md", "batch add failed", 101).unwrap();
+        // Only the errored row is re-queued; done and pending untouched.
+        assert_eq!(db.requeue_errored_extractions().unwrap(), 1);
+        // Drain the queue: b (re-queued, hash preserved) and c (already pending)
+        // are the only pending rows; a stayed done.
+        let mut pending = Vec::new();
+        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
+            db.mark_extraction_done(&rel, &hash, 200).unwrap();
+            pending.push((rel, hash));
+        }
+        assert!(pending.iter().any(|(r, h)| r == "b.md" && h == "hb"),
+            "errored file b returned to pending with its hash");
+        assert!(pending.iter().any(|(r, _)| r == "c.md"));
+        assert!(!pending.iter().any(|(r, _)| r == "a.md"), "a stayed done");
+        // Re-queueing again is a no-op now that nothing is errored.
+        assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
     }
 
     #[test]

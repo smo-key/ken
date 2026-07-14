@@ -46,6 +46,34 @@ pub fn chatml_prompt(system: &str, user: &str) -> String {
     )
 }
 
+/// The most prompt tokens we may feed given a context window that must also
+/// hold `max_tokens` of generated output, with a small safety margin. Pure so
+/// the batch-sizing/clamp logic is unit-tested without a real model.
+pub(crate) fn max_prompt_tokens(n_ctx: usize, max_tokens: usize) -> usize {
+    n_ctx.saturating_sub(max_tokens).saturating_sub(8).max(1)
+}
+
+/// Cap a tokenized prompt at `cap` tokens without dropping the chat template's
+/// framing: keep the head (system/BOS + start of the user turn) and a short
+/// tail (the closing `<|im_end|>…<|im_start|>assistant` markers), truncating the
+/// long middle of the document. Returned length is always `<= cap`. Generic and
+/// pure (no llama types) so it's unit-tested; a real prompt over the model's
+/// context is truncated here rather than erroring the whole generation.
+pub(crate) fn clamp_prompt_tokens<T: Clone>(tokens: &[T], cap: usize) -> Vec<T> {
+    if tokens.len() <= cap {
+        return tokens.to_vec();
+    }
+    // How many tail tokens to preserve for the ChatML closing turn markers.
+    const TAIL: usize = 24;
+    if cap <= TAIL {
+        return tokens[..cap].to_vec();
+    }
+    let head = cap - TAIL;
+    let mut out = tokens[..head].to_vec();
+    out.extend_from_slice(&tokens[tokens.len() - TAIL..]);
+    out
+}
+
 /// Reassembles a UTF-8 string from token byte fragments. llama.cpp emits raw
 /// bytes per token and a single character can straddle two tokens, so we buffer
 /// any trailing bytes that don't yet form a complete char and emit them once the
@@ -578,19 +606,30 @@ mod llama {
             greedy: bool,
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<String> {
-            let ctx_params =
-                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.n_ctx));
+            // Size the compute batch to the whole context so a real extraction
+            // prompt (~6k tokens) decodes in one pass. Default n_batch is 2048,
+            // below our prompts; leave n_ubatch at its default (llama splits the
+            // logical batch into micro-batches internally).
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(self.n_ctx))
+                .with_n_batch(self.n_ctx);
             let mut ctx = self
                 .model
                 .new_context(&self.backend, ctx_params)
                 .map_err(|e| Error::Other(format!("llama context failed: {e}")))?;
 
-            let tokens = self
+            let raw = self
                 .model
                 .str_to_token(prompt, AddBos::Always)
                 .map_err(|e| Error::Other(format!("tokenize failed: {e}")))?;
+            // Keep the prompt within the context window (reserving room for the
+            // generation), truncating the document's middle rather than failing.
+            let cap = super::max_prompt_tokens(self.n_ctx as usize, self.max_tokens);
+            let tokens = super::clamp_prompt_tokens(&raw, cap);
 
-            let mut batch = LlamaBatch::new(512, 1);
+            // Allocate the batch for the actual prompt length (the old fixed
+            // `512` errored with InsufficientSpace on any longer prompt).
+            let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
             let last = tokens.len().saturating_sub(1);
             for (i, tok) in tokens.iter().enumerate() {
                 batch
@@ -659,6 +698,44 @@ mod tests {
             "<|im_start|>system\nYou are terse.<|im_end|>\n\
              <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn max_prompt_tokens_reserves_generation_room() {
+        // 8192 ctx, 1024 generation reserve, 8-token margin.
+        assert_eq!(max_prompt_tokens(8192, 1024), 8192 - 1024 - 8);
+        // Never returns 0, even if the reserve swallows the whole window.
+        assert_eq!(max_prompt_tokens(100, 1000), 1);
+    }
+
+    #[test]
+    fn clamp_prompt_tokens_passes_short_prompts_through() {
+        let toks: Vec<u32> = (0..50).collect();
+        assert_eq!(clamp_prompt_tokens(&toks, 100), toks);
+        // Exactly at the cap is untouched.
+        assert_eq!(clamp_prompt_tokens(&toks, 50), toks);
+    }
+
+    #[test]
+    fn clamp_prompt_tokens_keeps_head_and_tail_when_truncating() {
+        // A prompt far larger than the cap: the returned slice is exactly `cap`
+        // long, keeps the head, and preserves the last 24 tokens (the ChatML
+        // closing turn markers) so the model still knows to answer.
+        let toks: Vec<u32> = (0..6000).collect();
+        let cap = 512;
+        let out = clamp_prompt_tokens(&toks, cap);
+        assert_eq!(out.len(), cap);
+        assert_eq!(out[0], 0, "head preserved");
+        // The final 24 entries are the original tail.
+        assert_eq!(&out[cap - 24..], &toks[toks.len() - 24..]);
+    }
+
+    #[test]
+    fn clamp_prompt_tokens_handles_tiny_caps() {
+        let toks: Vec<u32> = (0..100).collect();
+        // cap smaller than the tail reserve falls back to a plain head cut.
+        let out = clamp_prompt_tokens(&toks, 10);
+        assert_eq!(out, (0..10).collect::<Vec<u32>>());
     }
 
     #[test]

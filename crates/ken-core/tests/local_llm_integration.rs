@@ -74,4 +74,66 @@ fn loads_a_real_model_and_generates_a_few_tokens() {
     }
 
     assert!(!produced.trim().is_empty(), "model produced no text");
+
+    // --- Regression for the batch-overflow bug (a single backend/model init;
+    // llama's backend is global and can only be initialized once per process,
+    // so this lives in the same test rather than a second one). A prompt longer
+    // than 512 tokens must decode: the old `LlamaBatch::new(512, 1)` returned
+    // `InsufficientSpace` on the 513th `add`. The production fix sizes the batch
+    // to the token count and lifts `n_batch` to the context window.
+    let filler = "The quarterly review covered billing, vendors, and rollout. "
+        .repeat(200);
+    let long_prompt = format!(
+        "<|im_start|>user\nSummarize in three words. Context:\n{filler}<|im_end|>\n<|im_start|>assistant\n"
+    );
+    let long_tokens = model.str_to_token(&long_prompt, AddBos::Always).expect("tokenize long");
+    assert!(
+        long_tokens.len() > 512,
+        "prompt should exceed the old cap (got {} tokens)",
+        long_tokens.len()
+    );
+
+    // n_batch must cover the whole prompt for a single decode (default is 2048).
+    let n_ctx = 8192u32;
+    let long_ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(n_ctx);
+    let mut long_ctx = model.new_context(&backend, long_ctx_params).expect("long context");
+
+    // Batch sized to the actual prompt length — the fix.
+    let mut long_batch = LlamaBatch::new(long_tokens.len().max(1), 1);
+    let long_last = long_tokens.len() - 1;
+    for (i, tok) in long_tokens.iter().enumerate() {
+        long_batch
+            .add(*tok, i as i32, &[0], i == long_last)
+            .expect("batch add must not overflow for a long prompt");
+    }
+    long_ctx.decode(&mut long_batch).expect("decode long prompt");
+
+    let mut long_sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+    let mut long_produced = String::new();
+    let mut long_n_cur = long_batch.n_tokens();
+    for _ in 0..16 {
+        let token = long_sampler.sample(&long_ctx, long_batch.n_tokens() - 1);
+        long_sampler.accept(token);
+        if model.is_eog_token(token) {
+            break;
+        }
+        let bytes = model
+            .token_to_bytes(token, llama_cpp_2::model::Special::Plaintext)
+            .expect("token to bytes");
+        long_produced.push_str(&String::from_utf8_lossy(&bytes));
+        long_batch.clear();
+        long_batch.add(token, long_n_cur, &[0], true).expect("batch add gen");
+        long_n_cur += 1;
+        long_ctx.decode(&mut long_batch).expect("decode gen");
+    }
+    eprintln!(
+        "[long-prompt] {} tokens in → produced {:?}",
+        long_tokens.len(), long_produced
+    );
+    assert!(
+        !long_produced.trim().is_empty(),
+        "model produced no text for a long prompt"
+    );
 }

@@ -3827,12 +3827,25 @@ fn extraction_worker(
     // (opening runs pragmas + a migration probe — needless work per file).
     // Dropped with the function when the project switches/closes.
     let mut db: Option<Db> = None;
+    // Tracks the model's not-ready → ready edge so we retry files that errored
+    // while the model was faulty (e.g. a bad load, or the batch-overflow bug)
+    // exactly once per recovery — no content edit required.
+    let mut was_ready = false;
+    let mut requeue_on_next_open = false;
     while !stop.load(Ordering::SeqCst) {
         // Pause quietly unless the local model is ready.
-        if !matches!(
+        let ready = matches!(
             ken_core::local_llm::llm_status(),
             ken_core::local_llm::LlmStatus::Ready
-        ) {
+        );
+        if ready && !was_ready {
+            // Just became ready (model installed / selection changed / error
+            // acknowledged): return any errored rows to pending on the next
+            // time we hold the DB connection.
+            requeue_on_next_open = true;
+        }
+        was_ready = ready;
+        if !ready {
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
@@ -3864,6 +3877,12 @@ fn extraction_worker(
             }
         }
         let db = db.as_mut().expect("opened above");
+        // First tick after the model became ready: rescue errored rows so the
+        // Map recovers files that failed under a transient model fault.
+        if requeue_on_next_open {
+            let _ = db.requeue_errored_extractions();
+            requeue_on_next_open = false;
+        }
         let today = local_date_today();
         let at = engine::now_epoch();
         let generate = |prompt: &str| {
