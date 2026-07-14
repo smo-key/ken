@@ -361,6 +361,57 @@ pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
     Extraction { entities, events }
 }
 
+/// Extract one file: read its indexed text, prompt the model, parse the delta,
+/// and merge it. Marks the extraction row `done` on success (stamping the hash
+/// that was queued) or `error` on generation failure — a failed file leaves
+/// the model untouched and does NOT return to `pending`, so a persistently
+/// failing file can't wedge the queue.
+pub fn extract_one<G>(
+    db: &mut Db,
+    rel_path: &str,
+    content_hash: &str,
+    today: &str,
+    at: i64,
+    generate: &G,
+) -> Result<()>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
+    let text = db.get_text(rel_path)?.unwrap_or_default();
+    let prompt = compose_file_prompt(rel_path, &text, today);
+    match generate(&prompt) {
+        Ok(value) => {
+            let delta = parse_delta_value(&value);
+            db.merge_knowledge_delta(rel_path, &delta, at)?;
+            db.mark_extraction_done(rel_path, content_hash, at)?;
+            Ok(())
+        }
+        Err(e) => {
+            db.mark_extraction_error(rel_path, &e.to_string(), at)?;
+            Err(e)
+        }
+    }
+}
+
+/// Pop the oldest pending file and extract it. `Ok(None)` when the queue is
+/// empty. The caller (one background thread per project) loops on this,
+/// emitting `knowledge-updated` after each `Ok(Some(_))`.
+pub fn process_next_pending<G>(
+    db: &mut Db,
+    today: &str,
+    at: i64,
+    generate: &G,
+) -> Result<Option<String>>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
+    let Some((rel_path, content_hash)) = db.next_pending_extraction()? else {
+        return Ok(None);
+    };
+    extract_one(db, &rel_path, &content_hash, today, at, generate)?;
+    Ok(Some(rel_path))
+}
+
 /// Build (or rebuild) the knowledge model: compose from the DB's
 /// indexed files, run one headless session, parse, store. A failed
 /// build returns an error and leaves the previous model untouched.
@@ -629,6 +680,45 @@ mod tests {
         let h = content_hash("anything");
         assert_eq!(h.len(), 16);
         assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn worker_drains_queue_merges_and_marks_done() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("kickoff.md", "md", 1, 1, "indexed", None, "We hired Priya N.").unwrap();
+        let hash = content_hash("We hired Priya N.");
+        db.enqueue_extraction_if_changed("kickoff.md", &hash).unwrap();
+
+        // Fake local model: returns a canned delta regardless of prompt.
+        let generate = |_prompt: &str| -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "entities": [{"kind": "person", "name": "Priya N.", "summary": "New hire."}],
+                "relations": [],
+                "events": [{"date": "2026-07-14", "category": "people", "text": "Priya joined."}]
+            }))
+        };
+
+        let done = process_next_pending(&mut db, "2026-07-14", 100, &generate).unwrap();
+        assert_eq!(done, Some("kickoff.md".to_string()));
+        assert_eq!(db.extraction_coverage().unwrap(), (1, 1));
+        assert_eq!(db.list_entities_with_edges().unwrap().0.len(), 1);
+        assert_eq!(db.list_events().unwrap().len(), 1);
+        // Queue now empty.
+        assert_eq!(process_next_pending(&mut db, "2026-07-14", 101, &generate).unwrap(), None);
+    }
+
+    #[test]
+    fn worker_records_generation_failure_without_touching_the_model() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("bad.md", "md", 1, 1, "indexed", None, "content").unwrap();
+        db.enqueue_extraction_if_changed("bad.md", &content_hash("content")).unwrap();
+        let generate = |_: &str| -> Result<serde_json::Value> {
+            Err(Error::Other("model timed out".into()))
+        };
+        assert!(process_next_pending(&mut db, "2026-07-14", 100, &generate).is_err());
+        // Model untouched; the row is 'error', not 'pending' (no retry storm).
+        assert!(db.list_entities_with_edges().unwrap().0.is_empty());
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
     }
 
     #[test]
