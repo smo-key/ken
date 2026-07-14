@@ -21,6 +21,8 @@ serde_yaml = "0.9"
 portable-pty = "0.9"
 tiny_http = "0.12"
 similar = "2"
+cpal = "0.18"
+hound = "3.5"
 # Blocking, streamed HTTPS GET for the in-app model downloader — the only
 # network the app performs (a deliberate, user-initiated fetch). ureq is a tiny
 # blocking client using rustls (no OpenSSL/native-tls); default features would

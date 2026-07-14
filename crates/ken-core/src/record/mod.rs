@@ -121,6 +121,36 @@ impl LinearResampler {
     }
 }
 
+/// Create a 16 kHz / mono / 16-bit-PCM WAV writer at `path`. The caller writes
+/// `i16` samples (via `f32_to_i16`) and calls `finalize`.
+pub fn create_wav(
+    path: &Path,
+) -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    hound::WavWriter::create(path, spec)
+        .map_err(|e| Error::Other(format!("couldn't create recording file: {e}")))
+}
+
+/// Normalize a float sample to 16-bit PCM, clamped to avoid wrap on overshoot.
+pub fn f32_to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32767.0) as i16
+}
+
+/// Read a 16-bit PCM WAV back to `f32` in [-1, 1] — the form Whisper wants.
+pub fn read_wav_f32(path: &Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| Error::Other(format!("couldn't open recording file: {e}")))?;
+    reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / 32768.0).map_err(|e| Error::Other(e.to_string())))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +222,24 @@ mod tests {
         }
         // ~10 * 441 input @44.1k = 0.1s -> ~1600 output samples (±a few).
         assert!((out.len() as i64 - 1600).abs() < 8, "len {}", out.len());
+    }
+
+    #[test]
+    fn wav_round_trips_16k_mono() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0, 0.25];
+        {
+            let mut w = create_wav(&path).unwrap();
+            for s in &samples {
+                w.write_sample(f32_to_i16(*s)).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let back = read_wav_f32(&path).unwrap();
+        assert_eq!(back.len(), samples.len());
+        for (a, b) in samples.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
     }
 }
