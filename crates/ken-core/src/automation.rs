@@ -76,6 +76,91 @@ pub fn triggers(a: &Automation, changed: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Phase-1 (auto_apply=false): research + write a PROPOSAL, change nothing else.
+pub fn proposal_prompt(a: &Automation, matched: &[String], staging: &Path) -> String {
+    let files = if matched.is_empty() {
+        "(no specific files — inspect the folders your patterns cover)".to_string()
+    } else {
+        matched.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+    };
+    format!(
+        r###"You are Ken running the automation "{name}".
+
+## What to do
+
+{prompt}
+
+## Files that triggered this run
+
+{files}
+
+## THIS IS A PROPOSAL RUN — do not act outside the project
+
+- Research whatever you need by READING files and using read-only tools.
+- Do NOT create, edit, send, or delete anything outside this project folder.
+  Do NOT call any tool that changes an external system (issue trackers, chat,
+  email, calendars, etc.). This run only PLANS.
+- Write a single markdown proposal to `PROPOSAL_FILE={proposal}` containing:
+  1. A short summary of what you found.
+  2. A section "## Proposed actions" listing each external action you intend,
+     one bullet per action, concrete and self-contained (exactly what a later
+     run must do). If no external action is warranted, say so plainly.
+- Write ONLY that proposal file. Do not modify any other file.
+
+PROPOSAL_FILE={proposal}
+"###,
+        name = a.name,
+        prompt = a.prompt,
+        files = files,
+        proposal = staging.join("proposal.md").display(),
+    )
+}
+
+/// Phase-2: execute exactly the approved actions (MCP tools available).
+pub fn apply_prompt(a: &Automation, proposal: &str) -> String {
+    format!(
+        r#"You are Ken carrying out the approved actions for the automation "{name}".
+
+The user has reviewed and APPROVED the plan below. Execute exactly these actions
+using the tools available to you (including any MCP servers configured in the
+user's Claude setup). Do only what the approved plan says — nothing more. When
+done, reply with a one-line confirmation of what you did.
+
+## Approved plan
+
+{proposal}
+"#,
+        name = a.name,
+        proposal = proposal,
+    )
+}
+
+/// auto_apply=true: one session researches AND acts.
+pub fn direct_prompt(a: &Automation, matched: &[String]) -> String {
+    let files = if matched.is_empty() {
+        String::from("(no specific files — inspect the folders your patterns cover)")
+    } else {
+        matched.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+    };
+    format!(
+        r#"You are Ken running the automation "{name}".
+
+## What to do
+
+{prompt}
+
+## Files that triggered this run
+
+{files}
+
+Research what you need, then carry out the actions directly using the tools
+available to you (including any MCP servers configured in the user's Claude
+setup). When done, reply with a one-line confirmation.
+"#,
+        name = a.name, prompt = a.prompt, files = files,
+    )
+}
+
 pub fn list(project: &Project) -> Result<Vec<AutomationEntry>> {
     let dir = automations_dir(&project.root);
     if !dir.is_dir() {
@@ -315,5 +400,33 @@ mod tests {
         a = sample();
         a.prompt = "  ".into();
         assert!(validate(&a).is_err());
+    }
+
+    #[test]
+    fn proposal_prompt_names_files_staging_and_forbids_external_writes() {
+        let a = sample();
+        let matched = vec!["Recordings/a.md".to_string()];
+        let staging = std::path::Path::new("/tmp/stg");
+        let p = proposal_prompt(&a, &matched, staging);
+        assert!(p.contains("Recordings/a.md"));
+        assert!(p.contains("PROPOSAL_FILE=/tmp/stg/proposal.md"));
+        assert!(p.to_lowercase().contains("do not") || p.to_lowercase().contains("must not"));
+        assert!(p.contains(&a.prompt));
+    }
+
+    #[test]
+    fn apply_prompt_embeds_the_approved_proposal() {
+        let a = sample();
+        let p = apply_prompt(&a, "## Proposed actions\n- Create issue X");
+        assert!(p.contains("Create issue X"));
+        assert!(p.to_lowercase().contains("execute"));
+    }
+
+    #[test]
+    fn direct_prompt_used_when_auto_apply() {
+        let a = sample();
+        let p = direct_prompt(&a, &["Recordings/a.md".into()]);
+        assert!(p.contains("Recordings/a.md"));
+        assert!(p.contains(&a.prompt));
     }
 }
