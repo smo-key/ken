@@ -1,9 +1,10 @@
 # Ken wave 4 — local model, denser Map, Record, automations, ingest visibility
 
 Date: 2026-07-13. Status: approved by Arthur (this session); §9 (chat
-usability) added after approval at Arthur's request.
+usability), §10 (Settings simplification), and §11 (large-file preview hang)
+added after approval at Arthur's request.
 
-Eight work items. Items 1 and 4 share one new subsystem (the embedded local
+Ten work items. Items 1 and 4 share one new subsystem (the embedded local
 LLM); the rest are independent.
 
 User decisions (recorded from the clarifying round):
@@ -23,7 +24,8 @@ New `local_llm` module in `ken-core` behind a default-on cargo feature
 - Runtime: `llama-cpp-2` crate with the Metal feature. One model loaded
   per app process, lazily, on first use.
 - Model: Qwen3-4B-Instruct GGUF Q4_K_M downloaded from Hugging Face into the
-  app-data `models/` directory. Download runs in Rust with progress events;
+  app-data `models/` directory (default; Settings offers an advanced 8B
+  alternative — see §10). Download runs in Rust with progress events;
   the frontend reuses the Whisper flow's `ModelDownloadDialog`
   (`src/files/previews/ModelDownloadDialog.svelte`) generalized to name the
   model it is fetching. Checksum verified; partial downloads resume or restart.
@@ -256,6 +258,76 @@ Two reported bugs plus an audit:
   state after archiving the active chat. Findings that are quick fixes land in
   this wave; anything structural gets written up for the next wave.
 
+## 10. Settings simplification (reviewed under Paper & Ink / impeccable)
+
+Current `src/screens/SettingsScreen.svelte` review findings: seven identical
+cards at uniform 18px gaps (no editorial hierarchy or rhythm); the Appearance
+card fakes its row label with a per-option ternary; "Transcription model"
+lists every `ggml-*.bin` the whisper.cpp repo ships (runtime discovery,
+`crates/ken-core/src/model.rs`) — an unbounded, jargon-named list; Watched
+folders is a flat indented checkbox list of every folder with an "excluded"
+tag. Changes:
+
+- **Offline Models card** (replaces "Transcription model"): two categories,
+  each offering exactly **Recommended** or **Advanced** — a curated pair, not
+  the discovered repo listing (`model.rs` gains a curated catalog with the
+  same download/verify/install plumbing; discovery code retires):
+  - *Transcription* — Recommended: Whisper Base (English), 148 MB ("fast,
+    accurate for meetings"). Advanced: Whisper Large v3 Turbo, ~1.6 GB
+    ("best accuracy, understands more languages, slower").
+  - *Answers & Map* (the §1 language model) — Recommended: Qwen3 4B, ~2.5 GB
+    ("instant answers, builds your map"). Advanced: Qwen3 8B, ~5 GB ("smarter
+    answers, needs more memory").
+  - Interaction: one radio pair per category; picking an uninstalled model
+    starts its download inline (existing compact download flow, progress in
+    place); the non-selected installed file offers a quiet "Remove" to free
+    disk. The selected model is what the feature uses. Copy keeps the promise
+    up front: "These run on your Mac — nothing you say or store leaves it."
+  - The Whisper file constant stops being load-bearing: `transcript.rs` uses
+    whichever transcription model is selected (settings-persisted), falling
+    back to any installed one.
+- **Watched folders tree**: roots-only at first, chevron to expand/collapse
+  (quiet grid-rows transition, no bounce). Tri-state checkboxes: checked =
+  folder and everything under it watched; unchecked = excluded; indeterminate
+  ([-], native `indeterminate`) = some descendant excluded. Toggling a parent
+  applies to its whole subtree (the exclusion model is already prefix-based).
+  The "excluded" tag goes — the checkbox says it. The note copy stays plain.
+- **Page rhythm**: cards group under three quiet uppercase section headings —
+  *This project* (Project, Watched folders, Ignored files, Cloud files,
+  Sync & collaboration), *On this Mac* (Appearance, Offline models, AI
+  runner), *Working with agents* (Connect an agent) — generous separation
+  between groups, tighter within, restoring hierarchy without new chrome.
+- **Appearance**: the three radio rows collapse to one "Theme" row with the
+  app's existing segmented-control idiom (as in the Files All/Unread filter);
+  the ternary label hack goes.
+
+## 11. Large-file preview hang ("Opening…" stuck)
+
+Reported with `Research/Data/irs-bmf/eo3.xlsx` (148 MB): opening it wedges
+the UI on "Opening…" with no way out. Root cause class is the same as the
+fixed CSV startup freeze: the size guards in `EditorPane.svelte`
+(`GRID_EDIT_MAX`/`TEXT_EDIT_MAX`/`WYSIWYG_MAX`) only cover *editable*
+text/CSV paths — office previews (`XlsxPreview`, `DocxPreview`,
+`PptxPreview`, ipynb) read and parse the whole file on the main thread with
+no cap, so a huge workbook blocks the webview (nothing is cancellable because
+nothing yields).
+
+- **Size gate**: per-format preview caps (e.g. xlsx/docx/pptx/ipynb ~15 MB;
+  tune per format against real parse times) checked against `meta.size`
+  BEFORE any bytes are read. Over the cap → the existing "too large" notice
+  treatment with Open in Finder / external-app actions, same as big text
+  files today. Trust `meta.size` (already loaded) — no extra I/O.
+- **Never wedge**: under-cap previews parse off the main thread where the
+  parser allows (yielding/chunked parse as done for the CSV grid), and the
+  "Opening…" state always renders a working Cancel (back to the notice) —
+  the tab strip and rest of the app must stay responsive while a preview
+  loads. Regression test with a synthesized many-row workbook fixture.
+
+## Execution note
+
+Implementation will run subagent-driven (per superpowers), with subagents on
+**Opus** — Arthur's directive for all wave-4 work.
+
 ## Testing
 
 TDD per item. Rust: extraction merge semantics (dedup, source-union,
@@ -265,7 +337,9 @@ answer preempts), automation trigger matching + two-phase staging into
 recorder WAV plumbing with synthesized fixtures. Vitest: pptx group
 transforms / theme resolution / custGeom path building / table model (XML
 fixtures cut from the real deck), FileTree header layout, SearchOverlay
-streamed quick-answer state, chat store optimistic-echo reconciliation. Manual live-test per the project's existing
+streamed quick-answer state, chat store optimistic-echo reconciliation,
+watched-folders tri-state tree logic, curated model catalog selection, and
+preview size-gate behavior (big-workbook fixture never reaches the parser). Manual live-test per the project's existing
 `verify` recipe; recording and screen-capture permission flows verified by
 hand (TCC cannot be automated).
 
