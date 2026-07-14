@@ -108,7 +108,7 @@ impl IngestEngine {
         db_path: PathBuf,
         hooks: Arc<HookListener>,
         cfg: EngineConfig,
-        on_event: impl Fn(IngestEvent) + Send + 'static,
+        on_event: impl Fn(IngestEvent) + Send + Sync + 'static,
     ) -> Result<IngestEngine> {
         let (tx, rx) = channel::<Msg>();
         let current: Arc<Mutex<Option<(String, CancelToken)>>> =
@@ -116,6 +116,9 @@ impl IngestEngine {
         let current_thread = current.clone();
 
         let thread = std::thread::spawn(move || {
+            // Shared so the streaming activity callback (which needs a `'static`
+            // sink) and this loop can both emit through the same on_event.
+            let on_event: Arc<dyn Fn(IngestEvent) + Send + Sync> = Arc::new(on_event);
             let Ok(mut db) = Db::open_at(&db_path) else { return };
             let mut pending: HashMap<String, Instant> = HashMap::new();
             let mut force: HashMap<String, bool> = HashMap::new();
@@ -227,7 +230,7 @@ fn execute(
     current: &Arc<Mutex<Option<(String, CancelToken)>>>,
     slug: &str,
     force_full: bool,
-    on_event: &impl Fn(IngestEvent),
+    on_event: &Arc<dyn Fn(IngestEvent) + Send + Sync>,
 ) {
     // Fresh state every run: settings and recipes may have changed on disk.
     let emit_fail = |run_id: i64, detail: String| {
@@ -344,15 +347,31 @@ fn execute(
             ));
         }
     };
-    let outcome = runner::run_session(
-        &runner_cfg,
-        &project.root,
-        &session_id,
-        &plan.prompt,
-        hooks,
-        &token,
-        blocked_event,
-    );
+    // Live activity: each parsed tool/text line re-emits a transient `running`
+    // event carrying the newest activity string and elapsed seconds. Nothing is
+    // persisted here — the frontend overwrites its per-slug live marker.
+    let started = Instant::now();
+    let outcome = {
+        let act_emit = on_event.clone();
+        let a_slug = slug.to_string();
+        let a_sid = session_id.clone();
+        runner::run_ingest_session(
+            &runner_cfg,
+            &project.root,
+            &session_id,
+            &plan.prompt,
+            hooks,
+            &token,
+            blocked_event,
+            move |line: &str| {
+                act_emit(IngestEvent {
+                    activity: Some(line.to_string()),
+                    elapsed_secs: Some(started.elapsed().as_secs()),
+                    ..IngestEvent::at("ingest", &a_slug, run_id, Some(a_sid.clone()), "running", None)
+                });
+            },
+        )
+    };
     *current.lock().unwrap() = None;
 
     let finish = |db: &mut Db, status: &str, summary: Option<&str>, error: Option<&str>, ratio: Option<f64>| {
@@ -707,11 +726,33 @@ mod tests {
     }
 
     #[test]
+    fn running_event_carries_live_activity() {
+        let r = rig("complete");
+        r.engine.trigger("people", true);
+        wait_status(&r.events, "running", 15);
+        // At least one running event should carry an activity line before done.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_activity = false;
+        while Instant::now() < deadline {
+            if let Ok(ev) = r.events.recv_timeout(Duration::from_millis(200)) {
+                if ev.status == "running" && ev.activity.as_deref().map(|a| a.contains("notes/a.md")).unwrap_or(false) {
+                    saw_activity = true;
+                }
+                if ev.status == "fresh" { break; }
+            }
+        }
+        assert!(saw_activity, "no running event carried an activity line");
+    }
+
+    #[test]
     fn failed_run_reports_detail() {
-        let r = rig("fail");
+        // Ingests use the streaming headless path; `stream-fail` emits an
+        // error terminal result and a non-zero exit, which must surface as a
+        // failed run carrying diagnostic detail.
+        let r = rig("stream-fail");
         r.engine.trigger("people", false);
         let failed = wait_status(&r.events, "failed", 20);
-        assert!(failed.detail.unwrap().contains("boom"));
+        assert!(failed.detail.unwrap().contains("exited"));
     }
 
     #[test]
