@@ -356,3 +356,78 @@ fn extract_audio_f32(sample: &CMSampleBuffer) -> Result<(Vec<f32>, u16)> {
     }
     Ok((out, ch))
 }
+
+// ---------------------------------------------------------------------------
+// TCC permission probes (Task 15)
+//
+// Confirmed objc2-av-foundation 0.3.2 API (default features enable
+// `AVCaptureDevice`, `AVMediaFormat`, `block2`):
+//   - AVMediaTypeAudio: Option<&'static AVMediaType>   (an unsafe static)
+//   - AVCaptureDevice::authorizationStatusForMediaType(&AVMediaType)
+//         -> AVAuthorizationStatus     (static fn; not &self)
+//   - AVAuthorizationStatus is a newtype over NSInteger with associated consts
+//         {NotDetermined=0, Restricted=1, Denied=2, Authorized=3}
+//   - AVCaptureDevice::requestAccessForMediaType_completionHandler(
+//         &AVMediaType, &block2::DynBlock<dyn Fn(objc2::runtime::Bool)>)
+// ---------------------------------------------------------------------------
+
+use crate::record::PermissionStatus;
+
+// Screen Recording TCC lives in CoreGraphics. Both return C `bool`.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+/// Current Screen Recording authorization — no prompt.
+pub fn screen_permission() -> PermissionStatus {
+    if unsafe { CGPreflightScreenCaptureAccess() } {
+        PermissionStatus::Granted
+    } else {
+        // Preflight can't distinguish "denied" from "not yet asked"; treat as
+        // NotDetermined so the UI offers "Allow", falling back to the Settings
+        // deep link if the OS won't prompt again.
+        PermissionStatus::NotDetermined
+    }
+}
+
+/// Trigger the Screen Recording prompt (first time only; later a no-op that
+/// returns the current state). Returns true if now granted.
+pub fn request_screen() -> bool {
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+/// Microphone authorization via AVFoundation. No prompt — reads current TCC.
+pub fn mic_permission() -> PermissionStatus {
+    use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+    // `AVMediaTypeAudio` is an `Option<&'static AVMediaType>` static.
+    let media = match unsafe { AVMediaTypeAudio } {
+        Some(m) => m,
+        None => return PermissionStatus::Unsupported,
+    };
+    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media) };
+    if status == AVAuthorizationStatus::Authorized {
+        PermissionStatus::Granted
+    } else if status == AVAuthorizationStatus::NotDetermined {
+        PermissionStatus::NotDetermined
+    } else {
+        // Denied or Restricted.
+        PermissionStatus::Denied
+    }
+}
+
+/// Ask for microphone access (async prompt). Fire-and-forget: the UI re-reads
+/// `mic_permission()` after the user responds. The completion handler runs on an
+/// arbitrary dispatch queue, so it does nothing here.
+pub fn request_mic() {
+    use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+    let media = match unsafe { AVMediaTypeAudio } {
+        Some(m) => m,
+        None => return,
+    };
+    let handler = block2::RcBlock::new(|_granted: objc2::runtime::Bool| {});
+    unsafe {
+        AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &handler);
+    }
+}

@@ -50,6 +50,7 @@ local-llm = ["dep:llama-cpp-2"]
 screencapturekit = "8.0.0"
 objc2 = "0.6"
 objc2-av-foundation = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
