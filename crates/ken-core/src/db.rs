@@ -361,6 +361,8 @@ impl Db {
             // the file row.
             tx.execute("DELETE FROM contents WHERE file_id = ?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+            strip_file(&tx, rel_path)?;
+            tx.execute("DELETE FROM extractions WHERE rel_path = ?1", params![rel_path])?;
         }
         tx.commit()?;
         Ok(())
@@ -532,6 +534,9 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM contents", [])?;
         tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM extractions", [])?;
+        tx.execute("DELETE FROM entities", [])?; // cascades entity_edges
+        tx.execute("DELETE FROM events", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -1708,6 +1713,23 @@ mod tests {
         let (entities, _) = db.list_entities_with_edges().unwrap();
         assert!(entities.is_empty());
         assert!(db.list_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_file_purges_its_knowledge_and_queue_row() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("gone.md", "md", 1, 1, "indexed", None, "solo content").unwrap();
+        db.enqueue_extraction_if_changed("gone.md", "h1").unwrap();
+        db.merge_knowledge_delta("gone.md", &Extraction {
+            entities: vec![ent("person", "Solo", "Only here.")],
+            events: vec![],
+        }, 10).unwrap();
+
+        db.remove_file("gone.md").unwrap();
+
+        assert!(db.list_entities_with_edges().unwrap().0.is_empty());
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 0));
+        assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
     #[test]
