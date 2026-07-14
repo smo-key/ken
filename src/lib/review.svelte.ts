@@ -251,12 +251,20 @@ class ReviewStore {
   }
 
   async approve(item: InboxItem) {
-    await api.approveRun(numericId(item));
+    if (item.kind === "automation-proposal") {
+      await api.approveAutomationProposal(numericId(item));
+    } else {
+      await api.approveRun(numericId(item));
+    }
     await this.refresh();
   }
 
   async discard(item: InboxItem) {
-    await api.discardRun(numericId(item));
+    if (item.kind === "automation-proposal") {
+      await api.discardAutomationProposal(numericId(item));
+    } else {
+      await api.discardRun(numericId(item));
+    }
     await this.refresh();
   }
 

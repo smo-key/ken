@@ -1,11 +1,37 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const {
+  approveRun,
+  discardRun,
+  approveAutomationProposal,
+  discardAutomationProposal,
+} = vi.hoisted(() => ({
+  approveRun: vi.fn(),
+  discardRun: vi.fn(),
+  approveAutomationProposal: vi.fn(),
+  discardAutomationProposal: vi.fn(),
+}));
+
+vi.mock("./api", () => ({
+  api: {
+    approveRun,
+    discardRun,
+    approveAutomationProposal,
+    discardAutomationProposal,
+    reviewInbox: vi.fn(async () => ({ items: [], done: [] })),
+    currentProject: vi.fn(async () => "/proj"),
+  },
+}));
+
 import {
   actionsFor,
   buildDiffRows,
   conflictCopyPayload,
   conflictPayload,
   dotFor,
+  inboxFileRef,
   numericId,
+  review,
   sourceLabel,
 } from "./review.svelte";
 import type { InboxItem } from "./api";
@@ -41,6 +67,36 @@ describe("actionsFor", () => {
       "keep-original",
       "open-both",
     ]);
+    expect(actionsFor("automation-proposal")).toEqual(["approve", "discard"]);
+  });
+});
+
+describe("automation-proposal routing", () => {
+  it("dotFor and inboxFileRef treat proposals as slug-based action items", () => {
+    expect(dotFor("automation-proposal")).toBe("var(--accent)");
+    expect(
+      inboxFileRef(item({ kind: "automation-proposal", sourceRef: "people" })),
+    ).toBeNull();
+  });
+
+  it("approve/discard branch to the automation-proposal commands by kind", async () => {
+    approveRun.mockClear();
+    discardRun.mockClear();
+    approveAutomationProposal.mockClear();
+    discardAutomationProposal.mockClear();
+
+    const proposal = item({ id: "item-7", kind: "automation-proposal" });
+    await review.approve(proposal);
+    expect(approveAutomationProposal).toHaveBeenCalledWith(7);
+    expect(approveRun).not.toHaveBeenCalled();
+
+    await review.discard(proposal);
+    expect(discardAutomationProposal).toHaveBeenCalledWith(7);
+    expect(discardRun).not.toHaveBeenCalled();
+
+    const approval = item({ id: "run-3", kind: "approval" });
+    await review.approve(approval);
+    expect(approveRun).toHaveBeenCalledWith(3);
   });
 });
 
