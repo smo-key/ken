@@ -3130,6 +3130,10 @@ fn extraction_worker(
 ) {
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     let mut pending_emit = false;
+    // The worker's own connection, opened once and reused for its whole life
+    // (opening runs pragmas + a migration probe — needless work per file).
+    // Dropped with the function when the project switches/closes.
+    let mut db: Option<Db> = None;
     while !stop.load(Ordering::SeqCst) {
         // Pause quietly unless the local model is ready.
         if !matches!(
@@ -3157,16 +3161,22 @@ fn extraction_worker(
                 _ => return, // project closed or switched — this worker is done
             }
         };
-        let Ok(mut db) = Db::open(&base, project_id) else {
-            std::thread::sleep(Duration::from_secs(2));
-            continue;
-        };
+        if db.is_none() {
+            match Db::open(&base, project_id) {
+                Ok(d) => db = Some(d),
+                Err(_) => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        }
+        let db = db.as_mut().expect("opened above");
         let today = local_date_today();
         let at = engine::now_epoch();
         let generate = |prompt: &str| {
             ken_core::local_llm::generate_json(prompt, ken_core::local_llm::Priority::Background)
         };
-        match knowledge_model::process_next_pending(&mut db, &today, at, &generate) {
+        match knowledge_model::process_next_pending(db, &today, at, &generate) {
             Ok(Some(_)) => {
                 pending_emit = true;
                 // Throttle: coalesce a burst into at most one event / 750ms.

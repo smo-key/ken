@@ -87,6 +87,13 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Multiple writers share this file on separate connections (the state
+        // mutex's Db, the scanner's, the extraction worker's). WAL allows
+        // concurrent readers but still one writer at a time — without a busy
+        // handler a second writer gets SQLITE_BUSY *immediately*: the worker
+        // would waste a whole re-generation on retry, and a scanner write could
+        // simply be lost. Waiting briefly instead makes contention invisible.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Db { conn };
         db.migrate()?;
         Ok(db)
