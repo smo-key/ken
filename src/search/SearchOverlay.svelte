@@ -25,6 +25,10 @@
   let aiTimer: ReturnType<typeof setTimeout> | undefined;
   // Live streaming buffer for the query currently being answered.
   let streaming = $state<{ query: string; text: string } | null>(null);
+  // The query for which the on-device model is working but has not yet
+  // produced any output — drives the "Thinking…" indicator. Tied to the
+  // query string so a stale one never lingers across query changes.
+  let thinking = $state<string | null>(null);
   let modelInstalled = $state(true);
 
   onMount(() => {
@@ -35,6 +39,7 @@
     void api
       .onQuickAnswer((qa) => {
         answerCache.set(qa.query, qa);
+        if (thinking === qa.query) thinking = null;
         if (qa.query === query.trim()) {
           answer = qa;
           streaming = null; // final replaces the live buffer
@@ -44,6 +49,8 @@
     void api
       .onQuickAnswerDelta((ev) => {
         if (ev.query !== query.trim()) return; // stale
+        // First output for this query — the model is no longer "thinking".
+        if (thinking === ev.query) thinking = null;
         if (!streaming || streaming.query !== ev.query) {
           streaming = { query: ev.query, text: ev.delta };
         } else {
@@ -71,6 +78,9 @@
     // Clear the live buffer when the query changes so an old stream doesn't
     // bleed into a new query.
     if (!streaming || streaming.query !== q) streaming = null;
+    // The query changed, so any pending "Thinking…" belongs to an old query.
+    // A fresh dispatch (below) re-arms it after the debounce.
+    if (thinking !== q) thinking = null;
     if (!cached && aiAvailable && isQuestionQuery(q)) {
       aiTimer = setTimeout(() => void ask(q), 800);
     }
@@ -78,13 +88,23 @@
 
   async function ask(q: string) {
     if (q !== query.trim()) return;
+    // The debounce elapsed and we're dispatching for the live query: the
+    // on-device model is now working with nothing to show yet.
+    thinking = q;
     const available = await api.quickAnswer(q).catch(() => false);
-    if (!available) aiAvailable = false;
+    if (!available) {
+      aiAvailable = false;
+      if (thinking === q) thinking = null;
+    }
   }
+
+  // Below this length a query is too trivial to be worth a backend round-trip
+  // (and would return firehose results); guard the dispatch entirely.
+  const MIN_SEARCH_LEN = 2;
 
   async function run() {
     const q = query.trim();
-    if (!q) {
+    if (q.length < MIN_SEARCH_LEN) {
       hits = [];
       searched = false;
       return;
@@ -164,6 +184,11 @@
     <div class="qa">
       <div class="qa-head">Quick answer</div>
       <div class="qa-body">{@html renderMarkdown(stripStreamingBody(streaming.text))}</div>
+    </div>
+  {:else if thinking === query.trim()}
+    <div class="qa">
+      <div class="qa-head">Quick answer</div>
+      <div class="qa-body qa-thinking">Thinking…</div>
     </div>
   {:else if !modelInstalled && isQuestionQuery(query.trim())}
     <div class="qa qa-hint">
@@ -370,6 +395,19 @@
   }
   .qa-body :global(p) {
     margin: 0;
+  }
+  .qa-thinking {
+    color: var(--ink-secondary);
+    animation: qa-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes qa-pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 1;
+    }
   }
   .qa-foot {
     display: flex;
