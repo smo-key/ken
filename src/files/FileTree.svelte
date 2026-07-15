@@ -8,13 +8,14 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
-  import { showMarkAllViewed, showUnreadFilter } from "./filesHeader";
+  import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
   import { buildTree } from "../lib/tree";
   import {
     openContextMenu,
     type MenuEntry,
   } from "../lib/ui/ContextMenu.svelte";
   import ContextMenu from "../lib/ui/ContextMenu.svelte";
+  import ConfirmMenu from "../lib/ui/ConfirmMenu.svelte";
   import { canDrop, drag } from "./dnd.svelte";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
@@ -24,6 +25,7 @@
   let { width }: { width: number } = $props();
 
   const unreadOnly = $derived(app.filesFilter === "unread");
+  const markAllEnabled = $derived(isMarkAllEnabled(app.unread.length));
   // In unread-only view, buildTree gets just the unread files and synthesizes
   // their ancestor folders (folders=[]), so nothing but the changed files and
   // the path to them shows.
@@ -147,16 +149,27 @@
           >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
         </div>
       {/if}
-      {#if showMarkAllViewed(app.unread.length)}
-        <button
-          class="icon-btn"
-          data-tooltip="Mark every changed file as viewed"
-          aria-label="Mark all as viewed"
-          onclick={() => void app.markAllSeen()}
-        >
-          <CheckCheck size={15} strokeWidth={1.75} />
-        </button>
-      {/if}
+      <!-- Always shown; disabled (not hidden) when there is nothing to mark.
+           Uses aria-disabled + a data-disabled styling hook rather than the
+           native `disabled` attribute: a natively disabled button swallows
+           pointer/hover events, so its :hover::after tooltip would never fire.
+           Keeping the element hoverable lets the "why" tooltip appear, and the
+           onclick guards against acting while disabled. -->
+      <button
+        class="icon-btn"
+        class:is-disabled={!markAllEnabled}
+        data-disabled={!markAllEnabled}
+        data-tooltip={markAllEnabled
+          ? "Mark every changed file as viewed"
+          : "No unread files"}
+        aria-label="Mark all as viewed"
+        aria-disabled={!markAllEnabled}
+        onclick={() => {
+          if (markAllEnabled) void app.markAllSeen();
+        }}
+      >
+        <CheckCheck size={15} strokeWidth={1.75} />
+      </button>
       <button
         class="icon-btn"
         data-tooltip="Import file"
@@ -207,6 +220,7 @@
 </div>
 
 <ContextMenu />
+<ConfirmMenu />
 
 <style>
   .tree {
@@ -329,6 +343,17 @@
   .icon-btn:hover {
     background: var(--sunken);
     color: var(--ink);
+  }
+  /* aria-disabled, not the native attribute, so the button still receives hover
+     and can surface its "why" tooltip. Dim it and suppress the interactive
+     affordances (hover ground, pointer cursor) instead. */
+  .icon-btn.is-disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .icon-btn.is-disabled:hover {
+    background: transparent;
+    color: var(--ink-tertiary);
   }
   .icon-btn[data-tooltip]::after {
     content: attr(data-tooltip);

@@ -10,10 +10,12 @@
   import Pencil from "@lucide/svelte/icons/pencil";
   import FilePlus from "@lucide/svelte/icons/file-plus";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
+  import Trash2 from "@lucide/svelte/icons/trash-2";
   import { app } from "../lib/app.svelte";
   import { api } from "../lib/api";
   import type { TreeNode } from "../lib/tree";
   import { openContextMenu, type MenuEntry } from "../lib/ui/ContextMenu.svelte";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import { canDrop, drag, parentOf } from "./dnd.svelte";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
@@ -49,6 +51,9 @@
 
   function rowMenu(e: MouseEvent) {
     e.preventDefault();
+    // Capture coords now: the confirm popover opens later, off the same spot.
+    const x = e.clientX;
+    const y = e.clientY;
     const fav = app.isFavorite(node.relPath);
     const kind = isFolder ? "folder" : "file";
     const items: MenuEntry[] = [
@@ -111,8 +116,21 @@
             icon: Star,
             onSelect: () => app.toggleFavorite(node.relPath, kind),
           },
+      "separator",
+      {
+        label: "Delete",
+        icon: Trash2,
+        danger: true,
+        onSelect: () =>
+          openConfirm(x, y, {
+            title: "Move to Trash",
+            body: `Move “${node.name}” to the Trash? You can recover it from the Trash.`,
+            confirmLabel: "Move to Trash",
+            onConfirm: () => void app.deleteFile(node.relPath),
+          }),
+      },
     ];
-    openContextMenu(e.clientX, e.clientY, items);
+    openContextMenu(x, y, items);
   }
 
   async function doMove(from: string, folder: string) {

@@ -24,3 +24,9 @@ chrono = "0.4"
 # The record session names `hound::WavWriter` as a struct field type, so hound
 # must be a direct dependency here (not just transitively via ken-core).
 hound = "3.5"
+# Recoverable delete: move files/folders to the OS trash (Finder Trash, Recycle
+# Bin, freedesktop Trash) instead of unlinking them permanently.
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"

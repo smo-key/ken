@@ -441,6 +441,28 @@ class AppStore {
     if (this.project) saveFavorites(this.project.id, this.favorites);
     await this.refreshTree();
   }
+
+  /** Move a file or folder to the OS trash (recoverable), then forget it:
+   *  close any open tab for that path — or, for a folder, every tab under it —
+   *  and drop matching favorites and recents. Folder deletes are prefix-aware. */
+  async deleteFile(relPath: string) {
+    await api.deleteFile(relPath);
+    // A folder delete takes everything under its prefix with it.
+    const under = (p: string) => p === relPath || p.startsWith(relPath + "/");
+    const tabs = this.fileTabs.filter((t) => !under(t.path));
+    const active =
+      this.activeTab && under(this.activeTab)
+        ? (tabs[tabs.length - 1]?.path ?? null)
+        : this.activeTab;
+    this.applyTabState({ tabs, active });
+    this.favorites = this.favorites.filter((f) => !under(f.path));
+    this.recents = this.recents.filter((r) => !under(r.path));
+    if (this.project) {
+      saveFavorites(this.project.id, this.favorites);
+      saveRecents(this.project.id, this.recents);
+    }
+    await this.refreshTree();
+  }
 }
 
 export const app = new AppStore();

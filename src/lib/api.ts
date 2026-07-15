@@ -496,6 +496,8 @@ export const api = {
   reindex: () => invoke<ScanStats>("reindex"),
   moveFile: (fromRel: string, toRel: string) =>
     invoke<void>("move_file", { fromRel, toRel }),
+  /// Move a file OR folder to the OS trash (recoverable — not a permanent delete).
+  deleteFile: (relPath: string) => invoke<void>("delete_file", { relPath }),
   createFolder: (relPath: string) => invoke<void>("create_folder", { relPath }),
   /** Returns the FINAL rel path (the name may have been deduped). */
   createDocument: (relPath: string) =>

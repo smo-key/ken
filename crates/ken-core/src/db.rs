@@ -1238,6 +1238,68 @@ impl Db {
         Ok(n)
     }
 
+    /// Sentinel `mtime` stamped on a row that must be re-indexed by the next
+    /// incremental scan. `scan::scan` treats a file as unchanged only when the
+    /// stored `(size, mtime)` equals what's on disk; no real filesystem mtime
+    /// can be negative, so this value guarantees the row no longer matches and
+    /// `index_one` re-runs for it.
+    const REINDEX_SENTINEL_MTIME: i64 = -1;
+
+    /// One-time, idempotent reclassification of stored file kinds. `kind` is
+    /// STORED at index time (via `FileKind::from_path` in `scan::index_one`),
+    /// and the incremental scanner never re-runs `index_one` for an unchanged
+    /// file — so when a kind's classification later changes (e.g. `.vtt` moving
+    /// from "binary" to "txt"), pre-existing rows keep the stale kind forever.
+    /// This walks every `files` row, recomputes the kind from its `rel_path`,
+    /// and UPDATEs any that drifted — correcting the file-tree glyph and the
+    /// search-hit kind WITHOUT re-reading file bytes. Returns how many rows were
+    /// reclassified; safe to call on every project open.
+    ///
+    /// A row transitioning from a non-content kind ("binary"/"image") to a
+    /// content kind ("txt"/"md"/…) must ALSO become content-searchable. We
+    /// can't extract here (no byte read), but we CAN reset the row's stored
+    /// `mtime` to [`Self::REINDEX_SENTINEL_MTIME`] so the next incremental
+    /// `scan::scan` sees it as changed and re-runs `index_one` (re-extracting
+    /// content + enqueuing extraction). Only those transitioned rows are
+    /// re-index-flagged, to avoid needless work for a mere glyph change.
+    pub fn refresh_stored_kinds(&mut self) -> Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT rel_path, kind FROM files")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        for (rel, stored_kind) in rows {
+            let new_kind = crate::extract::FileKind::from_path(Path::new(&rel));
+            let new_str = new_kind.as_str();
+            if new_str == stored_kind {
+                continue;
+            }
+            // The only kinds that carry no extractable content serialize as
+            // "binary" / "image" (see `FileKind::has_content`). A row was
+            // non-content iff its stored kind is one of those.
+            let old_was_content = stored_kind != "binary" && stored_kind != "image";
+            let gains_content = !old_was_content && new_kind.has_content();
+            if gains_content {
+                tx.execute(
+                    "UPDATE files SET kind = ?2, mtime = ?3 WHERE rel_path = ?1",
+                    params![rel, new_str, Self::REINDEX_SENTINEL_MTIME],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE files SET kind = ?2 WHERE rel_path = ?1",
+                    params![rel, new_str],
+                )?;
+            }
+            n += 1;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Return `error` extraction rows that still have retries left (attempts <
     /// `MAX_EXTRACTION_ATTEMPTS`) to `pending` so the worker retries them. Called
     /// both when the local model becomes ready (install / selection / error
@@ -2002,6 +2064,72 @@ mod tests {
 
         // Idempotent: a second call enqueues nothing (every file now has a row).
         assert_eq!(db.backfill_extractions().unwrap(), 0);
+    }
+
+    #[test]
+    fn refresh_stored_kinds_reclassifies_stale_binary_vtt_to_txt() {
+        let mut db = Db::open_in_memory().unwrap();
+        // A `.vtt` indexed before it was reclassified as text: stored "binary",
+        // metadata-only, with no content — exactly the stale-row bug.
+        db.upsert_file("m/talk.vtt", "binary", 10, 5, "metadata_only", None, "")
+            .unwrap();
+
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 1);
+
+        let row = db.get_file("m/talk.vtt").unwrap().unwrap();
+        assert_eq!(row.kind, "txt", "the stale binary kind must be corrected to txt");
+    }
+
+    #[test]
+    fn refresh_stored_kinds_is_idempotent_and_leaves_correct_rows_untouched() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Already-correct rows: a content file classified as its true kind, and
+        // a genuine binary that must stay binary.
+        db.upsert_file("notes/a.md", "md", 1, 5, "indexed", None, "alpha").unwrap();
+        db.upsert_file("data/blob.bin", "binary", 1, 5, "metadata_only", None, "").unwrap();
+
+        // No drift → nothing changed.
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 0);
+        assert_eq!(db.get_file("notes/a.md").unwrap().unwrap().kind, "md");
+        assert_eq!(db.get_file("data/blob.bin").unwrap().unwrap().kind, "binary");
+
+        // Second call is a no-op too (idempotent).
+        db.upsert_file("m/talk.vtt", "binary", 10, 5, "metadata_only", None, "").unwrap();
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 1);
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 0);
+    }
+
+    #[test]
+    fn refresh_stored_kinds_resets_mtime_only_for_content_transitions() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Non-content → content: mtime must be reset to the sentinel so the next
+        // incremental scan sees it as changed and re-runs index_one (re-extract).
+        db.upsert_file("m/talk.vtt", "binary", 10, 5, "metadata_only", None, "").unwrap();
+
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 1);
+        let row = db.get_file("m/talk.vtt").unwrap().unwrap();
+        assert_eq!(row.kind, "txt");
+        assert_eq!(
+            row.mtime, -1,
+            "a non-content→content transition must reset mtime so scan re-indexes it"
+        );
+    }
+
+    #[test]
+    fn refresh_stored_kinds_preserves_mtime_for_non_content_transitions() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Kind drift that does NOT gain content (content stays present): the
+        // glyph updates but there's no need to force a re-index, so mtime stays.
+        // Simulate a stored "md" for a path that now classifies as "code".
+        db.upsert_file("src/main.rs", "md", 10, 5, "indexed", None, "fn main").unwrap();
+
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 1);
+        let row = db.get_file("src/main.rs").unwrap().unwrap();
+        assert_eq!(row.kind, "code");
+        assert_eq!(
+            row.mtime, 5,
+            "a content→content reclassification must not disturb mtime (no re-index needed)"
+        );
     }
 
     #[test]

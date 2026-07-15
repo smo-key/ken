@@ -187,6 +187,19 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let mut db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
     let watch_db_path = db_path(&guard.base_dir, project.config.id);
 
+    // One-time kind refresh: `files.kind` is STORED at index time, and the
+    // scanner never re-classifies an unchanged file — so a file whose kind
+    // definition changed after it was indexed (e.g. `.vtt` moving from "binary"
+    // to editable "txt") keeps its stale stored kind, wrong glyph, and wrong
+    // search-hit kind. Recompute every row's kind from its path and correct the
+    // drifted ones. Rows transitioning from a non-content to a content kind also
+    // get their stored mtime reset to a sentinel, so the initial background scan
+    // below re-runs `index_one` and makes their content searchable + extractable.
+    // Cheap (no byte reads), idempotent, and safe on every open.
+    if let Err(e) = db.refresh_stored_kinds() {
+        eprintln!("warning: stored-kind refresh failed: {e}");
+    }
+
     // One-time extraction backfill: a project indexed before the incremental
     // Map landed has no `extractions` rows, and the scanner never re-runs
     // index_one for unchanged files — so those files would show "0 of N
@@ -912,7 +925,19 @@ fn save_file(
 fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRow>> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
-    active.db.get_file(&rel_path).map_err(err)
+    let mut row = active.db.get_file(&rel_path).map_err(err)?;
+    // Read-time authority over `kind`: the column is STORED at index time, so a
+    // file whose classification changed after it was indexed (e.g. `.vtt` moving
+    // from "binary" to editable "txt") keeps a stale kind until a reindex. The
+    // editor decides read-only/editable from this value, so recompute it from the
+    // path here — one cheap `from_path` — and override the stored kind. Falls back
+    // to the stored kind if the path can't be resolved to an absolute path.
+    if let Some(r) = row.as_mut() {
+        if let Ok(abs) = active.project.resolve(&rel_path) {
+            r.kind = ken_core::extract::FileKind::from_path(&abs).as_str().to_string();
+        }
+    }
+    Ok(row)
 }
 
 #[tauri::command]
@@ -1610,6 +1635,49 @@ fn move_file(
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
         scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
     }
+    Ok(())
+}
+
+/// Reconcile the index after a file or folder has left the project on disk
+/// (deleted or moved to the trash). A file's row is dropped through the standard
+/// `refresh_path` (which sees the path is gone and removes it); a folder's whole
+/// subtree is dropped with `remove_folder` — the same reconciliation the watcher
+/// performs, but synchronous so the caller's tree refresh already reflects it.
+/// Factored out of `delete_file` so it's unit-testable without the OS trash.
+fn deindex_removed(project: &Project, db: &mut Db, rel: &str, is_dir: bool) -> ken_core::Result<()> {
+    if is_dir {
+        db.remove_folder(rel)?;
+    } else {
+        scan::refresh_path(project, db, rel)?;
+    }
+    Ok(())
+}
+
+/// Move a file OR folder to the OS trash (recoverable — it lands in Finder's
+/// Trash / the Recycle Bin, not an unlink). The path is validated to stay inside
+/// the project root (`resolve` rejects `..`/absolute escapes). After the trash
+/// succeeds the index is reconciled via `deindex_removed` and the tree refreshes.
+#[tauri::command]
+fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let abs = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        active.project.resolve(&rel_path).map_err(err)?
+    };
+
+    let is_dir = abs.is_dir();
+    if !abs.is_file() && !is_dir {
+        return Err("That file or folder no longer exists.".to_string());
+    }
+
+    // Recoverable delete: hand the path to the OS trash rather than unlinking it.
+    trash::delete(&abs).map_err(err)?;
+
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    deindex_removed(&active.project, &mut active.db, &rel_path, is_dir).map_err(err)?;
+    drop(guard);
+    let _ = app.emit("index-updated", ScanStats::default());
     Ok(())
 }
 
@@ -4495,6 +4563,7 @@ pub fn run() {
             extracted_text,
             reindex,
             move_file,
+            delete_file,
             create_folder,
             create_document,
             import_begin,
@@ -4598,5 +4667,49 @@ mod tests {
         assert!(p.contains("who owns billing?"));
         assert!(p.contains("People.md: Priya owns billing")); // marks stripped
         assert!(p.contains("<|im_start|>assistant"));
+    }
+
+    /// The trash call plus `deindex_removed` (the two halves of `delete_file`)
+    /// must leave a file gone from BOTH disk and the index. Trashing a real path
+    /// is exercised here so the recoverable-delete contract is covered end to end.
+    #[test]
+    fn delete_file_trashes_and_deindexes_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::create(dir.path(), "Fixture").unwrap();
+        let mut db = Db::open(&dir.path().join("idx"), project.config.id).unwrap();
+
+        let rel = "note.md";
+        let abs = project.root.join(rel);
+        std::fs::write(&abs, "Priya owns billing.").unwrap();
+        // Index it the way the watcher/scan would, so it lands in the DB.
+        scan::refresh_path(&project, &mut db, rel).unwrap();
+        assert!(db.get_file(rel).unwrap().is_some(), "file should be indexed");
+
+        // Same two steps delete_file runs, minus the Tauri State plumbing.
+        trash::delete(&abs).unwrap();
+        deindex_removed(&project, &mut db, rel, false).unwrap();
+
+        assert!(!abs.exists(), "file should be gone from disk (in the trash)");
+        assert!(db.get_file(rel).unwrap().is_none(), "row should be gone from the index");
+    }
+
+    /// Deleting a folder drops its whole subtree from the index.
+    #[test]
+    fn delete_file_deindexes_a_folder_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::create(dir.path(), "Fixture").unwrap();
+        let mut db = Db::open(&dir.path().join("idx"), project.config.id).unwrap();
+
+        std::fs::create_dir(project.root.join("Meetings")).unwrap();
+        let child = "Meetings/kickoff.md";
+        std::fs::write(project.root.join(child), "Kickoff notes.").unwrap();
+        scan::refresh_path(&project, &mut db, child).unwrap();
+        assert!(db.get_file(child).unwrap().is_some());
+
+        trash::delete(project.root.join("Meetings")).unwrap();
+        deindex_removed(&project, &mut db, "Meetings", true).unwrap();
+
+        assert!(!project.root.join("Meetings").exists());
+        assert!(db.get_file(child).unwrap().is_none(), "child row should be dropped with the folder");
     }
 }
