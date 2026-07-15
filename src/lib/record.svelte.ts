@@ -1,5 +1,5 @@
 // Live recording state (Svelte 5 runes). One recorder at a time.
-import { api, type AudioDevice, type PermissionStatus, type RecordPhase } from "./api";
+import { api, type AudioDevice, type ModelStatus, type PermissionStatus, type RecordPhase } from "./api";
 
 class RecordStore {
   phase = $state<RecordPhase>("idle");
@@ -18,6 +18,10 @@ class RecordStore {
   transcribing = $state(false);
   savedPath = $state<string | null>(null);
   error = $state<string | null>(null);
+  // Readiness of the recommended/selected transcription model. Null until the
+  // first check resolves; drives the up-front gate so we never let the user
+  // record a transcript we can't produce.
+  modelStatus = $state<ModelStatus | null>(null);
 
   private clock: ReturnType<typeof setInterval> | null = null;
   private baseElapsed = 0;
@@ -27,10 +31,21 @@ class RecordStore {
     return this.phase === "recording" || this.phase === "paused";
   }
 
+  /** The transcription model is on disk and recording can produce a transcript. */
+  get modelReady() {
+    return this.modelStatus?.installed ?? false;
+  }
+
   async init() {
     this.devices = await api.recordInputDevices().catch(() => []);
     if (!this.deviceId && this.devices[0]) this.deviceId = this.devices[0].id;
     await this.refreshPermissions();
+    await this.refreshModelStatus();
+    // A download finishing (100% sample, emitted only after a verified install)
+    // flips readiness so the gate clears without a manual refresh.
+    await api.onModelDownloadProgress((ev) => {
+      if (ev.total > 0 && ev.downloaded >= ev.total) void this.refreshModelStatus();
+    });
     await api.onRecordLevel((ev) => {
       if (ev.source === "mic") this.micLevel = ev.rms;
       else this.systemLevel = ev.rms;
@@ -72,6 +87,10 @@ class RecordStore {
     });
   }
 
+  async refreshModelStatus() {
+    this.modelStatus = await api.modelStatus().catch(() => null);
+  }
+
   async refreshPermissions() {
     const p = await api.recordPermissions().catch(() => null);
     if (!p) return;
@@ -95,6 +114,14 @@ class RecordStore {
   async start() {
     this.error = null;
     this.savedPath = null;
+    // Up-front gate: without the transcription model on disk the recording would
+    // only fail after Stop, wasting the take. Refuse and let the UI prompt the
+    // download instead.
+    if (!this.modelReady) {
+      this.error =
+        "Download a transcription model below before recording, so Ken can make a transcript.";
+      return;
+    }
     await api.recordStart(this.micOn, this.systemOn, this.deviceId).catch((e) => {
       this.error = String(e);
     });

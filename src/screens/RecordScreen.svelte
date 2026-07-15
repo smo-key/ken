@@ -4,6 +4,7 @@
   import { record } from "../lib/record.svelte";
   import LevelMeter from "../record/LevelMeter.svelte";
   import PermissionNotice from "../record/PermissionNotice.svelte";
+  import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Mic from "@lucide/svelte/icons/mic";
   import Speaker from "@lucide/svelte/icons/volume-2";
 
@@ -16,7 +17,9 @@
     return `${m}:${rem.toString().padStart(2, "0")}`;
   }
 
-  const canStart = $derived(record.micOn || record.systemOn);
+  const canStart = $derived(
+    (record.micOn || record.systemOn) && record.modelReady,
+  );
 
   function openSaved() {
     if (record.savedPath) app.openInFiles(record.savedPath);
@@ -80,6 +83,19 @@
             <option value={d.id}>{d.name}</option>
           {/each}
         </select>
+      </div>
+    {/if}
+
+    {#if record.modelStatus && !record.modelStatus.installed && !record.recording}
+      <div class="model-gate">
+        <p class="model-gate-lead">
+          Recording needs the on-device speech model. Download it once and Ken
+          will transcribe your recordings — nothing leaves your Mac.
+        </p>
+        <ModelDownloadDialog
+          status={record.modelStatus}
+          onInstalled={() => void record.refreshModelStatus()}
+        />
       </div>
     {/if}
 
@@ -211,6 +227,21 @@
     border: 1px solid var(--border);
     background: var(--surface);
     font-size: 12.5px;
+  }
+  .model-gate {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px 16px;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+    border-radius: var(--radius-card);
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+  }
+  .model-gate-lead {
+    margin: 0;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--ink-secondary);
   }
   .controls {
     display: flex;

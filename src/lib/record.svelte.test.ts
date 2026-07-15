@@ -1,12 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RecordStateEvent } from "./api";
+import type { ModelProgress, ModelStatus, RecordStateEvent } from "./api";
 
 // Captured event listeners registered by the store's `init()`.
 const listeners: {
   state?: (ev: RecordStateEvent) => void;
   transcribing?: () => void;
   saved?: (ev: { relPath: string }) => void;
+  modelProgress?: (ev: ModelProgress) => void;
 } = {};
+
+// A resolved, installed transcription-model status by default; individual tests
+// override `installed` to exercise the not-ready gate.
+const modelStatus: ModelStatus = {
+  id: "whisper-base",
+  name: "Whisper Base",
+  installed: true,
+  sizeBytes: 100,
+  expectedBytes: 100,
+  recommended: true,
+  category: "transcription",
+  tier: "recommended",
+  blurb: "",
+  selected: true,
+};
 
 vi.mock("./api", () => ({
   api: {
@@ -17,6 +33,11 @@ vi.mock("./api", () => ({
       micSettingsUrl: "",
       screenSettingsUrl: "",
     })),
+    modelStatus: vi.fn(async () => modelStatus),
+    recordStart: vi.fn(async () => {}),
+    onModelDownloadProgress: vi.fn(async (cb: (ev: ModelProgress) => void) => {
+      listeners.modelProgress = cb;
+    }),
     onRecordLevel: vi.fn(async () => {}),
     onRecordState: vi.fn(async (cb: (ev: RecordStateEvent) => void) => {
       listeners.state = cb;
@@ -32,6 +53,7 @@ vi.mock("./api", () => ({
 }));
 
 import { record } from "./record.svelte";
+import { api } from "./api";
 
 // Drive the elapsed clock deterministically: fake setInterval/clearInterval and
 // control performance.now() directly so we can prove the interval ticks while
@@ -94,5 +116,58 @@ describe("record store — transcribing", () => {
     now = 30000;
     vi.advanceTimersByTime(5000);
     expect(record.elapsedMs).toBe(6000); // clock still frozen at true duration
+  });
+});
+
+describe("record store — transcription-model gate", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    // Leave the shared status installed so other suites start ready.
+    modelStatus.installed = true;
+  });
+
+  it("reads model status on init and reports readiness", async () => {
+    modelStatus.installed = true;
+    await record.init();
+    expect(record.modelStatus?.installed).toBe(true);
+    expect(record.modelReady).toBe(true);
+  });
+
+  it("refuses to start and does not call recordStart when the model is missing", async () => {
+    modelStatus.installed = false;
+    await record.init();
+    vi.mocked(api.recordStart).mockClear();
+
+    expect(record.modelReady).toBe(false);
+    await record.start();
+
+    expect(api.recordStart).not.toHaveBeenCalled();
+    expect(record.error).toBeTruthy();
+  });
+
+  it("starts recording once the model is installed", async () => {
+    modelStatus.installed = true;
+    await record.init();
+    vi.mocked(api.recordStart).mockClear();
+
+    await record.start();
+
+    expect(api.recordStart).toHaveBeenCalledTimes(1);
+    expect(record.error).toBeNull();
+  });
+
+  it("clears the gate when a download completes (progress hits 100%)", async () => {
+    modelStatus.installed = false;
+    await record.init();
+    expect(record.modelReady).toBe(false);
+
+    // The install lands, then the terminal 100% progress sample fires.
+    modelStatus.installed = true;
+    listeners.modelProgress?.({ id: "whisper-base", downloaded: 100, total: 100 });
+    // Let refreshModelStatus() resolve.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(record.modelReady).toBe(true);
   });
 });
