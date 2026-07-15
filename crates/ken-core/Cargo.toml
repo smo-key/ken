@@ -7,6 +7,7 @@ edition.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+anyhow = "1"
 uuid.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
 notify = "8"
@@ -57,6 +58,56 @@ screencapturekit = "8.0.0"
 objc2 = "0.6"
 objc2-av-foundation = "0.3"
 block2 = "0.6"
+# Native OCR (module `ocr`) via Apple Vision. Like `record`, these are pure
+# binding crates (no C/C++ toolchain, no cmake) so they compile unconditionally
+# on macOS rather than behind a cargo feature. The objc2 framework crates are
+# the 0.3.x family that pairs with objc2 0.6 (same as objc2-av-foundation).
+# Only the specific submodules we touch are enabled to keep build time down.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+    "NSError",
+    "NSValue",
+    "NSGeometry",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFData",
+    "CFString",
+    "CFDictionary",
+    "CFArray",
+    "CFBase",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGImage",
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+    "CGGeometry",
+    "CGBase",
+    "CGDataProvider",
+    "CGPDFDocument",
+    "CGPDFPage",
+] }
+objc2-image-io = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGImageSource",
+    "objc2-core-graphics",
+] }
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    # Enables `VNImageRequestHandler::initWithCGImage:options:` (feeding a
+    # CGImage straight into Vision).
+    "objc2-core-graphics",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "VNTypes",
+] }
 
 [dev-dependencies]
 tempfile = "3"
