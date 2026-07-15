@@ -13,7 +13,20 @@
       ready = true;
     }
   });
+
+  // Suppress the native (OS/WebView) context menu everywhere — this is a
+  // desktop app, not a web page. Runs at the window level in the bubble phase,
+  // so it fires AFTER any element's own `oncontextmenu` handler (which already
+  // called preventDefault + opened our custom menu). We ONLY preventDefault
+  // here — never stopPropagation — so those element handlers still run and the
+  // app's custom context menus keep working. WKWebView has no config toggle
+  // for this, so it must be done in JS.
+  function suppressNativeContextMenu(e: MouseEvent) {
+    e.preventDefault();
+  }
 </script>
+
+<svelte:window oncontextmenu={suppressNativeContextMenu} />
 
 {#if !ready}
   <div class="boot"></div>

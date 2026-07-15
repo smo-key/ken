@@ -124,7 +124,16 @@
       class="row"
       class:current={entry.id === app.project?.id}
       class:unavailable={!entry.available}
-      onclick={() => pick(entry.path, entry.available)}
+      onclick={() => {
+        // While this row's rename input is showing, the input lives INSIDE
+        // this <button>. Pressing Space in the input triggers the button's
+        // native activation, which synthesizes a click targeting the button
+        // (not the input) — so stopPropagation on the input can't catch it.
+        // Neutralize the row action during rename so the popover stays open
+        // and the space is typed into the input.
+        if (renamingId === entry.id) return;
+        pick(entry.path, entry.available);
+      }}
       oncontextmenu={(e) => rowMenu(e, entry)}
     >
       <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
