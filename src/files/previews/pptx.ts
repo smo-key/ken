@@ -34,12 +34,20 @@ export interface Paragraph {
   bullet: boolean;
 }
 
-export type ShapeKind = "text" | "image" | "shape" | "custgeom" | "table";
+export type ShapeKind =
+  | "text"
+  | "image"
+  | "shape"
+  | "custgeom"
+  | "table"
+  | "placeholder";
 
-/** Resolved outline: CSS colour + width in px. */
+/** Resolved outline: CSS colour + width in px, plus optional dash pattern. */
 export interface ShapeLine {
   color: string;
   width: number;
+  /** Preset dash style (a:prstDash) mapped to a coarse family, when dashed. */
+  dash?: "dash" | "dot" | "dashDot";
 }
 
 export interface TableCell {
@@ -79,7 +87,17 @@ export interface Shape {
   embedId?: string;
   /** Solid fill colour of an autoshape box, when present. */
   fill?: string;
+  /** CSS gradient string (a:gradFill), when the shape/background is gradient-filled. */
+  gradient?: string;
+  /** Relationship id of a picture fill (a:blipFill on spPr) → background-image. */
+  fillImageEmbedId?: string;
   geom?: "rect" | "ellipse" | "roundRect";
+  /** CSS box-shadow / drop-shadow value resolved from a:effectLst/a:outerShdw. */
+  shadow?: string;
+  /** Inherited default text size (pt) from the placeholder's master text style. */
+  defaultSizePt?: number;
+  /** Label for an unsupported embedded object (chart, SmartArt, OLE) placeholder. */
+  placeholder?: string;
   /** Resolved outline (a:ln), when present. */
   line?: ShapeLine;
   /** custGeom: SVG path string in path space (view scales it to the box). */
@@ -99,8 +117,40 @@ export interface Shape {
   flipV?: boolean;
 }
 
+/** A resolved slide background fill: solid colour, CSS gradient, or picture. */
+export interface SlideBackground {
+  color?: string;
+  gradient?: string;
+  /** Relationship id of a background picture fill; caller resolves to a URI. */
+  imageEmbedId?: string;
+}
+
 export interface ParsedSlide {
   shapes: Shape[];
+  /** The slide's own background fill (p:cSld/p:bg), when it declares one. */
+  background?: SlideBackground;
+}
+
+/** A placeholder's inheritable geometry/anchor, read from a layout or master. */
+export interface Placeholder {
+  type: string | null;
+  idx: number | null;
+  box: Pick<Shape, "x" | "y" | "w" | "h"> | null;
+  anchor?: Shape["anchor"];
+}
+
+/** Default text sizes (pt) by placeholder family, read from a master's txStyles. */
+export interface MasterTextStyles {
+  title?: number;
+  body?: number;
+  other?: number;
+}
+
+/** Inheritance context threaded from the slide's layout + master into parseSlide. */
+export interface InheritContext {
+  layout?: Placeholder[];
+  master?: Placeholder[];
+  textStyles?: MasterTextStyles;
 }
 
 const parser = new DOMParser();
@@ -342,10 +392,21 @@ function applyColorTransforms(clr: Element, rgb: [number, number, number]): stri
         [r, g, b] = hslToRgb(h, s, clamp01(l + frac));
         break;
       }
+      case "a:satMod": {
+        const [h, s, l] = rgbToHsl(r, g, b);
+        [r, g, b] = hslToRgb(h, clamp01(s * frac), l);
+        break;
+      }
+      case "a:hueMod": {
+        const [h, s, l] = rgbToHsl(r, g, b);
+        // hue is 0..1 (a full turn); hueMod multiplies the angle, wrapping.
+        [r, g, b] = hslToRgb((h * frac) % 1, s, l);
+        break;
+      }
       case "a:alpha":
         alpha = frac;
         break;
-      // a:satMod, a:hueMod, a:gamma, etc.: unsupported → ignored (v1).
+      // a:gamma/a:invGamma and other rare transforms: still ignored.
     }
   }
   if (alpha < 1) {
@@ -406,6 +467,55 @@ function directChild(parent: Element, tag: string): Element | null {
  * wrongly report the line's colour as its fill (these text-less shapes are now
  * rendered, not dropped, so the bug would be visible).
  */
+/** Resolve a single colour element (a:srgbClr | a:schemeClr | a:sysClr | a:prstClr)
+ *  to CSS, applying its colour transforms. Returns undefined if unresolvable. */
+function resolveClrEl(el: Element, theme?: ThemeContext): string | undefined {
+  if (el.tagName === "a:srgbClr") {
+    const val = el.getAttribute("val");
+    if (!val) return undefined;
+    return applyColorTransforms(el, [
+      parseInt(val.slice(0, 2), 16),
+      parseInt(val.slice(2, 4), 16),
+      parseInt(val.slice(4, 6), 16),
+    ]);
+  }
+  if (el.tagName === "a:schemeClr") {
+    const name = el.getAttribute("val");
+    const hex = name ? theme?.colors[name] : undefined;
+    if (!hex) return undefined;
+    return applyColorTransforms(el, [
+      parseInt(hex.slice(0, 2), 16),
+      parseInt(hex.slice(2, 4), 16),
+      parseInt(hex.slice(4, 6), 16),
+    ]);
+  }
+  if (el.tagName === "a:sysClr") {
+    const last = el.getAttribute("lastClr");
+    if (!last) return undefined;
+    return applyColorTransforms(el, [
+      parseInt(last.slice(0, 2), 16),
+      parseInt(last.slice(2, 4), 16),
+      parseInt(last.slice(4, 6), 16),
+    ]);
+  }
+  return undefined;
+}
+
+/** First colour child (srgb/scheme/sys) of an element, if any. */
+function firstClrChild(parent: Element): Element | null {
+  for (const c of Array.from(parent.children)) {
+    if (
+      c.tagName === "a:srgbClr" ||
+      c.tagName === "a:schemeClr" ||
+      c.tagName === "a:sysClr" ||
+      c.tagName === "a:prstClr"
+    ) {
+      return c;
+    }
+  }
+  return null;
+}
+
 export function resolveColor(
   clrParent: Element | null,
   theme?: ThemeContext,
@@ -418,26 +528,91 @@ export function resolveColor(
     ? clrParent
     : directChild(clrParent, "a:solidFill");
   if (!fill) return undefined;
-  const srgb = directChild(fill, "a:srgbClr");
-  if (srgb) {
-    const val = srgb.getAttribute("val");
-    if (!val) return undefined;
-    return applyColorTransforms(srgb, [
-      parseInt(val.slice(0, 2), 16),
-      parseInt(val.slice(2, 4), 16),
-      parseInt(val.slice(4, 6), 16),
-    ]);
+  const clr = firstClrChild(fill);
+  return clr ? resolveClrEl(clr, theme) : undefined;
+}
+
+/**
+ * Resolve an a:gradFill element to a CSS gradient string, or undefined if it has
+ * no usable stops. `fillParent` may BE the a:gradFill or CONTAIN one directly.
+ * Linear gradients map a:lin ang (60000ths deg, clockwise from 3 o'clock) to the
+ * CSS convention (deg from 12 o'clock) via +90; radial paths become radial-gradient.
+ */
+export function resolveGradient(
+  fillParent: Element | null,
+  theme?: ThemeContext,
+): string | undefined {
+  if (!fillParent) return undefined;
+  const grad = fillParent.tagName === "a:gradFill"
+    ? fillParent
+    : directChild(fillParent, "a:gradFill");
+  if (!grad) return undefined;
+  const gsLst = directChild(grad, "a:gsLst");
+  if (!gsLst) return undefined;
+  const stops: string[] = [];
+  for (const gs of Array.from(gsLst.children)) {
+    if (gs.tagName !== "a:gs") continue;
+    const clr = firstClrChild(gs);
+    const css = clr ? resolveClrEl(clr, theme) : undefined;
+    if (!css) continue;
+    const pos = Number(gs.getAttribute("pos")) / 1000; // thousandths of a % → %
+    stops.push(`${css} ${Number.isFinite(pos) ? pos : 0}%`);
   }
-  const scheme = directChild(fill, "a:schemeClr");
-  if (scheme) {
-    const name = scheme.getAttribute("val");
-    const hex = name ? theme?.colors[name] : undefined;
-    if (!hex) return undefined;
-    return applyColorTransforms(scheme, [
-      parseInt(hex.slice(0, 2), 16),
-      parseInt(hex.slice(2, 4), 16),
-      parseInt(hex.slice(4, 6), 16),
-    ]);
+  if (stops.length < 2) return undefined;
+  const path = directChild(grad, "a:path");
+  if (path) {
+    // Radial / rectangular: approximate all as a centred radial gradient.
+    return `radial-gradient(circle, ${stops.join(", ")})`;
+  }
+  const lin = directChild(grad, "a:lin");
+  const ang = lin ? Number(lin.getAttribute("ang")) / 60000 : 90;
+  const cssAng = (((Number.isFinite(ang) ? ang : 90) + 90) % 360 + 360) % 360;
+  return `linear-gradient(${cssAng}deg, ${stops.join(", ")})`;
+}
+
+/** Resolve a picture fill (a:blipFill) to its embed relationship id, if any. */
+function blipEmbedId(fillParent: Element): string | null {
+  const blipFill = fillParent.tagName === "a:blipFill"
+    ? fillParent
+    : directChild(fillParent, "a:blipFill");
+  if (!blipFill) return null;
+  const blip = directChild(blipFill, "a:blip");
+  return blip ? relAttr(blip, "embed") : null;
+}
+
+/**
+ * Resolve a slide/layout/master background (p:cSld/p:bg) to a fill. Accepts the
+ * part's XML (any of the three levels) and returns the first p:bg it finds, or
+ * undefined. Callers chain slide → layout → master for inheritance.
+ */
+export function parseBackground(
+  xml: string | undefined,
+  theme?: ThemeContext,
+): SlideBackground | undefined {
+  if (!xml) return undefined;
+  const bg = parseXml(xml).getElementsByTagName("p:bg")[0];
+  if (!bg) return undefined;
+  return backgroundFromEl(bg, theme);
+}
+
+function backgroundFromEl(bg: Element, theme?: ThemeContext): SlideBackground | undefined {
+  const bgPr = directChild(bg, "p:bgPr");
+  if (bgPr) {
+    if (directChild(bgPr, "a:noFill")) return undefined;
+    const gradient = resolveGradient(bgPr, theme);
+    if (gradient) return { gradient };
+    const color = resolveColor(bgPr, theme);
+    if (color) return { color };
+    const imageEmbedId = blipEmbedId(bgPr);
+    if (imageEmbedId) return { imageEmbedId };
+    return undefined;
+  }
+  // p:bgRef references a theme fill by idx; we can at least honour its colour.
+  const bgRef = directChild(bg, "p:bgRef");
+  if (bgRef) {
+    const clr = firstClrChild(bgRef);
+    const color = clr ? resolveClrEl(clr, theme) : undefined;
+    if (color) return { color };
   }
   return undefined;
 }
@@ -502,8 +677,95 @@ function paragraphsOf(el: Element, theme?: ThemeContext): Paragraph[] {
     .filter((p) => p.runs.some((r) => r.text.trim().length > 0));
 }
 
+function placeholderEl(sp: Element): Element | null {
+  return firstChildTag(sp, "p:ph");
+}
+
 function placeholderType(sp: Element): string | null {
-  return firstChildTag(sp, "p:ph")?.getAttribute("type") ?? null;
+  return placeholderEl(sp)?.getAttribute("type") ?? null;
+}
+
+function placeholderIdx(sp: Element): number | null {
+  const idx = placeholderEl(sp)?.getAttribute("idx");
+  return idx != null ? Number(idx) : null;
+}
+
+/** Normalize placeholder types so title/ctrTitle (and the body family) match. */
+function phFamily(type: string | null): "title" | "body" | "other" {
+  if (type === "title" || type === "ctrTitle") return "title";
+  if (
+    type == null ||
+    type === "body" ||
+    type === "subTitle" ||
+    type === "obj"
+  ) {
+    return "body";
+  }
+  return "other";
+}
+
+function bodyAnchor(el: Element): Shape["anchor"] | undefined {
+  const a = firstChildTag(el, "a:bodyPr")?.getAttribute("anchor");
+  return a === "ctr" ? "center" : a === "b" ? "bottom" : a === "t" ? "top" : undefined;
+}
+
+/**
+ * Read a layout/master part's placeholders (type/idx + geometry + anchor) so a
+ * slide shape without its own xfrm can inherit them. Walks the spTree directly.
+ */
+export function parsePlaceholders(xml: string | undefined): Placeholder[] {
+  if (!xml) return [];
+  const doc = parseXml(xml);
+  const tree = doc.getElementsByTagName("p:spTree")[0] ?? doc.documentElement;
+  const out: Placeholder[] = [];
+  for (const sp of Array.from(tree.getElementsByTagName("p:sp"))) {
+    const ph = placeholderEl(sp);
+    if (!ph) continue;
+    const box = xfrmOf(sp);
+    out.push({
+      type: ph.getAttribute("type"),
+      idx: ph.getAttribute("idx") != null ? Number(ph.getAttribute("idx")) : null,
+      box: box.x === null ? null : box,
+      anchor: bodyAnchor(sp),
+    });
+  }
+  return out;
+}
+
+/** Best placeholder match for (type, idx): idx wins, else same family. */
+function matchPlaceholder(
+  list: Placeholder[] | undefined,
+  type: string | null,
+  idx: number | null,
+): Placeholder | undefined {
+  if (!list?.length) return undefined;
+  if (idx != null) {
+    const byIdx = list.find((p) => p.idx === idx);
+    if (byIdx) return byIdx;
+  }
+  const fam = phFamily(type);
+  return list.find((p) => phFamily(p.type) === fam);
+}
+
+/** Default text sizes (pt) per placeholder family from a master's p:txStyles. */
+export function parseMasterTextStyles(xml: string | undefined): MasterTextStyles {
+  const out: MasterTextStyles = {};
+  if (!xml) return out;
+  const styles = parseXml(xml).getElementsByTagName("p:txStyles")[0];
+  if (!styles) return out;
+  const lvl1Size = (styleTag: string): number | undefined => {
+    const style = firstChildTag(styles, styleTag);
+    const lvl1 = style && firstChildTag(style, "a:lvl1pPr");
+    const sz = lvl1 && firstChildTag(lvl1, "a:defRPr")?.getAttribute("sz");
+    return sz ? Number(sz) / 100 : undefined;
+  };
+  const title = lvl1Size("p:titleStyle");
+  const body = lvl1Size("p:bodyStyle");
+  const other = lvl1Size("p:otherStyle");
+  if (title) out.title = title;
+  if (body) out.body = body;
+  if (other) out.other = other;
+  return out;
 }
 
 const GEOM: Record<string, Shape["geom"]> = {
@@ -511,15 +773,76 @@ const GEOM: Record<string, Shape["geom"]> = {
   roundRect: "roundRect",
 };
 
-/** a:ln → resolved outline (px width + CSS colour), or undefined. */
+// Common preset geometries drawn as an SVG path in a normalized 100×100 box
+// (preserveAspectRatio="none" stretches it to the shape). rect/ellipse/roundRect
+// stay CSS (crisper, cheaper) and are intentionally absent here.
+const PRESET_PATHS: Record<string, string> = {
+  triangle: "M50 0 L100 100 L0 100 Z",
+  rtTriangle: "M0 0 L0 100 L100 100 Z",
+  diamond: "M50 0 L100 50 L50 100 L0 50 Z",
+  parallelogram: "M25 0 L100 0 L75 100 L0 100 Z",
+  trapezoid: "M25 0 L75 0 L100 100 L0 100 Z",
+  pentagon: "M50 0 L100 38 L82 100 L18 100 L0 38 Z",
+  hexagon: "M25 0 L75 0 L100 50 L75 100 L25 100 L0 50 Z",
+  heptagon: "M50 0 L90 20 L100 60 L75 100 L25 100 L0 60 L10 20 Z",
+  octagon: "M30 0 L70 0 L100 30 L100 70 L70 100 L30 100 L0 70 L0 30 Z",
+  chevron: "M0 0 L75 0 L100 50 L75 100 L0 100 L25 50 Z",
+  homePlate: "M0 0 L75 0 L100 50 L75 100 L0 100 Z",
+  rightArrow: "M0 30 L60 30 L60 10 L100 50 L60 90 L60 70 L0 70 Z",
+  leftArrow: "M100 30 L40 30 L40 10 L0 50 L40 90 L40 70 L100 70 Z",
+  upArrow: "M30 100 L30 40 L10 40 L50 0 L90 40 L70 40 L70 100 Z",
+  downArrow: "M30 0 L30 60 L10 60 L50 100 L90 60 L70 60 L70 0 Z",
+  leftRightArrow: "M0 50 L25 25 L25 40 L75 40 L75 25 L100 50 L75 75 L75 60 L25 60 L25 75 Z",
+  plus: "M35 0 L65 0 L65 35 L100 35 L100 65 L65 65 L65 100 L35 100 L35 65 L0 65 L0 35 L35 35 Z",
+  star5:
+    "M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z",
+  line: "M0 0 L100 100",
+  straightConnector1: "M0 0 L100 100",
+  bentConnector2: "M0 0 L100 0 L100 100",
+  bentConnector3: "M0 0 L50 0 L50 100 L100 100",
+};
+
+/** SVG path for a preset that has no crisp CSS form, or null to keep CSS/box. */
+function presetPath(prst: string | null | undefined): string | null {
+  return prst ? (PRESET_PATHS[prst] ?? null) : null;
+}
+
+/** Map an a:prstDash value onto a coarse dash family the view can render. */
+function dashFamily(val: string | null): ShapeLine["dash"] {
+  if (!val || val === "solid") return undefined;
+  if (val.includes("Dot") && val.includes("ash")) return "dashDot";
+  if (val.toLowerCase().includes("dot")) return "dot";
+  return "dash"; // dash, lgDash, sysDash, ...
+}
+
+/** a:ln → resolved outline (px width + CSS colour + dash), or undefined. */
 function parseLine(spPr: Element | null, theme?: ThemeContext): ShapeLine | undefined {
-  const ln = spPr && firstChildTag(spPr, "a:ln");
+  const ln = spPr && directChild(spPr, "a:ln");
   if (!ln) return undefined;
-  if (firstChildTag(ln, "a:noFill")) return undefined;
+  if (directChild(ln, "a:noFill")) return undefined;
   const color = resolveColor(ln, theme);
   if (!color) return undefined;
   const w = Number(ln.getAttribute("w"));
-  return { color, width: w ? emuToPx(w) : 1 };
+  const dash = dashFamily(directChild(ln, "a:prstDash")?.getAttribute("val") ?? null);
+  const line: ShapeLine = { color, width: w ? emuToPx(w) : 1 };
+  if (dash) line.dash = dash;
+  return line;
+}
+
+/** a:effectLst/a:outerShdw → a CSS box-shadow/drop-shadow value (px), or undefined. */
+function parseShadow(spPr: Element | null, theme?: ThemeContext): string | undefined {
+  const fx = spPr && directChild(spPr, "a:effectLst");
+  const shdw = fx && directChild(fx, "a:outerShdw");
+  if (!shdw) return undefined;
+  const clr = firstClrChild(shdw);
+  const color = (clr ? resolveClrEl(clr, theme) : undefined) ?? "rgba(0,0,0,0.4)";
+  const dist = emuToPx(Number(shdw.getAttribute("dist")) || 0);
+  const blur = emuToPx(Number(shdw.getAttribute("blurRad")) || 0);
+  const dir = (Number(shdw.getAttribute("dir")) || 0) / 60000; // deg, clockwise
+  const rad = (dir * Math.PI) / 180;
+  const dx = Math.round(Math.cos(rad) * dist);
+  const dy = Math.round(Math.sin(rad) * dist);
+  return `${dx}px ${dy}px ${Math.round(blur)}px ${color}`;
 }
 
 /** a:custGeom → { d, w, h } SVG path in path space, or null if unusable. */
@@ -547,20 +870,51 @@ function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | nul
     if (p !== path && (!pw || !ph)) continue;
     const sx = p === path || pw === w ? 1 : w / pw;
     const sy = p === path || ph === h ? 1 : h / ph;
-    const pt = (el: Element | null) =>
-      el
-        ? `${Number(el.getAttribute("x") ?? 0) * sx} ${Number(el.getAttribute("y") ?? 0) * sy}`
-        : "0 0";
+    const xOf = (el: Element | null) => Number(el?.getAttribute("x") ?? 0) * sx;
+    const yOf = (el: Element | null) => Number(el?.getAttribute("y") ?? 0) * sy;
+    const pt = (el: Element | null) => `${xOf(el)} ${yOf(el)}`;
+    // Track the current + subpath-start points so a:arcTo (which gives radii and
+    // sweep angles, not an endpoint) can be turned into an absolute SVG arc.
+    let curX = 0, curY = 0, startX = 0, startY = 0;
     for (const seg of Array.from(p.children)) {
       const pts = Array.from(seg.getElementsByTagName("a:pt"));
       switch (seg.tagName) {
-        case "a:moveTo":   cmds.push(`M ${pt(pts[0])}`); break;
-        case "a:lnTo":     cmds.push(`L ${pt(pts[0])}`); break;
-        case "a:cubicBezTo": cmds.push(`C ${pt(pts[0])} ${pt(pts[1])} ${pt(pts[2])}`); break;
-        case "a:quadBezTo":  cmds.push(`Q ${pt(pts[0])} ${pt(pts[1])}`); break;
-        case "a:close":    cmds.push("Z"); break;
-        // arcTo is skipped (no a:pt child in the schema); v1 degrade.
-        case "a:arcTo":    break;
+        case "a:moveTo":
+          cmds.push(`M ${pt(pts[0])}`);
+          curX = startX = xOf(pts[0]); curY = startY = yOf(pts[0]);
+          break;
+        case "a:lnTo":
+          cmds.push(`L ${pt(pts[0])}`);
+          curX = xOf(pts[0]); curY = yOf(pts[0]);
+          break;
+        case "a:cubicBezTo":
+          cmds.push(`C ${pt(pts[0])} ${pt(pts[1])} ${pt(pts[2])}`);
+          curX = xOf(pts[2]); curY = yOf(pts[2]);
+          break;
+        case "a:quadBezTo":
+          cmds.push(`Q ${pt(pts[0])} ${pt(pts[1])}`);
+          curX = xOf(pts[1]); curY = yOf(pts[1]);
+          break;
+        case "a:arcTo": {
+          const wR = (Number(seg.getAttribute("wR")) || 0) * sx;
+          const hR = (Number(seg.getAttribute("hR")) || 0) * sy;
+          const st = ((Number(seg.getAttribute("stAng")) || 0) / 60000) * (Math.PI / 180);
+          const sw = ((Number(seg.getAttribute("swAng")) || 0) / 60000) * (Math.PI / 180);
+          // The current point sits at angle st on the ellipse; back out the centre.
+          const cx = curX - wR * Math.cos(st);
+          const cy = curY - hR * Math.sin(st);
+          const ex = cx + wR * Math.cos(st + sw);
+          const ey = cy + hR * Math.sin(st + sw);
+          const large = Math.abs(sw) > Math.PI ? 1 : 0;
+          const sweep = sw > 0 ? 1 : 0; // OOXML +ve = clockwise = SVG sweep 1 (y-down)
+          cmds.push(`A ${wR} ${hR} 0 ${large} ${sweep} ${ex} ${ey}`);
+          curX = ex; curY = ey;
+          break;
+        }
+        case "a:close":
+          cmds.push("Z");
+          curX = startX; curY = startY;
+          break;
       }
     }
   }
@@ -568,56 +922,80 @@ function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | nul
   return { d: cmds.join(" "), w, h };
 }
 
-function parseSp(sp: Element, theme?: ThemeContext, ctx: Ctx = IDENTITY): Shape | null {
+function parseSp(
+  sp: Element,
+  theme?: ThemeContext,
+  ctx: Ctx = IDENTITY,
+  inherit?: InheritContext,
+): Shape | null {
   const paragraphs = paragraphsOf(sp, theme);
   const spPr = firstChildTag(sp, "p:spPr");
   const fill = resolveColor(spPr, theme);
+  const gradient = fill ? undefined : resolveGradient(spPr, theme);
+  const fillImageEmbedId = spPr ? (blipEmbedId(spPr) ?? undefined) : undefined;
   const line = parseLine(spPr, theme);
+  const shadow = parseShadow(spPr, theme);
   const custom = spPr ? parseCustGeom(spPr) : null;
-
-  // Drop only shapes with nothing to draw: no text, no fill, no outline, no path.
-  if (paragraphs.length === 0 && !fill && !line && !custom) return null;
-
-  const ph = placeholderType(sp);
-  const isTitle = ph === "title" || ph === "ctrTitle";
-  const anchorAttr = firstChildTag(sp, "a:bodyPr")?.getAttribute("anchor");
-  const anchor: Shape["anchor"] =
-    anchorAttr === "ctr" ? "center" : anchorAttr === "b" ? "bottom" : "top";
-
-  if (custom) {
-    return {
-      kind: "custgeom",
-      ...applyCtx(ctx, xfrmOf(sp)),
-      ...rotFlipOf(sp),
-      paragraphs,
-      fill,
-      line,
-      isTitle,
-      anchor,
-      geomPath: custom.d,
-      pathW: custom.w,
-      pathH: custom.h,
-    };
-  }
-
   const prst = spPr
     ? firstChildTag(spPr, "a:prstGeom")?.getAttribute("prst")
     : null;
-  const geom: Shape["geom"] | undefined = prst
-    ? (GEOM[prst] ?? "rect")
+  const preset = custom ? null : presetPath(prst);
+
+  // Placeholder inheritance: a shape without its own xfrm borrows geometry and
+  // anchor from the matching layout/master placeholder (type/idx), which is what
+  // keeps titles/bodies in their authored positions instead of naive flow.
+  const phEl = placeholderEl(sp);
+  const phType = phEl?.getAttribute("type") ?? null;
+  const phIdx = placeholderIdx(sp);
+  const inherited =
+    matchPlaceholder(inherit?.layout, phType, phIdx) ??
+    matchPlaceholder(inherit?.master, phType, phIdx);
+  const own = xfrmOf(sp);
+  const box = own.x === null && inherited?.box ? inherited.box : own;
+  const anchor: Shape["anchor"] =
+    bodyAnchor(sp) ?? inherited?.anchor ?? "top";
+  const defaultSizePt = phEl
+    ? inherit?.textStyles?.[phFamily(phType)]
     : undefined;
 
-  return {
-    kind: "shape",
-    ...applyCtx(ctx, xfrmOf(sp)),
+  // Drop only shapes with nothing to draw.
+  if (
+    paragraphs.length === 0 &&
+    !fill &&
+    !gradient &&
+    !fillImageEmbedId &&
+    !line &&
+    !custom &&
+    !preset
+  ) {
+    return null;
+  }
+
+  const isTitle = phFamily(phType) === "title";
+  const base = {
+    ...applyCtx(ctx, box),
     ...rotFlipOf(sp),
     paragraphs,
     fill,
+    gradient,
+    fillImageEmbedId,
     line,
-    geom,
+    shadow,
     isTitle,
     anchor,
+    defaultSizePt,
   };
+
+  if (custom) {
+    return { kind: "custgeom", ...base, geomPath: custom.d, pathW: custom.w, pathH: custom.h };
+  }
+  if (preset) {
+    // Preset drawn as a stretched SVG path; text still renders over it.
+    return { kind: "shape", ...base, geomPath: preset, pathW: 100, pathH: 100 };
+  }
+
+  const geom: Shape["geom"] | undefined = prst ? (GEOM[prst] ?? "rect") : undefined;
+  return { kind: "shape", ...base, geom };
 }
 
 function parsePic(pic: Element, ctx: Ctx = IDENTITY): Shape | null {
@@ -667,7 +1045,28 @@ function parseGraphicFrame(
   ctx: Ctx = IDENTITY,
 ): Shape | null {
   const tbl = firstChildTag(frame, "a:tbl");
-  if (!tbl) return null; // charts/diagrams/oleObjects: unsupported in v1
+  if (!tbl) {
+    // Charts / SmartArt / OLE aren't rendered, but a labelled placeholder box at
+    // the right position keeps the layout honest instead of silently dropping it.
+    const uri = firstChildTag(frame, "a:graphicData")?.getAttribute("uri") ?? "";
+    const label = uri.includes("chart")
+      ? "Chart"
+      : uri.includes("diagram") || uri.includes("smartArt")
+        ? "SmartArt"
+        : uri.includes("ole") || uri.includes("oleObject")
+          ? "Embedded object"
+          : "Embedded content";
+    const box = applyCtx(ctx, frameXfrm(frame));
+    if (box.x === null) return null; // no geometry → nothing to place
+    return {
+      kind: "placeholder",
+      ...box,
+      paragraphs: [],
+      isTitle: false,
+      anchor: "center",
+      placeholder: label,
+    };
+  }
   const grid = firstChildTag(tbl, "a:tblGrid");
   const colWidths = grid
     ? Array.from(grid.getElementsByTagName("a:gridCol")).map((c) =>
@@ -689,7 +1088,11 @@ function parseGraphicFrame(
   };
 }
 
-export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide {
+export function parseSlide(
+  slideXml: string,
+  theme?: ThemeContext,
+  inherit?: InheritContext,
+): ParsedSlide {
   const doc = parseXml(slideXml);
   const tree =
     doc.getElementsByTagName("p:spTree")[0] ?? doc.documentElement;
@@ -699,8 +1102,10 @@ export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide 
   // slide space; we compose that onto the running ctx so nested groups stack.
   const walk = (parent: Element, ctx: Ctx) => {
     for (const el of Array.from(parent.children)) {
-      if (el.tagName === "p:sp") {
-        const s = parseSp(el, theme, ctx);
+      if (el.tagName === "p:sp" || el.tagName === "p:cxnSp") {
+        // Connectors (p:cxnSp) carry the same spPr/prstGeom as shapes; the preset
+        // path table turns straight/bent connectors into drawable lines.
+        const s = parseSp(el, theme, ctx, inherit);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:pic") {
         const s = parsePic(el, ctx);
@@ -714,5 +1119,7 @@ export function parseSlide(slideXml: string, theme?: ThemeContext): ParsedSlide 
     }
   };
   walk(tree, IDENTITY);
-  return { shapes };
+  const bg = doc.getElementsByTagName("p:bg")[0];
+  const background = bg ? backgroundFromEl(bg, theme) : undefined;
+  return background ? { shapes, background } : { shapes };
 }

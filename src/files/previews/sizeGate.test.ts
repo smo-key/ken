@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { PREVIEW_CAP_BYTES, isPreviewTooLarge, previewFormat } from "./sizeGate";
+import {
+  PPTX_CAP_BYTES,
+  PREVIEW_CAP_BYTES,
+  capForFormat,
+  isPreviewTooLarge,
+  previewFormat,
+} from "./sizeGate";
 
 describe("preview size gate", () => {
   const MB = 1024 * 1024;
@@ -29,5 +35,22 @@ describe("preview size gate", () => {
 
   it("never gates a non-capped format regardless of size", () => {
     expect(isPreviewTooLarge("huge.pdf", "pdf", 500 * MB)).toBe(false);
+  });
+
+  it("gives pptx its own 50 MB cap without lowering the others", () => {
+    expect(PPTX_CAP_BYTES).toBe(50 * MB);
+    expect(capForFormat("pptx")).toBe(50 * MB);
+    expect(capForFormat("xlsx")).toBe(PREVIEW_CAP_BYTES);
+    expect(capForFormat("docx")).toBe(PREVIEW_CAP_BYTES);
+    expect(capForFormat("ipynb")).toBe(PREVIEW_CAP_BYTES);
+  });
+
+  it("allows a 40 MB deck but gates one over 50 MB", () => {
+    expect(isPreviewTooLarge("deck.pptx", "pptx", 40 * MB)).toBe(false);
+    // A workbook of the same size is still gated at 15 MB.
+    expect(isPreviewTooLarge("book.xlsx", "xlsx", 40 * MB)).toBe(true);
+    // Exactly at the pptx cap is allowed; one byte over is not.
+    expect(isPreviewTooLarge("edge.pptx", "pptx", PPTX_CAP_BYTES)).toBe(false);
+    expect(isPreviewTooLarge("edge.pptx", "pptx", PPTX_CAP_BYTES + 1)).toBe(true);
   });
 });

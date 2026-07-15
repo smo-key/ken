@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   emuToPx,
+  parseBackground,
+  parseMasterTextStyles,
+  parsePlaceholders,
   parseRels,
   parseSlide,
   parseSlideSize,
   parseTheme,
   resolveColor,
+  resolveGradient,
   resolvePath,
   slidePathsInOrder,
 } from "./pptx";
@@ -448,6 +452,280 @@ describe("parseSlide — tables", () => {
     expect(head.fill).toBe("#4472C4");
     expect(s.table!.rows[0].cells[1].hMerge).toBe(true); // continuation → view skips it
     expect(s.table!.rows[1].cells[0].paragraphs[0].runs[0].text).toBe("A");
+  });
+});
+
+describe("resolveColor — extra transforms", () => {
+  it("desaturates fully with satMod=0 (color collapses to gray)", () => {
+    const c = resolveColor(colorEl(
+      `<a:solidFill><a:srgbClr val="4472C4"><a:satMod val="0"/></a:srgbClr></a:solidFill>`));
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(c!.slice(i, i + 2), 16));
+    expect(r).toBe(g);
+    expect(g).toBe(b);
+  });
+
+  it("applies hueMod and still yields a valid hex", () => {
+    const c = resolveColor(colorEl(
+      `<a:solidFill><a:srgbClr val="4472C4"><a:hueMod val="50000"/></a:srgbClr></a:solidFill>`));
+    expect(c).toMatch(/^#[0-9A-F]{6}$/);
+  });
+});
+
+describe("resolveGradient", () => {
+  it("maps a linear gradient's stops and angle to CSS (ang+90)", () => {
+    const g = resolveGradient(colorEl(
+      `<a:gradFill><a:gsLst>` +
+      `<a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs>` +
+      `<a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs>` +
+      `</a:gsLst><a:lin ang="5400000"/></a:gradFill>`));
+    expect(g).toBe("linear-gradient(180deg, #FF0000 0%, #0000FF 100%)");
+  });
+
+  it("resolves schemeClr stops through the theme", () => {
+    const t = parseTheme(THEME1, MASTER1);
+    const g = resolveGradient(colorEl(
+      `<a:gradFill><a:gsLst>` +
+      `<a:gs pos="0"><a:schemeClr val="accent1"/></a:gs>` +
+      `<a:gs pos="100000"><a:schemeClr val="accent2"/></a:gs>` +
+      `</a:gsLst></a:gradFill>`), t);
+    expect(g).toContain("#4472C4 0%");
+    expect(g).toContain("#ED7D31 100%");
+  });
+
+  it("emits a radial-gradient when a path element is present", () => {
+    const g = resolveGradient(colorEl(
+      `<a:gradFill><a:gsLst>` +
+      `<a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs>` +
+      `<a:gs pos="100000"><a:srgbClr val="000000"/></a:gs>` +
+      `</a:gsLst><a:path path="circle"/></a:gradFill>`));
+    expect(g).toBe("radial-gradient(circle, #FFFFFF 0%, #000000 100%)");
+  });
+
+  it("returns undefined with fewer than two usable stops", () => {
+    expect(resolveGradient(colorEl(
+      `<a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs></a:gsLst></a:gradFill>`)))
+      .toBeUndefined();
+  });
+});
+
+describe("parseBackground", () => {
+  const bgSlide = (bg: string) =>
+    `<?xml version="1.0"?><p:sld ${A} ${P}><p:cSld>${bg}<p:spTree/></p:cSld></p:sld>`;
+
+  it("reads a solid background fill", () => {
+    expect(parseBackground(bgSlide(
+      `<p:bg><p:bgPr><a:solidFill><a:srgbClr val="123456"/></a:solidFill></p:bgPr></p:bg>`)))
+      .toEqual({ color: "#123456" });
+  });
+
+  it("reads a gradient background fill", () => {
+    const bg = parseBackground(bgSlide(
+      `<p:bg><p:bgPr><a:gradFill><a:gsLst>` +
+      `<a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs>` +
+      `<a:gs pos="100000"><a:srgbClr val="000000"/></a:gs>` +
+      `</a:gsLst><a:lin ang="0"/></a:gradFill></p:bgPr></p:bg>`));
+    expect(bg?.gradient).toBe("linear-gradient(90deg, #FFFFFF 0%, #000000 100%)");
+  });
+
+  it("reads a picture (blip) background as an embed id", () => {
+    expect(parseBackground(bgSlide(
+      `<p:bg><p:bgPr><a:blipFill><a:blip r:embed="rId7"/></a:blipFill></p:bgPr></p:bg>`)))
+      .toEqual({ imageEmbedId: "rId7" });
+  });
+
+  it("exposes the slide's own background on the parsed model", () => {
+    const parsed = parseSlide(
+      `<?xml version="1.0"?><p:sld ${A} ${P}><p:cSld>` +
+      `<p:bg><p:bgPr><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill></p:bgPr></p:bg>` +
+      `<p:spTree/></p:cSld></p:sld>`);
+    expect(parsed.background).toEqual({ color: "#EEEEEE" });
+  });
+
+  it("returns undefined when there is no background", () => {
+    expect(parseBackground(bgSlide(""))).toBeUndefined();
+  });
+});
+
+const LAYOUT1 =
+  `<?xml version="1.0"?><p:sldLayout ${P} ${A}><p:cSld><p:spTree>` +
+  `<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/>` +
+  `<p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="914400" y="457200"/><a:ext cx="1828800" cy="914400"/></a:xfrm></p:spPr>` +
+  `<a:txBody><a:bodyPr anchor="b"/></a:txBody></p:sp>` +
+  `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="914400" y="1828800"/><a:ext cx="3657600" cy="2743200"/></a:xfrm></p:spPr>` +
+  `</p:sp>` +
+  `</p:spTree></p:cSld></p:sldLayout>`;
+
+const MASTER_TXSTYLES =
+  `<?xml version="1.0"?><p:sldMaster ${P} ${A}><p:txStyles>` +
+  `<p:titleStyle><a:lvl1pPr><a:defRPr sz="4400"/></a:lvl1pPr></p:titleStyle>` +
+  `<p:bodyStyle><a:lvl1pPr><a:defRPr sz="2800"/></a:lvl1pPr></p:bodyStyle>` +
+  `<p:otherStyle><a:lvl1pPr><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle>` +
+  `</p:txStyles></p:sldMaster>`;
+
+describe("placeholder inheritance", () => {
+  it("reads a layout's placeholders (type/idx, geometry, anchor)", () => {
+    const phs = parsePlaceholders(LAYOUT1);
+    expect(phs).toHaveLength(2);
+    const title = phs.find((p) => p.type === "title")!;
+    expect(title.box).toEqual({ x: 96, y: 48, w: 192, h: 96 });
+    expect(title.anchor).toBe("bottom");
+    const body = phs.find((p) => p.idx === 1)!;
+    expect(body.type).toBe("body");
+    expect(body.box?.y).toBe(192);
+  });
+
+  it("gives a slide placeholder with no xfrm the layout's geometry (title↔ctrTitle)", () => {
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr>` +
+      `<p:txBody><a:p><a:r><a:t>Deck</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml, undefined, {
+      layout: parsePlaceholders(LAYOUT1),
+    }).shapes;
+    expect(s.x).toBe(96);
+    expect(s.y).toBe(48);
+    expect(s.anchor).toBe("bottom"); // inherited from the layout bodyPr
+    expect(s.isTitle).toBe(true);
+  });
+
+  it("matches a body placeholder by idx", () => {
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
+      `<p:txBody><a:p><a:r><a:t>Point</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml, undefined, {
+      layout: parsePlaceholders(LAYOUT1),
+    }).shapes;
+    expect(s.y).toBe(192);
+  });
+
+  it("keeps a shape's own xfrm over the inherited one", () => {
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
+      `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody><a:p><a:r><a:t>Deck</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml, undefined, {
+      layout: parsePlaceholders(LAYOUT1),
+    }).shapes;
+    expect(s.x).toBe(0);
+  });
+
+  it("falls back to the master placeholder when the layout lacks one", () => {
+    const master = parsePlaceholders(
+      `<?xml version="1.0"?><p:sldMaster ${P} ${A}><p:cSld><p:spTree>` +
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
+      `<p:spPr><a:xfrm><a:off x="457200" y="457200"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `</p:sp></p:spTree></p:cSld></p:sldMaster>`);
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` +
+      `<p:txBody><a:p><a:r><a:t>X</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml, undefined, { layout: [], master }).shapes;
+    expect(s.x).toBe(48);
+  });
+
+  it("inherits a default text size from the master text styles by family", () => {
+    const styles = parseMasterTextStyles(MASTER_TXSTYLES);
+    expect(styles).toEqual({ title: 44, body: 28, other: 18 });
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
+      `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody><a:p><a:r><a:t>Deck</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml, undefined, { textStyles: styles }).shapes;
+    expect(s.defaultSizePt).toBe(44);
+  });
+});
+
+describe("parseSlide — preset geometry, connectors, effects", () => {
+  it("emits an SVG path for a preset geometry while keeping its text", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:prstGeom prst="triangle"/><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr>` +
+      `<p:txBody><a:p><a:r><a:t>Tri</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.kind).toBe("shape");
+    expect(s.geomPath).toBe("M50 0 L100 100 L0 100 Z");
+    expect(s.pathW).toBe(100);
+    expect(s.fill).toBe("#00FF00");
+    expect(s.paragraphs[0].runs[0].text).toBe("Tri");
+  });
+
+  it("draws a straight connector (p:cxnSp) as a line path", () => {
+    const xml = slide(
+      `<p:cxnSp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="0"/></a:xfrm>` +
+      `<a:prstGeom prst="line"/><a:ln w="9525"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln>` +
+      `</p:spPr></p:cxnSp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.geomPath).toBe("M0 0 L100 100");
+    expect(s.line?.color).toBe("#FF0000");
+  });
+
+  it("resolves a gradient shape fill", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:gradFill><a:gsLst>` +
+      `<a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs>` +
+      `<a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs>` +
+      `</a:gsLst><a:lin ang="0"/></a:gradFill></p:spPr></p:sp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.gradient).toBe("linear-gradient(90deg, #FF0000 0%, #0000FF 100%)");
+  });
+
+  it("captures a picture (blip) shape fill as an embed id", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:blipFill><a:blip r:embed="rId9"/></a:blipFill></p:spPr></p:sp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.fillImageEmbedId).toBe("rId9");
+  });
+
+  it("maps a:prstDash onto a coarse dash family", () => {
+    const dashOf = (val: string) => {
+      const xml = slide(
+        `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+        `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>` +
+        `<a:ln><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:prstDash val="${val}"/></a:ln>` +
+        `</p:spPr></p:sp>`);
+      return parseSlide(xml).shapes[0].line?.dash;
+    };
+    expect(dashOf("dash")).toBe("dash");
+    expect(dashOf("sysDot")).toBe("dot");
+    expect(dashOf("dashDot")).toBe("dashDot");
+    expect(dashOf("solid")).toBeUndefined();
+  });
+
+  it("resolves an outer shadow to a CSS box-shadow", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>` +
+      `<a:effectLst><a:outerShdw blurRad="38100" dist="38100" dir="0">` +
+      `<a:srgbClr val="000000"><a:alpha val="40000"/></a:srgbClr></a:outerShdw></a:effectLst>` +
+      `</p:spPr></p:sp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.shadow).toBe("4px 0px 4px rgba(0,0,0,0.4)");
+  });
+
+  it("builds an arcTo segment into an absolute SVG arc", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+      `<a:custGeom><a:pathLst><a:path w="100" h="100">` +
+      `<a:moveTo><a:pt x="100" y="50"/></a:moveTo>` +
+      `<a:arcTo wR="50" hR="50" stAng="0" swAng="5400000"/>` +
+      `</a:path></a:pathLst></a:custGeom>` +
+      `<a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></p:spPr></p:sp>`);
+    const [s] = parseSlide(xml).shapes;
+    expect(s.kind).toBe("custgeom");
+    expect(s.geomPath?.startsWith("M 100 50 A 50 50 0 0 1")).toBe(true);
+  });
+
+  it("renders a chart graphicFrame as a labelled placeholder box", () => {
+    const xml =
+      `<p:graphicFrame><p:xfrm><a:off x="914400" y="457200"/><a:ext cx="1828800" cy="914400"/></p:xfrm>` +
+      `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">` +
+      `<c:chart/></a:graphicData></a:graphic></p:graphicFrame>`;
+    const [s] = parseSlide(slide(xml)).shapes;
+    expect(s.kind).toBe("placeholder");
+    expect(s.placeholder).toBe("Chart");
+    expect(s.x).toBe(96);
   });
 });
 
