@@ -34,9 +34,12 @@ pub const FILE_MAX_RELATIONS: usize = 60;
 pub const FILE_MAX_EVENTS: usize = 20;
 
 /// The file's extracted text is truncated to this many characters before
-/// prompting — ~6k tokens at 4 chars/token, comfortably inside the local
-/// model's context alongside the instructions.
-pub const EXTRACT_CHAR_BUDGET: usize = 24_000;
+/// prompting — ~3k tokens at 4 chars/token, comfortably inside the local
+/// model's context alongside the instructions. Halved from a former 24k: the
+/// per-file delta is small and bounded (≤ 40 entities / 60 relations / 20
+/// events), so the first ~3k tokens of a document ground it well while roughly
+/// halving prefill — the dominant per-file cost when indexing a large project.
+pub const EXTRACT_CHAR_BUDGET: usize = 12_000;
 
 /// Corpus-wide reading is slower than a digest.
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -764,6 +767,8 @@ mod tests {
 
     #[test]
     fn file_prompt_truncates_to_budget() {
+        // The extraction prompt is intentionally lean to keep prefill cheap.
+        assert_eq!(EXTRACT_CHAR_BUDGET, 12_000);
         let big = "x".repeat(EXTRACT_CHAR_BUDGET + 5_000);
         let p = compose_file_prompt("big.md", &big, "2026-07-14");
         // The document body is capped; the surrounding instructions are small.

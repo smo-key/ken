@@ -20,6 +20,25 @@ pub enum Priority {
     Background,
 }
 
+/// How many tokens a generation may emit, chosen per job by priority. Quick
+/// answers (Interactive) can run long, so they keep the full budget. Background
+/// Map extraction only ever emits a small, bounded JSON delta (≤ 40 entities /
+/// 60 relations / 20 events per file — see `knowledge_model`), so half the
+/// budget is ample and roughly halves the per-file decode work, the dominant
+/// cost of indexing a large project.
+pub(crate) const INTERACTIVE_MAX_TOKENS: usize = 1024;
+pub(crate) const BACKGROUND_MAX_TOKENS: usize = 512;
+
+/// The generation length cap for a job at this priority. Scoping the cap here
+/// (rather than on the engine) keeps the quick-answer budget untouched while the
+/// background extraction path asks for less.
+pub(crate) fn max_tokens_for(priority: Priority) -> usize {
+    match priority {
+        Priority::Interactive => INTERACTIVE_MAX_TOKENS,
+        Priority::Background => BACKGROUND_MAX_TOKENS,
+    }
+}
+
 /// The inference seam: one blocking, token-by-token generation. The real
 /// implementation wraps llama.cpp; tests supply a fake. Kept deliberately small
 /// so the whole scheduler above it is exercised without a model.
@@ -27,11 +46,14 @@ pub trait Engine: Send {
     /// Generate a completion for `prompt`, invoking `on_token` for each decoded
     /// UTF-8 piece. Returning `false` from `on_token` stops generation early.
     /// `greedy` selects a deterministic sampler (used by `generate_json`).
-    /// Returns the full text produced (which may be partial if cancelled).
+    /// `max_tokens` caps how many tokens this one generation may emit (chosen
+    /// per job by priority — see `max_tokens_for`). Returns the full text
+    /// produced (which may be partial if cancelled).
     fn generate(
         &mut self,
         prompt: &str,
         greedy: bool,
+        max_tokens: usize,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> Result<String>;
 }
@@ -154,6 +176,7 @@ enum Msg {
 struct Job {
     prompt: String,
     greedy: bool,
+    max_tokens: usize,
     tx: Sender<Msg>,
     reply_rx: Receiver<bool>,
 }
@@ -263,6 +286,7 @@ impl LlmService {
         let job = Job {
             prompt: prompt.to_string(),
             greedy,
+            max_tokens: max_tokens_for(priority),
             tx,
             reply_rx,
         };
@@ -295,14 +319,24 @@ impl LlmService {
     /// sampler, resending the *identical* prompt would reproduce the same
     /// non-JSON output, so the second attempt must perturb the input to have a
     /// chance at succeeding.
+    ///
+    /// The retry is scoped to `Interactive` work. `Background` (Map extraction)
+    /// runs hundreds of files serially, so the doubled generation a retry costs
+    /// on every not-quite-JSON first answer dominates indexing time; the
+    /// pipeline already tolerates a failed delta (the file is marked `error`,
+    /// never re-queued into a storm), so background jobs take the single attempt.
     pub fn generate_json_via(
         &self,
         prompt: &str,
         priority: Priority,
     ) -> Result<serde_json::Value> {
         const NUDGE: &str = "\n\nReturn ONLY valid JSON.";
+        let attempts = match priority {
+            Priority::Interactive => 2,
+            Priority::Background => 1,
+        };
         let mut last_err = None;
-        for attempt in 0..2 {
+        for attempt in 0..attempts {
             let this_prompt = if attempt == 0 {
                 prompt.to_string()
             } else {
@@ -405,6 +439,7 @@ fn worker_loop<F>(
         let Job {
             prompt,
             greedy,
+            max_tokens,
             tx,
             reply_rx,
         } = job;
@@ -418,7 +453,7 @@ fn worker_loop<F>(
                 // channel) cancels the generation on the next token boundary.
                 matches!(reply_rx.recv(), Ok(true))
             };
-            eng.generate(&prompt, greedy, &mut cb)
+            eng.generate(&prompt, greedy, max_tokens, &mut cb)
         } else {
             Err(Error::Other(
                 unavailable.unwrap_or_else(|| "the local model is unavailable".into()),
@@ -585,7 +620,6 @@ mod llama {
         backend: LlamaBackend,
         model: LlamaModel,
         n_ctx: u32,
-        max_tokens: usize,
     }
 
     impl LlamaEngine {
@@ -595,7 +629,7 @@ mod llama {
             let params = LlamaModelParams::default().with_n_gpu_layers(1000); // Metal: offload all
             let model = LlamaModel::load_from_file(&backend, path, &params)
                 .map_err(|e| Error::Other(format!("couldn't load the answers model: {e}")))?;
-            Ok(LlamaEngine { backend, model, n_ctx: 8192, max_tokens: 1024 })
+            Ok(LlamaEngine { backend, model, n_ctx: 8192 })
         }
     }
 
@@ -604,6 +638,7 @@ mod llama {
             &mut self,
             prompt: &str,
             greedy: bool,
+            max_tokens: usize,
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<String> {
             // Size the compute batch to the whole context so a real extraction
@@ -624,7 +659,7 @@ mod llama {
                 .map_err(|e| Error::Other(format!("tokenize failed: {e}")))?;
             // Keep the prompt within the context window (reserving room for the
             // generation), truncating the document's middle rather than failing.
-            let cap = super::max_prompt_tokens(self.n_ctx as usize, self.max_tokens);
+            let cap = super::max_prompt_tokens(self.n_ctx as usize, max_tokens);
             let tokens = super::clamp_prompt_tokens(&raw, cap);
 
             // Allocate the batch for the actual prompt length (the old fixed
@@ -655,7 +690,7 @@ mod llama {
             let mut streamer = Utf8Streamer::new();
             let mut n_cur = batch.n_tokens();
 
-            for _ in 0..self.max_tokens {
+            for _ in 0..max_tokens {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
                 sampler.accept(token);
                 if self.model.is_eog_token(token) {
@@ -698,6 +733,15 @@ mod tests {
             "<|im_start|>system\nYou are terse.<|im_end|>\n\
              <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn background_gets_a_smaller_generation_budget_than_interactive() {
+        // Quick answers keep the full budget; background Map extraction asks for
+        // half, roughly halving per-file decode cost. Guards the two constants.
+        assert_eq!(max_tokens_for(Priority::Interactive), 1024);
+        assert_eq!(max_tokens_for(Priority::Background), 512);
+        assert!(max_tokens_for(Priority::Background) < max_tokens_for(Priority::Interactive));
     }
 
     #[test]
@@ -845,6 +889,7 @@ mod tests {
             &mut self,
             prompt: &str,
             _greedy: bool,
+            _max_tokens: usize,
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<String> {
             let call = self.started.fetch_add(1, Ordering::SeqCst);
@@ -911,8 +956,34 @@ mod tests {
                 order: None,
             }) as Box<dyn Engine>)
         });
-        let v = svc.generate_json_via("x", Priority::Background).unwrap();
+        // Interactive keeps the retry: bad-then-good succeeds on the second try.
+        let v = svc.generate_json_via("x", Priority::Interactive).unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn background_json_does_not_retry() {
+        // Background (Map extraction) takes a single attempt: hundreds of serial
+        // files make the retry's doubled generation too costly, and the pipeline
+        // tolerates a failed delta. A bad first answer errors without a second
+        // generation, so the good script is never reached.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = {
+            let order = order.clone();
+            LlmService::spawn(move || {
+                let mut scripts = VecDeque::new();
+                scripts.push_back(vec!["not json".to_string()]);
+                scripts.push_back(vec!["{\"ok\":true}".to_string()]);
+                Ok(Box::new(FakeEngine {
+                    scripts,
+                    gate: None,
+                    started: Arc::new(AtomicUsize::new(0)),
+                    order: Some(order.clone()),
+                }) as Box<dyn Engine>)
+            })
+        };
+        assert!(svc.generate_json_via("base", Priority::Background).is_err());
+        assert_eq!(order.lock().unwrap().len(), 1, "exactly one generation, no retry");
     }
 
     #[test]
@@ -935,7 +1006,7 @@ mod tests {
                 }) as Box<dyn Engine>)
             })
         };
-        let v = svc.generate_json_via("base prompt", Priority::Background).unwrap();
+        let v = svc.generate_json_via("base prompt", Priority::Interactive).unwrap();
         assert_eq!(v["ok"], true);
         let log = order.lock().unwrap().clone();
         assert_eq!(log.len(), 2, "one initial attempt + one retry");
