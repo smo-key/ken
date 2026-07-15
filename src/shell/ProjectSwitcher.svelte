@@ -137,6 +137,10 @@
             bind:value={renameValue}
             onclick={(e) => e.stopPropagation()}
             onkeydown={(e) => {
+              // Stop every keydown from bubbling to the row <button>, whose
+              // native Space/Enter activation would otherwise open (and close)
+              // the switcher while typing the new name.
+              e.stopPropagation();
               if (e.key === "Enter") {
                 e.preventDefault();
                 void submitRename(entry);

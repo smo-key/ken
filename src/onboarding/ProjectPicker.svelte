@@ -98,7 +98,13 @@
         <div class="mono path">{pendingPath}</div>
         <label>
           Project name
-          <input bind:value={pendingName} onkeydown={(e) => e.key === "Enter" && confirmCreate()} />
+          <input
+            bind:value={pendingName}
+            onkeydown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") confirmCreate();
+            }}
+          />
         </label>
         <div class="confirm-actions">
           <button class="btn btn-primary" onclick={confirmCreate}>Create project</button>
