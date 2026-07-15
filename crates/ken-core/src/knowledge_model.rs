@@ -395,7 +395,7 @@ where
             Ok(())
         }
         Err(e) => {
-            db.mark_extraction_error(rel_path, &e.to_string(), at)?;
+            db.mark_extraction_error(rel_path, content_hash, &e.to_string(), at)?;
             Err(e)
         }
     }

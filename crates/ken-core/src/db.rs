@@ -12,7 +12,13 @@ use uuid::Uuid;
 use crate::knowledge_model;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
+
+/// How many times an errored extraction is automatically re-queued before it is
+/// left `error` for good. Bounds retries so a persistently/deterministically
+/// failing file self-heals from a *transient* fault (bad model load, momentary
+/// unparseable JSON) but can never wedge the queue in an infinite retry loop.
+pub const MAX_EXTRACTION_ATTEMPTS: i64 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -313,6 +319,21 @@ impl Db {
                 )?;
             }
         }
+        if version < 10 {
+            // Bounded-retry bookkeeping for the extraction queue: how many times
+            // this file's extraction has errored. Guarded ADD COLUMN (no IF NOT
+            // EXISTS; a fresh DB already created the column via this same block,
+            // and tests rewind schema_version).
+            let has_attempts: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('extractions') WHERE name = 'attempts'")?
+                .exists([])?;
+            if !has_attempts {
+                self.conn.execute_batch(
+                    "ALTER TABLE extractions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -508,7 +529,12 @@ impl Db {
         // and non-final prefixes.
         let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
         let clauses = vec!["lower(rel_path) LIKE ? ESCAPE '\\'"; lowered.len()].join(" AND ");
-        let sql = format!("SELECT rel_path, kind, status FROM files WHERE {clauses}");
+        // Bound the scan: without a LIMIT a short/common token (e.g. a single
+        // char) scans and returns the whole `files` table, which — combined with
+        // this running synchronously on the command thread — froze the UI. We
+        // only ever keep `limit` results anyway, so cap the scan there.
+        let sql =
+            format!("SELECT rel_path, kind, status FROM files WHERE {clauses} LIMIT {limit}");
         let mut stmt = self.conn.prepare(&sql)?;
         let patterns: Vec<String> = lowered
             .iter()
@@ -520,12 +546,20 @@ impl Db {
             })?
             .collect::<std::result::Result<_, _>>()?;
 
+        // Merge in O(n) via a rel_path -> index map instead of an O(n²) linear
+        // scan of `hits` per name row.
+        let mut index: std::collections::HashMap<String, usize> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.rel_path.clone(), i))
+            .collect();
         for (rel_path, kind, status) in name_rows {
             let rank = name_match_rank(&rel_path, query);
-            match hits.iter_mut().find(|h| h.rel_path == rel_path) {
-                Some(hit) => {
+            match index.get(&rel_path) {
+                Some(&i) => {
                     // Both passes hit: keep the better rank, and the content
                     // snippet unless it's empty (metadata-only/failed files).
+                    let hit = &mut hits[i];
                     if rank < hit.rank {
                         hit.rank = rank;
                     }
@@ -533,13 +567,17 @@ impl Db {
                         hit.snippet = name_snippet(&rel_path, &lowered);
                     }
                 }
-                None => hits.push(SearchHit {
-                    snippet: name_snippet(&rel_path, &lowered),
-                    rel_path,
-                    kind,
-                    status,
-                    rank,
-                }),
+                None => {
+                    let snippet = name_snippet(&rel_path, &lowered);
+                    index.insert(rel_path.clone(), hits.len());
+                    hits.push(SearchHit {
+                        snippet,
+                        rel_path,
+                        kind,
+                        status,
+                        rank,
+                    });
+                }
             }
         }
         hits.sort_by(|a, b| {
@@ -579,6 +617,41 @@ impl Db {
     pub fn indexed_file_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM files WHERE status = 'indexed'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Count of indexed files that actually have a stored `contents` row — the
+    /// exact population `backfill_extractions` can enqueue and the worker can
+    /// process. This is the extraction-coverage denominator: an `indexed` row
+    /// with no `contents` row (a legacy/corrupt state) can never be extracted,
+    /// so counting it toward "N of M analyzed" would strand coverage below 100%
+    /// forever with no queued work to close the gap. In the healthy case every
+    /// `indexed` file has a `contents` row (`upsert_file` always writes one), so
+    /// this equals `indexed_file_count`; it only diverges to drop files that are
+    /// uncountable by construction.
+    pub fn extractable_file_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM files f
+             WHERE f.status = 'indexed'
+               AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Count of indexed-with-content files that have NO `extractions` row yet —
+    /// i.e. the queue never picked them up. Should be 0 after `backfill_extractions`;
+    /// a nonzero value means the coverage denominator and the enqueuable
+    /// population disagree (the Map would stick below 100% with no work queued).
+    /// Used as a lightweight post-backfill sanity check.
+    pub fn unqueued_extractable_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM files f
+             WHERE f.status = 'indexed'
+               AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)
+               AND NOT EXISTS (SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path)",
             [],
             |r| r.get(0),
         )?)
@@ -1061,9 +1134,18 @@ impl Db {
         Ok(())
     }
 
+    /// Mark a file's extraction `error` and bump its retry counter — but ONLY
+    /// while the queued `content_hash` still matches the row (same guard as
+    /// `mark_extraction_done`). The worker pops a hash, drops the DB lock for the
+    /// slow generation, then reports back on its own connection; meanwhile the
+    /// scanner may re-index the file and re-enqueue it under a NEW hash. Guarding
+    /// on `content_hash` keeps a stale generation failure from flipping that
+    /// freshly re-enqueued `pending` row back to `error` — a mismatch is a
+    /// harmless no-op and the newer hash stays queued for a re-run.
     pub fn mark_extraction_error(
         &mut self,
         rel_path: &str,
+        content_hash: &str,
         message: &str,
         _at: i64,
     ) -> Result<()> {
@@ -1071,21 +1153,27 @@ impl Db {
         // SUCCESS only. Stamping it here would let an errored-then-changed file
         // (re-enqueued to `pending`, keeping this timestamp) count toward
         // `extraction_coverage`, inflating "N of M analyzed" for a file that
-        // never actually succeeded.
+        // never actually succeeded. `attempts` is bumped so bounded retries
+        // (see `requeue_errored_extractions`) eventually give up.
         self.conn.execute(
             "UPDATE extractions
-             SET status = 'error', error = ?2
-             WHERE rel_path = ?1",
-            params![rel_path, message],
+             SET status = 'error', error = ?3, attempts = attempts + 1
+             WHERE rel_path = ?1 AND content_hash = ?2",
+            params![rel_path, content_hash, message],
         )?;
         Ok(())
     }
 
-    /// `(files extracted, indexed files)` — the Map coverage line's numerator
-    /// and denominator. A file counts once it has a successful `extracted_at`
-    /// on record and is not currently in `error`; it keeps counting after a
-    /// content change re-queues it (`pending` with the prior `extracted_at`
-    /// preserved) until the re-run overwrites or it errors.
+    /// `(files extracted, extractable files)` — the Map coverage line's
+    /// numerator and denominator. A file counts once it has a successful
+    /// `extracted_at` on record and is not currently in `error`; it keeps
+    /// counting after a content change re-queues it (`pending` with the prior
+    /// `extracted_at` preserved) until the re-run overwrites or it errors.
+    ///
+    /// The denominator is `extractable_file_count` (indexed AND has content),
+    /// NOT the raw indexed count: that is exactly the population `backfill_extractions`
+    /// enqueues, so an `indexed` file that can never be extracted (no `contents`
+    /// row) can't create a permanent gap that freezes the count at "0 of N".
     pub fn extraction_coverage(&self) -> Result<(i64, i64)> {
         let done: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM extractions
@@ -1093,7 +1181,22 @@ impl Db {
             [],
             |r| r.get(0),
         )?;
-        Ok((done, self.indexed_file_count()?))
+        Ok((done, self.extractable_file_count()?))
+    }
+
+    /// Count of files whose extraction has failed *permanently*: `status =
+    /// 'error'` with the retry budget exhausted (`attempts >= MAX_EXTRACTION_ATTEMPTS`).
+    /// These are excluded from the coverage numerator forever, so the Map can
+    /// surface them explicitly ("Y failed") instead of showing a silent gap
+    /// below 100% that looks identical to "no progress". A row still within its
+    /// retry budget is NOT counted — it may yet succeed on a self-heal requeue.
+    pub fn extraction_failed_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM extractions
+             WHERE status = 'error' AND attempts >= ?1",
+            params![MAX_EXTRACTION_ATTEMPTS],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn remove_extraction(&mut self, rel_path: &str) -> Result<()> {
@@ -1135,17 +1238,21 @@ impl Db {
         Ok(n)
     }
 
-    /// Return every `error` extraction row to `pending` so the worker retries
-    /// it. Called when the local model becomes ready (install / selection /
-    /// error recovery): files that errored under a transient model fault — the
-    /// batch-overflow bug, a bad load — recover without needing a content edit.
-    /// The content hash is preserved, so a still-failing file simply errors
-    /// again and won't wedge the queue. Returns how many rows were re-queued.
+    /// Return `error` extraction rows that still have retries left (attempts <
+    /// `MAX_EXTRACTION_ATTEMPTS`) to `pending` so the worker retries them. Called
+    /// both when the local model becomes ready (install / selection / error
+    /// recovery) AND every time the worker drains the queue and goes idle, so a
+    /// file that errored under a transient fault — the batch-overflow bug, a bad
+    /// load, momentary unparseable JSON — self-heals without a model restart or a
+    /// content edit. The content hash is preserved, so a still-failing file
+    /// simply errors again; once it exhausts the attempt cap it stays `error`
+    /// permanently and won't be re-queued, so the queue can never spin forever.
+    /// Returns how many rows were re-queued.
     pub fn requeue_errored_extractions(&mut self) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE extractions SET status = 'pending', error = NULL
-             WHERE status = 'error'",
-            [],
+             WHERE status = 'error' AND attempts < ?1",
+            params![MAX_EXTRACTION_ATTEMPTS],
         )?;
         Ok(n)
     }
@@ -1618,7 +1725,11 @@ fn build_fts_query(tokens: &[String]) -> String {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            if i == last {
+            // Only apply the as-you-type prefix (`*`) once the last token is at
+            // least two chars. A 1-char prefix like `a*` matches a huge share of
+            // the index, turning a single keystroke into a near-full scan; match
+            // the char exactly instead until a second char narrows it.
+            if i == last && t.chars().count() >= 2 {
                 format!("\"{t}\" *")
             } else {
                 format!("\"{t}\"")
@@ -1853,7 +1964,7 @@ mod tests {
         db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
         db.enqueue_extraction_if_changed("b.md", "h1").unwrap();
         // Extraction fails — the file was never successfully analyzed.
-        db.mark_extraction_error("b.md", "boom", 101).unwrap();
+        db.mark_extraction_error("b.md", "h1", "boom", 101).unwrap();
         assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
         // Content changes and re-enqueues; still never succeeded → still not
         // counted (extracted_at must reflect last SUCCESS only, never an error).
@@ -1904,7 +2015,7 @@ mod tests {
         db.enqueue_extraction_if_changed("c.md", "hc").unwrap();
         // a done, b errored, c still pending.
         db.mark_extraction_done("a.md", "ha", 100).unwrap();
-        db.mark_extraction_error("b.md", "batch add failed", 101).unwrap();
+        db.mark_extraction_error("b.md", "hb", "batch add failed", 101).unwrap();
         // Only the errored row is re-queued; done and pending untouched.
         assert_eq!(db.requeue_errored_extractions().unwrap(), 1);
         // Drain the queue: b (re-queued, hash preserved) and c (already pending)
@@ -1920,6 +2031,128 @@ mod tests {
         assert!(!pending.iter().any(|(r, _)| r == "a.md"), "a stayed done");
         // Re-queueing again is a no-op now that nothing is errored.
         assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
+    }
+
+    #[test]
+    fn errored_extraction_is_requeued_up_to_cap_then_stays_error() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
+
+        // A deterministically failing file, driven the way the worker does: pop
+        // it, mark it error (guarding on its hash), and when the queue drains,
+        // rescue errored rows that still have retries left. It must self-heal
+        // only up to MAX_EXTRACTION_ATTEMPTS total failures, then be left
+        // `error` forever so the queue can never spin.
+        let mut requeued = 0;
+        for _ in 0..20 {
+            match db.next_pending_extraction().unwrap() {
+                Some((rel, hash)) => {
+                    db.mark_extraction_error(&rel, &hash, "boom", 100).unwrap();
+                }
+                None => {
+                    if db.requeue_errored_extractions().unwrap() == 0 {
+                        break; // exhausted the cap — no infinite loop
+                    }
+                    requeued += 1;
+                }
+            }
+        }
+        // First failure sets attempts=1; it was requeued (MAX-1) more times,
+        // failing on each, before attempts reached the cap.
+        assert_eq!(requeued, (MAX_EXTRACTION_ATTEMPTS - 1) as usize);
+        // Exhausted: stays error, never returns to pending, never re-queued.
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
+        assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn mark_extraction_error_does_not_clobber_a_re_enqueued_hash() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        // The worker popped "h1"; before it reports back, the scanner re-indexes
+        // and re-enqueues the file under a NEW hash "h2" (now pending).
+        db.enqueue_extraction_if_changed("a.md", "h1").unwrap();
+        db.enqueue_extraction_if_changed("a.md", "h2").unwrap();
+        // A stale failure for the OLD hash must NOT flip the fresh pending row to
+        // error — the mismatched content_hash makes it a harmless no-op.
+        db.mark_extraction_error("a.md", "h1", "stale boom", 100).unwrap();
+        assert_eq!(
+            db.next_pending_extraction().unwrap(),
+            Some(("a.md".into(), "h2".into())),
+            "the re-enqueued hash stays pending; a stale error is a no-op"
+        );
+        // The matching hash does record the error.
+        db.mark_extraction_error("a.md", "h2", "real boom", 101).unwrap();
+        assert_eq!(db.next_pending_extraction().unwrap(), None);
+        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn indexed_file_without_contents_row_does_not_freeze_coverage() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Two normal indexed files (each gets a contents row via upsert_file).
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        // Simulate a legacy/corrupt state: an `indexed` file with NO contents
+        // row — counted by the raw indexed count but impossible to extract.
+        db.conn
+            .execute(
+                "INSERT INTO files (rel_path, kind, size, mtime, status, error)
+                 VALUES ('ghost.md', 'md', 1, 1, 'indexed', NULL)",
+                [],
+            )
+            .unwrap();
+
+        // Raw indexed count includes the ghost; the extractable population does
+        // not — that is the denominator the coverage line now uses.
+        assert_eq!(db.indexed_file_count().unwrap(), 3);
+        assert_eq!(db.extractable_file_count().unwrap(), 2);
+
+        // Backfill enqueues exactly the extractable files (a, b), never the
+        // ghost, and leaves nothing extractable unqueued.
+        assert_eq!(db.backfill_extractions().unwrap(), 2);
+        assert_eq!(db.unqueued_extractable_count().unwrap(), 0);
+
+        // Draining the queue reaches the full extractable denominator (2 of 2),
+        // NOT 2 of 3 — the un-extractable ghost can't strand it below 100%.
+        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
+            db.mark_extraction_done(&rel, &hash, 100).unwrap();
+        }
+        assert_eq!(db.extraction_coverage().unwrap(), (2, 2));
+    }
+
+    #[test]
+    fn extraction_failed_count_counts_only_terminally_errored_rows() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
+        db.enqueue_extraction_if_changed("a.md", "ha").unwrap();
+        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
+
+        // a errored once — still within the retry budget, so NOT terminally
+        // failed (a self-heal requeue may yet make it succeed).
+        db.mark_extraction_error("a.md", "ha", "boom", 100).unwrap();
+        assert_eq!(
+            db.extraction_failed_count().unwrap(),
+            0,
+            "a row still within its retry budget must not count as failed"
+        );
+
+        // b errors until its retry budget is exhausted — now terminally failed.
+        for _ in 0..MAX_EXTRACTION_ATTEMPTS {
+            db.mark_extraction_error("b.md", "hb", "boom", 100).unwrap();
+        }
+        assert_eq!(
+            db.extraction_failed_count().unwrap(),
+            1,
+            "only b, which exhausted its retry budget, counts as failed"
+        );
+
+        // Boundary check: the exhausted row (b) is never re-queued, but a (still
+        // under the cap) is — so failures don't wedge the live queue.
+        assert_eq!(db.requeue_errored_extractions().unwrap(), 1);
     }
 
     #[test]
@@ -1953,7 +2186,7 @@ mod tests {
         assert_eq!(db.extraction_coverage().unwrap(), (1, 2)); // still 'done' count until re-run overwrites
 
         // Errors stay out of the pending queue but keep the row.
-        db.mark_extraction_error("b.md", "boom", 101).unwrap();
+        db.mark_extraction_error("b.md", "h2", "boom", 101).unwrap();
         db.mark_extraction_done("a.md", "h1b", 102).unwrap();
         assert_eq!(db.next_pending_extraction().unwrap(), None);
 
@@ -2020,6 +2253,29 @@ mod tests {
         let db = seeded();
         let hits = db.search("cutov", 10).unwrap();
         assert!(!hits.is_empty(), "prefix of last token should match");
+    }
+
+    #[test]
+    fn single_char_query_is_bounded_and_fast() {
+        // A 1-char query must never scan/return the whole index. Seed many
+        // files that all contain the char in both name and body, then assert the
+        // result honors `limit` (both the FTS LIMIT and the filename-scan LIMIT).
+        let mut db = Db::open_in_memory().unwrap();
+        for i in 0..50 {
+            db.upsert_file(
+                &format!("area/alpha-{i}.md"),
+                "md",
+                1,
+                1,
+                "indexed",
+                None,
+                "alpha and more alpha",
+            )
+            .unwrap();
+        }
+        let hits = db.search("a", 5).unwrap();
+        assert!(hits.len() <= 5, "1-char query must respect limit: {}", hits.len());
+        assert!(!hits.is_empty(), "1-char query should still return matches");
     }
 
     #[test]

@@ -192,7 +192,24 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     // index_one for unchanged files — so those files would show "0 of N
     // analyzed" forever. Enqueue every indexed file that has no row yet,
     // hashing its already-stored text. Cheap, idempotent, and re-index-safe.
-    let _ = db.backfill_extractions();
+    match db.backfill_extractions() {
+        Ok(_) => {
+            // Sanity check: after backfill, every extractable (indexed + has
+            // content) file should have an extractions row. If any still don't,
+            // the coverage denominator and the enqueuable population disagree —
+            // the Map would stick below 100% with no queued work to close the
+            // gap (the "0 of N" wedge). Surface it instead of failing silently.
+            if let Ok(missing) = db.unqueued_extractable_count() {
+                if missing > 0 {
+                    eprintln!(
+                        "warning: extraction backfill left {missing} extractable file(s) \
+                         unqueued; Map coverage may not reach 100%"
+                    );
+                }
+            }
+        }
+        Err(e) => eprintln!("warning: extraction backfill failed: {e}"),
+    }
 
     // One-time unread baseline: snapshot the already-indexed files (this DB
     // persists across sessions, so an existing project has them here) as "seen"
@@ -719,7 +736,11 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
 }
 
 #[tauri::command]
-fn search(state: State<SharedState>, query: String, limit: Option<usize>) -> CmdResult<Vec<SearchHit>> {
+async fn search(
+    state: State<'_, SharedState>,
+    query: String,
+    limit: Option<usize>,
+) -> CmdResult<Vec<SearchHit>> {
     // Hold the global lock only long enough to clone the Arc (microseconds),
     // then release it so the FTS query runs on the dedicated read-only handle
     // without serializing against every other command and background worker.
@@ -727,8 +748,16 @@ fn search(state: State<SharedState>, query: String, limit: Option<usize>) -> Cmd
         let guard = state.lock().unwrap();
         guard.active.as_ref().ok_or("no project open")?.search_db.clone()
     };
-    let db = search_db.lock().unwrap();
-    db.search(&query, limit.unwrap_or(30)).map_err(err)
+    // Run the (potentially expensive — a short/common query can touch many
+    // rows) DB work on the blocking pool. As a synchronous command this ran on
+    // the main thread and could freeze the whole UI event loop; offloading
+    // keeps IPC responsive.
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = search_db.lock().unwrap();
+        db.search(&query, limit.unwrap_or(30)).map_err(err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Error code the frontend matches on to offer a download instead of a
@@ -3684,9 +3713,13 @@ struct KnowledgeModelDto {
     /// may open mid-build, so the state has to come back with the model, not
     /// only as an event.
     building: bool,
-    /// Incremental coverage: files extracted / indexed files.
+    /// Incremental coverage: files extracted / extractable files.
     analyzed: i64,
     total: i64,
+    /// Files whose extraction failed permanently (retry budget exhausted).
+    /// Excluded from `analyzed`, so the Map can show "X analyzed, Y failed of N"
+    /// instead of a silent gap that looks identical to "no progress".
+    failed: i64,
     /// `ready` | `notInstalled` | `error` — drives the Map's paused notice.
     llm_status: String,
     /// The model's error message when `llm_status == "error"`, else null.
@@ -3714,6 +3747,7 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     let active = guard.active.as_ref().ok_or("no project open")?;
     let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
     let (analyzed, total) = active.db.extraction_coverage().map_err(err)?;
+    let failed = active.db.extraction_failed_count().map_err(err)?;
     let (llm_status, llm_error) = match ken_core::local_llm::llm_status() {
         ken_core::local_llm::LlmStatus::Ready => ("ready".to_string(), None),
         ken_core::local_llm::LlmStatus::NotInstalled => ("notInstalled".to_string(), None),
@@ -3727,6 +3761,7 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
         building: active.knowledge_running.load(Ordering::SeqCst),
         analyzed,
         total,
+        failed,
         llm_status,
         llm_error,
     })
@@ -3927,6 +3962,12 @@ fn extraction_worker(
                     last_emit = Instant::now();
                     pending_emit = false;
                 }
+                // Self-heal: return errored rows that still have retries left to
+                // `pending` before sleeping, so a file that failed under a
+                // transient fault is retried on the next tick without needing a
+                // model restart. Rows that have exhausted the attempt cap stay
+                // `error` and are NOT re-queued, so this can't spin forever.
+                let _ = db.requeue_errored_extractions();
                 std::thread::sleep(Duration::from_secs(2));
             }
             Err(_) => {
