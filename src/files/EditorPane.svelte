@@ -36,6 +36,9 @@
   // Cloud-storage placeholder being fetched, and why a fetch gave up.
   let downloading = $state(false);
   let cloudError = $state<string | null>(null);
+  // A cloud-only file too big to auto-download (> CLOUD_DOWNLOAD_MAX): we hold
+  // off the fetch and show a prompt so the user opts into the pull explicitly.
+  let needsCloudConfirm = $state(false);
   // True from the first byte of load() until the file's kind/cloud-status is
   // known. Gates every preview/editor branch so a not-yet-hydrated online-only
   // file can't briefly mount a preview (flashing CLOUD_ONLY) before the
@@ -58,6 +61,9 @@
   const GRID_EDIT_MAX = 2 * 1024 * 1024; // csv/tsv grid
   const WYSIWYG_MAX = 1.5 * 1024 * 1024; // markdown in Crepe
   const TEXT_EDIT_MAX = 8 * 1024 * 1024; // plain-text editor
+  // A cloud-only file this big or larger is never auto-downloaded on open — the
+  // pull can be slow and costly, so we ask first rather than fetch silently.
+  const CLOUD_DOWNLOAD_MAX = 50 * 1024 * 1024;
 
   const tooLarge = $derived(
     meta !== null &&
@@ -88,9 +94,10 @@
     unlisten = await api.onIndexUpdated(() => void checkDisk());
   });
 
-  async function load() {
+  async function load(forceCloudDownload = false) {
     loadError = null;
     cloudError = null;
+    needsCloudConfirm = false;
     resolving = true;
     try {
       meta = await api.fileMeta(relPath);
@@ -98,7 +105,14 @@
       // reading one blocks until the provider delivers it. Opening the file is
       // the user asking for exactly that — so download it deliberately, behind
       // a visible "Downloading…" state, rather than freezing on a silent read.
+      // But a large pull can be slow and costly, so past CLOUD_DOWNLOAD_MAX we
+      // hold off and prompt instead of fetching silently (unless the user has
+      // already confirmed via the prompt).
       if (await api.isCloudOnly(relPath)) {
+        if (!forceCloudDownload && meta && meta.size > CLOUD_DOWNLOAD_MAX) {
+          needsCloudConfirm = true;
+          return;
+        }
         downloading = true;
         try {
           await api.hydrateFile(relPath);
@@ -126,6 +140,14 @@
     } finally {
       resolving = false;
     }
+  }
+
+  // The user accepted the large cloud pull: re-run load() forcing the download
+  // so the file hydrates and the editor/preview mounts exactly as the normal
+  // cloud path would have.
+  async function confirmCloudDownload() {
+    needsCloudConfirm = false;
+    await load(true);
   }
 
   onDestroy(() => {
@@ -294,6 +316,22 @@
       <p class="cloud-detail">{cloudError}</p>
       <div class="cloud-actions">
         <button class="btn" onclick={() => void load()}>Try again</button>
+        <button class="btn" onclick={() => api.openExternal(relPath)}>
+          Open in default app
+        </button>
+      </div>
+    </div>
+  {:else if needsCloudConfirm && meta}
+    <div class="cloud">
+      <p>
+        <strong>{relPath.split("/").pop()}</strong> is stored online only and is
+        large ({Math.round(meta.size / (1024 * 1024))} MB). Downloading it can
+        take a while, so Ken won't fetch it automatically.
+      </p>
+      <div class="cloud-actions">
+        <button class="btn" onclick={() => void confirmCloudDownload()}>
+          Download from cloud ({Math.round(meta.size / (1024 * 1024))} MB)
+        </button>
         <button class="btn" onclick={() => api.openExternal(relPath)}>
           Open in default app
         </button>
