@@ -56,7 +56,11 @@ impl FileKind {
             .unwrap_or_default();
         match ext.as_str() {
             "md" | "markdown" => FileKind::Md,
-            "txt" | "text" | "log" => FileKind::Txt,
+            // `.vtt` (WebVTT) is plain text: classify it as Txt so a standalone
+            // transcript is editable in the UI and indexes its own words. (An
+            // adjacent-to-video `.vtt` is still pulled in as that video's
+            // transcript by `crate::transcript`; see the note in `extract`.)
+            "txt" | "text" | "log" | "vtt" => FileKind::Txt,
             "rs" | "ts" | "js" | "jsx" | "tsx" | "svelte" | "py" | "rb" | "go" | "java"
             | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "swift" | "kt" | "sh" | "bash"
             | "zsh" | "sql" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "html"
@@ -91,7 +95,11 @@ pub fn extract(path: &Path) -> Result<Extracted> {
     let kind = FileKind::from_path(path);
     // A video's "content" is its transcript, resolved from adjacent/generated
     // files — never the container itself, so the size cap below (which would
-    // reject most videos) must not gate it.
+    // reject most videos) must not gate it. Note: a `.vtt` sitting next to a
+    // video is indexed both here (as the video's transcript) and, since `.vtt`
+    // classifies as Txt, as its own file — two rows carrying the same words.
+    // That's benign (both are legitimately searchable); de-duping would need
+    // cross-file context the per-file extractor deliberately doesn't have.
     if kind == FileKind::Video {
         return Ok(Extracted {
             text: crate::transcript::indexable_text(path),
@@ -343,6 +351,29 @@ mod tests {
             .unwrap()
             .text
             .contains("vendor pricing"));
+    }
+
+    #[test]
+    fn vtt_is_editable_text_not_binary() {
+        // A `.vtt` transcript is plain text: it classifies as Txt (kind "txt",
+        // which the UI treats as editable) and its raw text is extracted,
+        // rather than falling through to Binary and being metadata-only.
+        assert_eq!(FileKind::from_path(Path::new("m/talk.vtt")), FileKind::Txt);
+        assert_eq!(FileKind::from_path(Path::new("m/talk.VTT")), FileKind::Txt);
+        assert_eq!(FileKind::Txt.as_str(), "txt");
+        assert!(FileKind::Txt.has_content());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meeting.vtt");
+        std::fs::write(
+            &path,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nBudget approved by Priya\n",
+        )
+        .unwrap();
+        let out = extract(&path).unwrap();
+        // extract_plain returns the file verbatim (no VTT stripping here).
+        assert!(out.text.contains("Budget approved by Priya"), "got: {}", out.text);
+        assert!(out.text.contains("WEBVTT"));
     }
 
     #[test]
