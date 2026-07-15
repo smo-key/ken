@@ -12,13 +12,18 @@ use uuid::Uuid;
 use crate::knowledge_model;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// How many times an errored extraction is automatically re-queued before it is
 /// left `error` for good. Bounds retries so a persistently/deterministically
 /// failing file self-heals from a *transient* fault (bad model load, momentary
 /// unparseable JSON) but can never wedge the queue in an infinite retry loop.
 pub const MAX_EXTRACTION_ATTEMPTS: i64 = 3;
+
+/// Bounded retries for the OCR queue, mirroring [`MAX_EXTRACTION_ATTEMPTS`]. A
+/// scanned page that deterministically fails Vision (unrasterizable, corrupt)
+/// self-heals from a transient fault but never wedges the queue.
+pub const MAX_OCR_ATTEMPTS: i64 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -34,6 +39,21 @@ pub struct FileRow {
     /// `indexed` | `metadata_only` | `failed`
     pub status: String,
     pub error: Option<String>,
+}
+
+/// One stored OCR text region for a file: which page it came from, the
+/// recognized line, and its normalized **top-left origin** bounding box
+/// `[x, y, w, h]` (each in `0.0..=1.0`). Mirrors [`crate::ocr::OcrRegion`] but
+/// keeps the DB layer free of any dependency on the native OCR module, so it is
+/// unit-testable without Vision. Consumed by the `get_ocr_regions` command that
+/// feeds the Phase 3 Cmd+F highlight overlay.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrRegionRow {
+    pub page: i64,
+    pub text: String,
+    /// `[x, y, w, h]`, normalized, top-left origin.
+    pub bbox: [f32; 4],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,6 +354,40 @@ impl Db {
                 )?;
             }
         }
+        if version < 11 {
+            // OCR (Phase 2): per-region text boxes for image/scanned-PDF files,
+            // plus an async work queue mirroring `extractions`. `ocr_regions`
+            // holds one row per recognized line (normalized top-left bbox) so a
+            // later Cmd+F overlay can highlight in place; `ocr_pending` drives a
+            // background worker that reads bytes, runs Vision, and merges the
+            // recognized text into `contents` (→ FTS) so images/scans become
+            // searchable. Kept entirely separate from the knowledge-model
+            // extraction queue and its coverage accounting.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS ocr_regions (
+                    rel_path TEXT NOT NULL,
+                    page     INTEGER NOT NULL,
+                    text     TEXT NOT NULL,
+                    x        REAL NOT NULL,
+                    y        REAL NOT NULL,
+                    w        REAL NOT NULL,
+                    h        REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ocr_regions_rel
+                    ON ocr_regions(rel_path);
+                CREATE TABLE IF NOT EXISTS ocr_pending (
+                    rel_path     TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    status       TEXT NOT NULL,
+                    error        TEXT,
+                    attempts     INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS ocr_pending_status
+                    ON ocr_pending(status);
+                "#,
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -407,6 +461,8 @@ impl Db {
             tx.execute("DELETE FROM files WHERE id = ?1", params![id])?;
             strip_file(&tx, rel_path)?;
             tx.execute("DELETE FROM extractions WHERE rel_path = ?1", params![rel_path])?;
+            tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
+            tx.execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
         }
         tx.commit()?;
         Ok(())
@@ -596,6 +652,10 @@ impl Db {
         tx.execute("DELETE FROM contents", [])?;
         tx.execute("DELETE FROM files", [])?;
         tx.execute("DELETE FROM extractions", [])?;
+        // OCR is derived like everything else: a reindex starts from scratch, so
+        // stored regions and the OCR queue are wiped too.
+        tx.execute("DELETE FROM ocr_regions", [])?;
+        tx.execute("DELETE FROM ocr_pending", [])?;
         tx.execute("DELETE FROM entities", [])?; // cascades entity_edges
         tx.execute("DELETE FROM events", [])?;
         // Drop the knowledge-model build stamp too, so after a reindex the Map
@@ -1327,6 +1387,199 @@ impl Db {
         Ok(n)
     }
 
+    // --- OCR queue + region storage (Phase 2; independent of extraction) ---
+
+    /// Enqueue a file for OCR unless it is already `done` at this exact hash.
+    /// The hash is a cheap per-version fingerprint (see `scan::index_one`), so a
+    /// rescan that leaves a file unchanged never re-OCRs it, while a real change
+    /// (new hash) re-queues it. Returns true if a `pending` row was written.
+    /// Mirrors [`Self::enqueue_extraction_if_changed`].
+    pub fn enqueue_ocr_if_changed(&mut self, rel_path: &str, content_hash: &str) -> Result<bool> {
+        let already_done: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM ocr_pending
+                 WHERE rel_path = ?1 AND content_hash = ?2 AND status = 'done'",
+                params![rel_path, content_hash],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if already_done {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO ocr_pending (rel_path, content_hash, status)
+             VALUES (?1, ?2, 'pending')
+             ON CONFLICT(rel_path) DO UPDATE SET
+               content_hash = ?2, status = 'pending', error = NULL, attempts = 0",
+            params![rel_path, content_hash],
+        )?;
+        Ok(true)
+    }
+
+    /// The oldest `pending` OCR job (rel_path, hash-to-stamp), insertion order.
+    pub fn next_pending_ocr(&self) -> Result<Option<(String, String)>> {
+        match self.conn.query_row(
+            "SELECT rel_path, content_hash FROM ocr_pending
+             WHERE status = 'pending' ORDER BY rowid LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Store the recognized `regions` for a file and mark its OCR `done` —
+    /// but ONLY while the row is still `pending` at this exact hash. The worker
+    /// pops a hash, drops the DB lock for the (slow) Vision pass, then reports
+    /// back; meanwhile the scanner may re-enqueue the file under a NEW hash.
+    /// Guarding on `(hash, pending)` keeps a stale result from clobbering that
+    /// fresher row and makes a duplicate call a harmless no-op.
+    ///
+    /// The recognized text is also merged into `contents` (appended to whatever
+    /// the base extractor produced — empty EXIF for images, the sparse text
+    /// layer for scanned PDFs), which fires the FTS trigger so the file becomes
+    /// searchable by its OCR'd words. Because a content change re-runs
+    /// `index_one` (rewriting `contents` to the fresh base text) *before*
+    /// re-enqueuing OCR, this append never accumulates stale text across
+    /// versions.
+    pub fn mark_ocr_done(
+        &mut self,
+        rel_path: &str,
+        content_hash: &str,
+        regions: &[OcrRegionRow],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let matches: bool = tx
+            .query_row(
+                "SELECT 1 FROM ocr_pending
+                 WHERE rel_path = ?1 AND content_hash = ?2 AND status = 'pending'",
+                params![rel_path, content_hash],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !matches {
+            // Superseded by a newer hash, or already done: nothing to do.
+            tx.commit()?;
+            return Ok(());
+        }
+        // Replace any prior regions for this file (idempotent re-OCR).
+        tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
+        for r in regions {
+            tx.execute(
+                "INSERT INTO ocr_regions (rel_path, page, text, x, y, w, h)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![rel_path, r.page, r.text, r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3]],
+            )?;
+        }
+        // Merge the recognized text into `contents` so search picks it up.
+        let ocr_text: String = regions
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !ocr_text.trim().is_empty() {
+            let file_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM files WHERE rel_path = ?1",
+                    params![rel_path],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(id) = file_id {
+                let existing: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT text, name FROM contents WHERE file_id = ?1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok();
+                match existing {
+                    Some((base, _name)) => {
+                        let merged = if base.trim().is_empty() {
+                            ocr_text
+                        } else {
+                            format!("{base}\n{ocr_text}")
+                        };
+                        tx.execute(
+                            "UPDATE contents SET text = ?2 WHERE file_id = ?1",
+                            params![id, merged],
+                        )?;
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO contents (file_id, text, name) VALUES (?1, ?2, ?3)",
+                            params![id, ocr_text, name_tokens(rel_path)],
+                        )?;
+                    }
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE ocr_pending SET status = 'done', error = NULL
+             WHERE rel_path = ?1 AND content_hash = ?2",
+            params![rel_path, content_hash],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a file's OCR `error` and bump its retry counter — but ONLY while the
+    /// queued hash still matches (same guard as [`Self::mark_ocr_done`]).
+    pub fn mark_ocr_error(&mut self, rel_path: &str, content_hash: &str, message: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ocr_pending
+             SET status = 'error', error = ?3, attempts = attempts + 1
+             WHERE rel_path = ?1 AND content_hash = ?2",
+            params![rel_path, content_hash, message],
+        )?;
+        Ok(())
+    }
+
+    /// Return `error` OCR rows that still have retries left to `pending` so the
+    /// worker retries them when it next goes idle. Mirrors
+    /// [`Self::requeue_errored_extractions`]. Returns how many were re-queued.
+    pub fn requeue_errored_ocr(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE ocr_pending SET status = 'pending', error = NULL
+             WHERE status = 'error' AND attempts < ?1",
+            params![MAX_OCR_ATTEMPTS],
+        )?;
+        Ok(n)
+    }
+
+    /// All stored OCR regions for a file, page-then-insertion order — the input
+    /// to the Cmd+F highlight overlay (Phase 3). Empty when the file was never
+    /// OCR'd (or had no text).
+    pub fn get_ocr_regions(&self, rel_path: &str) -> Result<Vec<OcrRegionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT page, text, x, y, w, h FROM ocr_regions
+             WHERE rel_path = ?1 ORDER BY page, rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![rel_path], |r| {
+                Ok(OcrRegionRow {
+                    page: r.get(0)?,
+                    text: r.get(1)?,
+                    bbox: [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drop a file's OCR bookkeeping (regions + queue row). Used by callers that
+    /// invalidate a file's OCR without going through `remove_file`.
+    pub fn remove_ocr(&mut self, rel_path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
+        self.conn
+            .execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
+        Ok(())
+    }
+
     // --- knowledge model (entities, edges, events — derived read model
     //     for the Map and Timeline screens; replaced wholesale on build) ---
 
@@ -2029,6 +2282,132 @@ mod tests {
     }
 
     #[test]
+    fn ocr_queue_enqueue_next_and_done_makes_text_searchable() {
+        let mut db = Db::open_in_memory().unwrap();
+        // An image indexes as metadata-only with no content — not searchable yet.
+        db.upsert_file("scans/receipt.png", "image", 500, 1, "metadata_only", None, "")
+            .unwrap();
+        assert!(db.search("espresso", 5).unwrap().is_empty());
+
+        assert!(db.enqueue_ocr_if_changed("scans/receipt.png", "h1").unwrap());
+        assert_eq!(
+            db.next_pending_ocr().unwrap(),
+            Some(("scans/receipt.png".into(), "h1".into()))
+        );
+
+        db.mark_ocr_done(
+            "scans/receipt.png", "h1",
+            &[
+                OcrRegionRow { page: 0, text: "espresso machine".into(), bbox: [0.1, 0.2, 0.3, 0.05] },
+                OcrRegionRow { page: 0, text: "total 42.00".into(), bbox: [0.1, 0.3, 0.3, 0.05] },
+            ],
+        )
+        .unwrap();
+
+        // Queue drained, regions stored, and the OCR text is now searchable.
+        assert!(db.next_pending_ocr().unwrap().is_none());
+        let regions = db.get_ocr_regions("scans/receipt.png").unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].text, "espresso machine");
+        assert_eq!(regions[0].bbox, [0.1, 0.2, 0.3, 0.05]);
+        assert!(db
+            .search("espresso", 5)
+            .unwrap()
+            .iter()
+            .any(|h| h.rel_path == "scans/receipt.png"));
+    }
+
+    #[test]
+    fn ocr_enqueue_skips_unchanged_but_requeues_on_change() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        assert!(db.enqueue_ocr_if_changed("a.png", "h1").unwrap());
+        db.mark_ocr_done("a.png", "h1", &[]).unwrap();
+        // Same hash after completion: no re-OCR.
+        assert!(!db.enqueue_ocr_if_changed("a.png", "h1").unwrap());
+        assert!(db.next_pending_ocr().unwrap().is_none());
+        // A new hash (file changed): re-queued.
+        assert!(db.enqueue_ocr_if_changed("a.png", "h2").unwrap());
+        assert_eq!(db.next_pending_ocr().unwrap(), Some(("a.png".into(), "h2".into())));
+    }
+
+    #[test]
+    fn ocr_merges_onto_existing_pdf_text_without_double_appending() {
+        let mut db = Db::open_in_memory().unwrap();
+        // A scanned PDF whose text layer is sparse but non-empty.
+        db.upsert_file("doc.pdf", "pdf", 1, 1, "indexed", None, "page 1").unwrap();
+        db.enqueue_ocr_if_changed("doc.pdf", "h1").unwrap();
+        db.mark_ocr_done(
+            "doc.pdf", "h1",
+            &[OcrRegionRow { page: 0, text: "handwritten clause".into(), bbox: [0.0, 0.0, 1.0, 0.1] }],
+        )
+        .unwrap();
+        let text = db.get_text("doc.pdf").unwrap().unwrap();
+        assert!(text.contains("page 1"), "base text kept: {text}");
+        assert!(text.contains("handwritten clause"), "ocr merged: {text}");
+        // A duplicate mark at the same (now `done`) hash is a no-op: no double append.
+        db.mark_ocr_done(
+            "doc.pdf", "h1",
+            &[OcrRegionRow { page: 0, text: "handwritten clause".into(), bbox: [0.0, 0.0, 1.0, 0.1] }],
+        )
+        .unwrap();
+        let text2 = db.get_text("doc.pdf").unwrap().unwrap();
+        assert_eq!(text, text2, "duplicate done must not re-append");
+    }
+
+    #[test]
+    fn ocr_error_bounded_retries_then_stays_error() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("bad.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        db.enqueue_ocr_if_changed("bad.png", "h1").unwrap();
+        // Fail up to the cap, re-queuing each time it still has budget.
+        let mut errors = 0;
+        loop {
+            match db.next_pending_ocr().unwrap() {
+                Some((rel, hash)) => {
+                    db.mark_ocr_error(&rel, &hash, "vision failed").unwrap();
+                    errors += 1;
+                }
+                None => {
+                    if db.requeue_errored_ocr().unwrap() == 0 {
+                        break;
+                    }
+                }
+            }
+            assert!(errors <= MAX_OCR_ATTEMPTS + 1, "runaway retries");
+        }
+        assert_eq!(errors as i64, MAX_OCR_ATTEMPTS);
+        assert!(db.next_pending_ocr().unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_ocr_done_does_not_clobber_a_re_enqueued_hash() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("a.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        db.enqueue_ocr_if_changed("a.png", "h1").unwrap();
+        // Worker popped h1; meanwhile the scanner re-enqueues h2.
+        db.enqueue_ocr_if_changed("a.png", "h2").unwrap();
+        // The stale h1 result must NOT flip the fresh h2 row to done.
+        db.mark_ocr_done("a.png", "h1", &[]).unwrap();
+        assert_eq!(db.next_pending_ocr().unwrap(), Some(("a.png".into(), "h2".into())));
+    }
+
+    #[test]
+    fn removing_a_file_purges_its_ocr_rows() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("gone.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        db.enqueue_ocr_if_changed("gone.png", "h1").unwrap();
+        db.mark_ocr_done(
+            "gone.png", "h1",
+            &[OcrRegionRow { page: 0, text: "text".into(), bbox: [0.0, 0.0, 1.0, 1.0] }],
+        )
+        .unwrap();
+        db.remove_file("gone.png").unwrap();
+        assert!(db.get_ocr_regions("gone.png").unwrap().is_empty());
+        assert!(db.next_pending_ocr().unwrap().is_none());
+    }
+
+    #[test]
     fn errored_then_changed_file_is_not_counted_as_analyzed() {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
@@ -2553,9 +2932,22 @@ mod tests {
         db.replace_knowledge_model(&ents, &evs, 200).unwrap();
         assert_eq!(db.knowledge_model_built_at().unwrap(), Some(200));
 
+        // Seed the OCR queue + stored regions so clear() proves it wipes them.
+        db.upsert_file("scan.png", "png", 10, 1, "metadata_only", None, "").unwrap();
+        db.enqueue_ocr_if_changed("scan.png", "h1").unwrap();
+        db.mark_ocr_done(
+            "scan.png", "h1",
+            &[OcrRegionRow { page: 0, text: "invoice total".into(), bbox: [0.1, 0.1, 0.2, 0.05] }],
+        )
+        .unwrap();
+        assert!(!db.get_ocr_regions("scan.png").unwrap().is_empty());
+
         db.clear().unwrap();
         assert_eq!(db.file_count().unwrap(), 0);
         assert!(db.search("billing", 10).unwrap().is_empty());
+        // From scratch: OCR regions and queue are gone too.
+        assert!(db.get_ocr_regions("scan.png").unwrap().is_empty());
+        assert!(db.next_pending_ocr().unwrap().is_none());
         // From scratch: no entities/events and no stale build stamp.
         let (entities, edges) = db.list_entities_with_edges().unwrap();
         assert!(entities.is_empty() && edges.is_empty());

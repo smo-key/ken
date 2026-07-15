@@ -65,6 +65,8 @@ struct ActiveProject {
     auto_knowledge: Arc<AutoBuildTracker>,
     /// Stops the per-project extraction worker when this project closes.
     _extraction_worker: StopOnDrop,
+    /// Stops the per-project OCR worker when this project closes.
+    _ocr_worker: StopOnDrop,
     /// Stops the background cloud-hydration worker when this project closes.
     _bg_hydrate: StopOnDrop,
     /// Live research runs: chat/session id → cancel token.
@@ -400,6 +402,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     .map_err(err)?;
 
     let stop = Arc::new(AtomicBool::new(false));
+    let ocr_stop = Arc::new(AtomicBool::new(false));
     let bg_stop = Arc::new(AtomicBool::new(false));
     let info = ProjectInfo::of(&project);
     guard.active = Some(ActiveProject {
@@ -417,6 +420,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         reindex_running: Arc::new(AtomicBool::new(false)),
         auto_knowledge: auto_knowledge.clone(),
         _extraction_worker: StopOnDrop(stop.clone()),
+        _ocr_worker: StopOnDrop(ocr_stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
         transcripts: Arc::new(Mutex::new(TranscriptJobs::default())),
@@ -466,6 +470,18 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let worker_stop = stop.clone();
     std::thread::spawn(move || {
         extraction_worker(worker_app, worker_state, worker_id, worker_stop);
+    });
+
+    // One background OCR worker per open project: drains `ocr_pending`, runs
+    // Vision on images/scanned PDFs, and merges the recognized text into the
+    // index so it becomes searchable (and stores per-region boxes for the
+    // Cmd+F overlay). Independent of the extraction worker above.
+    let ocr_app = app.clone();
+    let ocr_worker_state = state.clone();
+    let ocr_id = project.config.id;
+    let ocr_worker_stop = ocr_stop.clone();
+    std::thread::spawn(move || {
+        ocr_worker(ocr_app, ocr_worker_state, ocr_id, ocr_worker_stop);
     });
 
     // A low-priority worker that downloads cloud-offline DOCUMENTS in the
@@ -952,6 +968,35 @@ fn extracted_text(state: State<SharedState>, rel_path: String) -> CmdResult<Stri
     Ok(ken_core::extract::extract(&abs)
         .map(|e| e.text)
         .unwrap_or_default())
+}
+
+/// One OCR text region for the Phase 3 Cmd+F highlight overlay. `bbox` is
+/// `[x, y, w, h]`, normalized to the unit square with a **top-left** origin
+/// (x grows right, y grows down), matching `crate::ocr::OcrRegion`. Keep this
+/// shape stable — the frontend overlay depends on it.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OcrRegionDto {
+    /// 0-based page index (always 0 for a single image).
+    page: i64,
+    text: String,
+    /// `[x, y, w, h]`, normalized, top-left origin.
+    bbox: [f32; 4],
+}
+
+/// Stored OCR regions for a file, in reading order — the input to the Cmd+F
+/// highlight overlay. Empty when the file was never OCR'd (or held no text);
+/// the OCR pass is asynchronous, so an image just added may return `[]` until
+/// the background worker finishes it.
+#[tauri::command]
+fn get_ocr_regions(state: State<SharedState>, rel_path: String) -> CmdResult<Vec<OcrRegionDto>> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let rows = active.db.get_ocr_regions(&rel_path).map_err(err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OcrRegionDto { page: r.page, text: r.text, bbox: r.bbox })
+        .collect())
 }
 
 #[tauri::command]
@@ -4139,6 +4184,121 @@ fn extraction_worker(
     }
 }
 
+/// Cap on how many pages of a scanned PDF are OCR'd. Rasterizing + recognizing
+/// every page is expensive; the first pages carry the searchable gist, and the
+/// cap bounds the cost of a pathological 500-page scan.
+const MAX_OCR_PAGES: usize = 50;
+
+/// One background OCR worker per open project, mirroring `extraction_worker` but
+/// independent of the local LLM and the knowledge-model coverage accounting. It
+/// drains `ocr_pending`: reads each queued file's bytes, runs Apple Vision
+/// (`ken_core::ocr`), stores the recognized regions, merges the text into
+/// `contents` (→ FTS, so search picks it up), and emits a coalesced
+/// `index-updated`. Errors are recorded with bounded retries; the queue is
+/// self-healing (errored-with-budget rows return to `pending` when it goes
+/// idle). Never runs inline in a scan — OCR is slow and must stay off that path.
+fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut pending_emit = false;
+    // Own connection, opened once and reused; dropped when the project closes.
+    let mut db: Option<Db> = None;
+    while !stop.load(Ordering::SeqCst) {
+        // Resolve base + root under the lock, then drop it before the (slow)
+        // Vision pass so IPC stays responsive.
+        let (base, root) = {
+            let guard = state.lock().unwrap();
+            match guard.active.as_ref() {
+                Some(active) if active.project.config.id == project_id => {
+                    (guard.base_dir.clone(), active.project.root.clone())
+                }
+                _ => return, // project closed or switched — this worker is done
+            }
+        };
+        if db.is_none() {
+            match Db::open(&base, project_id) {
+                Ok(d) => db = Some(d),
+                Err(_) => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        }
+        let db = db.as_mut().expect("opened above");
+        let Ok(next) = db.next_pending_ocr() else {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        let Some((rel, hash)) = next else {
+            // Queue empty: flush a trailing throttled emit, self-heal errored
+            // rows that still have retries, then idle.
+            if pending_emit {
+                let _ = app.emit("index-updated", ScanStats::default());
+                last_emit = Instant::now();
+                pending_emit = false;
+            }
+            let _ = db.requeue_errored_ocr();
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+
+        let abs = root.join(&rel);
+        // A file that vanished or turned back into a cloud placeholder can't be
+        // OCR'd right now: record it as an error (bounded retries) and move on.
+        if cloud::is_placeholder(&abs) {
+            let _ = db.mark_ocr_error(&rel, &hash, "cloud placeholder — bytes not local");
+            continue;
+        }
+        let bytes = match std::fs::read(&abs) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = db.mark_ocr_error(&rel, &hash, &format!("read failed: {e}"));
+                continue;
+            }
+        };
+        if bytes.len() as i64 > scan::MAX_OCR_IMAGE_BYTES && !is_pdf(&rel) {
+            let _ = db.mark_ocr_error(&rel, &hash, "image too large for OCR");
+            continue;
+        }
+        let result = if is_pdf(&rel) {
+            ken_core::ocr::ocr_pdf_bytes(&bytes, MAX_OCR_PAGES)
+        } else {
+            ken_core::ocr::ocr_image_bytes(&bytes)
+        };
+        match result {
+            Ok(regions) => {
+                let rows: Vec<ken_core::db::OcrRegionRow> = regions
+                    .into_iter()
+                    .map(|r| ken_core::db::OcrRegionRow {
+                        page: r.page as i64,
+                        text: r.text,
+                        bbox: r.bbox,
+                    })
+                    .collect();
+                if db.mark_ocr_done(&rel, &hash, &rows).is_ok() {
+                    pending_emit = true;
+                    if last_emit.elapsed() >= Duration::from_millis(750) {
+                        let _ = app.emit("index-updated", ScanStats::default());
+                        last_emit = Instant::now();
+                        pending_emit = false;
+                    }
+                }
+                // Loop straight to the next queued file.
+            }
+            Err(e) => {
+                let _ = db.mark_ocr_error(&rel, &hash, &e.to_string());
+                // Brief backoff so a bad run doesn't spin.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// True for a `.pdf` rel path (OCR routes PDFs through the page rasterizer,
+/// everything else through the single-image path).
+fn is_pdf(rel: &str) -> bool {
+    rel.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 // ---------- chat commands ----------
 
 #[tauri::command]
@@ -4652,6 +4812,7 @@ pub fn run() {
             save_file,
             file_meta,
             extracted_text,
+            get_ocr_regions,
             reindex,
             move_file,
             delete_file,

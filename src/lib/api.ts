@@ -329,6 +329,19 @@ export interface EventRow {
   source: string;
 }
 
+/**
+ * One OCR text region for the Cmd+F highlight overlay (Phase 3). `bbox` is
+ * `[x, y, w, h]`, each normalized to `0..1` with a top-left origin (x grows
+ * right, y grows down) — treat it like a CSS/image rectangle. `page` is the
+ * 0-based page index (always 0 for a single image).
+ */
+export interface OcrRegion {
+  page: number;
+  text: string;
+  /** `[x, y, w, h]`, normalized, top-left origin. */
+  bbox: [number, number, number, number];
+}
+
 /** The whole stored knowledge model — small by construction. */
 export interface KnowledgeModel {
   entities: EntityRow[];
@@ -493,6 +506,14 @@ export const api = {
   fileMeta: (relPath: string) => invoke<FileRow | null>("file_meta", { relPath }),
   extractedText: (relPath: string) =>
     invoke<string>("extracted_text", { relPath }),
+  /**
+   * Stored OCR regions for a file (images / scanned PDFs), in reading order —
+   * the input to the Cmd+F highlight overlay. OCR runs in the background, so a
+   * freshly added image may return `[]` until the worker finishes it; the
+   * `index-updated` event fires when new OCR text lands.
+   */
+  getOcrRegions: (relPath: string) =>
+    invoke<OcrRegion[]>("get_ocr_regions", { relPath }),
   reindex: () => invoke<ScanStats>("reindex"),
   moveFile: (fromRel: string, toRel: string) =>
     invoke<void>("move_file", { fromRel, toRel }),

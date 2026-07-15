@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import type { PageViewport, PDFDocumentProxy } from "pdfjs-dist";
   import type { TextItem } from "pdfjs-dist/types/src/display/api";
-  import { api } from "../../lib/api";
+  import { api, type OcrRegion } from "../../lib/api";
   import { MATCH_CAP, findTextMatches } from "../../lib/find";
   import { find, type FindAdapter } from "../../lib/find.svelte";
   import PreviewLoading from "./PreviewLoading.svelte";
@@ -23,16 +23,30 @@
     items?: TextItem[];
   }
 
-  interface Hit {
+  /** A hit on a page's pdf.js text layer. */
+  interface TextHit {
+    kind: "text";
     page: number; // index into `pages`
     item: number;
     start: number;
   }
 
+  /** A hit on an OCR region — for scanned pages with no text layer. */
+  interface OcrHit {
+    kind: "ocr";
+    page: number; // index into `pages`
+    /** `[x, y, w, h]`, normalized, top-left origin — same convention as the overlay. */
+    bbox: [number, number, number, number];
+  }
+
+  type Hit = TextHit | OcrHit;
+
   let doc: PDFDocumentProxy | null = null;
   let pages: Page[] = [];
   let hits: Hit[] = [];
   let boxes: HTMLElement[] = [];
+  /** OCR regions indexed by 0-based page, for pages whose text layer is empty. */
+  let ocrByPage = new Map<number, OcrRegion[]>();
 
   // A PDF is rendered to canvas, so a hit has to be drawn as a box over the
   // page. Text is read per page, and only for the first TEXT_PAGE_CAP pages —
@@ -61,7 +75,32 @@
    * is interpolated by character count — exact for the monospaced and near
    * enough for everything else to land the highlight on the right words.
    */
-  function draw(hit: Hit, queryLength: number, current: boolean): HTMLElement | null {
+  /** Whether a page carries a real pdf.js text layer (vs. a bare scan). Pages
+      past TEXT_PAGE_CAP have no items loaded and count as text-less, so OCR
+      covers them. */
+  function pageHasText(p: number): boolean {
+    const items = pages[p].items;
+    return !!items && items.some((it) => it.str.trim().length > 0);
+  }
+
+  /** An OCR hit's box: the normalized top-left bbox maps straight to the
+      per-page overlay's percentage coordinates — same convention `.page-overlay`
+      already uses, so no transform math. */
+  function drawOcr(hit: OcrHit, current: boolean): HTMLElement {
+    const page = pages[hit.page];
+    const [x, y, w, h] = hit.bbox;
+    const box = document.createElement("div");
+    box.className = current ? "pdf-hit current" : "pdf-hit";
+    box.style.left = `${x * 100}%`;
+    box.style.top = `${y * 100}%`;
+    box.style.width = `${w * 100}%`;
+    box.style.height = `${h * 100}%`;
+    page.overlay.appendChild(box);
+    boxes.push(box);
+    return box;
+  }
+
+  function draw(hit: TextHit, queryLength: number, current: boolean): HTMLElement | null {
     const page = pages[hit.page];
     const item = page.items?.[hit.item];
     if (!item || !item.str.length) return null;
@@ -120,18 +159,35 @@
         await loadText();
         if (gen !== searchGen) return { total: 0 }; // superseded; leave shared state alone
 
-        // A match split across two text runs ("in-" / "voice") isn't found; the
-        // runs are what pdf.js gives us, and stitching them would misplace the box.
+        // Page-then-position order: for each page, use its pdf.js text layer if
+        // it has one, else fall back to OCR regions (a scanned page). Never both
+        // — a page with a real text layer would otherwise double-count. A match
+        // split across two text runs ("in-" / "voice") isn't found; the runs are
+        // what pdf.js gives us, and stitching them would misplace the box.
         const found: Hit[] = [];
         for (let p = 0; p < pages.length && found.length < MATCH_CAP; p++) {
-          const items = pages[p].items ?? [];
-          for (let i = 0; i < items.length && found.length < MATCH_CAP; i++) {
-            for (const start of findTextMatches(
-              items[i].str,
-              query,
-              MATCH_CAP - found.length,
-            ).starts) {
-              found.push({ page: p, item: i, start });
+          if (pageHasText(p)) {
+            const items = pages[p].items ?? [];
+            for (let i = 0; i < items.length && found.length < MATCH_CAP; i++) {
+              for (const start of findTextMatches(
+                items[i].str,
+                query,
+                MATCH_CAP - found.length,
+              ).starts) {
+                found.push({ kind: "text", page: p, item: i, start });
+              }
+            }
+          } else {
+            for (const region of ocrByPage.get(p) ?? []) {
+              if (found.length >= MATCH_CAP) break;
+              const count = findTextMatches(
+                region.text,
+                query,
+                MATCH_CAP - found.length,
+              ).starts.length;
+              for (let i = 0; i < count && found.length < MATCH_CAP; i++) {
+                found.push({ kind: "ocr", page: p, bbox: region.bbox });
+              }
             }
           }
         }
@@ -141,7 +197,10 @@
         // leave orphaned boxes on the page.
         clearBoxes();
         hits = found;
-        for (const hit of found) draw(hit, query.length, false);
+        for (const hit of found) {
+          if (hit.kind === "ocr") drawOcr(hit, false);
+          else draw(hit, query.length, false);
+        }
         return {
           total: found.length,
           capped: found.length >= MATCH_CAP,
@@ -209,6 +268,30 @@
     } catch (e) {
       loading = false;
       error = `Couldn't render this PDF — ${e}. Try “Open in default app”.`;
+    }
+
+    // OCR is independent of rendering — makes scanned pages (no text layer)
+    // findable. A failure (non-macOS, still processing) just leaves the PDF as a
+    // pure text-layer search.
+    try {
+      const regions = await api.getOcrRegions(relPath);
+      if (regions.length) {
+        const byPage = new Map<number, OcrRegion[]>();
+        for (const region of regions) {
+          const list = byPage.get(region.page);
+          if (list) list.push(region);
+          else byPage.set(region.page, [region]);
+        }
+        // Position order within each page (top-to-bottom, then left-to-right) so
+        // OCR match navigation is coherent.
+        for (const list of byPage.values()) {
+          list.sort((a, b) => a.bbox[1] - b.bbox[1] || a.bbox[0] - b.bbox[0]);
+        }
+        ocrByPage = byPage;
+        find.refresh(); // regions arrived after the user already typed a query
+      }
+    } catch {
+      // Leave the text-layer-only behavior in place.
     }
   });
 

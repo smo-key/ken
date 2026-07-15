@@ -30,6 +30,34 @@ pub struct ScanStats {
     pub videos_needing_transcript: Vec<String>,
 }
 
+/// Images larger than this are not queued for OCR. Vision rasterization +
+/// recognition on a very large image is expensive and rarely worth it; the file
+/// stays name-searchable and its bytes are never read for OCR. Independent of
+/// [`extract::MAX_EXTRACT_BYTES`] because OCR is a heavier, opt-in pass.
+pub const MAX_OCR_IMAGE_BYTES: i64 = 25 * 1024 * 1024;
+
+/// A scanned/image PDF whose extractable text layer holds fewer than this many
+/// non-whitespace characters is treated as "low text" and queued for OCR. A
+/// genuine text PDF clears this easily (hundreds+ of characters per page), so
+/// text PDFs are never needlessly OCR'd; a scanned one yields ~nothing and gets
+/// picked up. Deliberately a small absolute floor — cheap to compute and safely
+/// below any real document's body text.
+pub const PDF_OCR_LOW_TEXT_CHARS: usize = 64;
+
+/// Does a PDF's extracted text look too sparse to be a real text layer (i.e. a
+/// scanned/image PDF worth OCR'ing)? Counts non-whitespace characters only, so
+/// page breaks and stray whitespace don't inflate the estimate.
+pub fn pdf_text_is_sparse(text: &str) -> bool {
+    text.chars().filter(|c| !c.is_whitespace()).count() < PDF_OCR_LOW_TEXT_CHARS
+}
+
+/// SVG (and any other vector image) can't be rasterized by ImageIO, so the OCR
+/// bridge errors on it — never enqueue it. The only vector kind among the image
+/// extensions is `.svg`.
+fn is_vector_image(rel: &str) -> bool {
+    rel.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+}
+
 /// Machine-generated folders no knowledge project wants indexed. (Hidden
 /// folders are already skipped.)
 pub const JUNK_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "__pycache__", "venv"];
@@ -206,6 +234,26 @@ fn index_one(
         let hash = crate::knowledge_model::content_hash(&text);
         db.enqueue_extraction_if_changed(rel, &hash)?;
     }
+    // OCR enqueue (Phase 2): images and low-text (scanned) PDFs get queued for
+    // a background OCR pass so their pixels become searchable text. Keep this
+    // OUT of the knowledge-model extraction queue/coverage — it's a separate
+    // pipeline. Never run OCR inline here: it reads bytes and hits Vision, which
+    // would stall the scan. Keyed by a cheap per-version hash so an unchanged
+    // rescan (which never re-runs `index_one`) never re-OCRs, and a real change
+    // (new size/mtime → new hash) re-queues. Only reached when the file was read
+    // (not a cloud placeholder, which returned early above).
+    if status != STATUS_FAILED {
+        let ocr_hash = crate::knowledge_model::content_hash(&format!("{size}:{mtime}"));
+        match kind {
+            FileKind::Image if !is_vector_image(rel) && size <= MAX_OCR_IMAGE_BYTES => {
+                db.enqueue_ocr_if_changed(rel, &ocr_hash)?;
+            }
+            FileKind::Pdf if pdf_text_is_sparse(&text) => {
+                db.enqueue_ocr_if_changed(rel, &ocr_hash)?;
+            }
+            _ => {}
+        }
+    }
     Ok(status)
 }
 
@@ -322,6 +370,77 @@ mod tests {
         db.mark_extraction_done("note.md", &crate::knowledge_model::content_hash("Priya leads billing."), 1).unwrap();
         index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false).unwrap();
         assert!(db.next_pending_extraction().unwrap().is_none());
+    }
+
+    #[test]
+    fn images_and_sparse_pdfs_enqueue_ocr_but_text_pdfs_and_svg_do_not() {
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+
+        // An image (no EXIF text): enqueued for OCR.
+        fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
+        let meta = project.root.join("photo.png").metadata().unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false).unwrap();
+        assert_eq!(
+            db.next_pending_ocr().unwrap().map(|(r, _)| r),
+            Some("photo.png".to_string()),
+            "an image should be queued for OCR"
+        );
+        // Drain it so the next assertions start clean.
+        let (rel, hash) = db.next_pending_ocr().unwrap().unwrap();
+        db.mark_ocr_done(&rel, &hash, &[]).unwrap();
+
+        // An SVG is vector-only — the OCR bridge can't rasterize it — so skip.
+        fs::write(project.root.join("logo.svg"), b"<svg></svg>").unwrap();
+        let m = project.root.join("logo.svg").metadata().unwrap();
+        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false).unwrap();
+        assert!(db.next_pending_ocr().unwrap().is_none(), "SVG must not enqueue OCR");
+
+        // The fixture PDF has only a one-line text layer (sparse) — exactly the
+        // scanned/image case the heuristic catches — so it IS queued for OCR.
+        // (A genuine multi-paragraph text PDF clears the threshold; that path is
+        // covered directly by `pdf_low_text_heuristic`.)
+        let pdf = project.root.join("vendor/contract.pdf");
+        let pm = pdf.metadata().unwrap();
+        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false).unwrap();
+        assert_eq!(
+            db.next_pending_ocr().unwrap().map(|(r, _)| r),
+            Some("vendor/contract.pdf".to_string()),
+            "a sparse (scanned-style) PDF should be queued for OCR"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn ocr_enqueue_is_idempotent_across_unchanged_rescans() {
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        fs::write(project.root.join("photo.png"), b"bytes").unwrap();
+        let meta = project.root.join("photo.png").metadata().unwrap();
+        let (size, mtime) = (meta.len() as i64, 5);
+
+        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        let (rel, hash) = db.next_pending_ocr().unwrap().unwrap();
+        db.mark_ocr_done(&rel, &hash, &[]).unwrap();
+
+        // Same (size, mtime): re-indexing does NOT re-OCR.
+        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        assert!(db.next_pending_ocr().unwrap().is_none(), "unchanged image must not re-OCR");
+
+        // A changed mtime (new version) re-queues it.
+        index_one(&project, &mut db, "photo.png", size, mtime + 1, false).unwrap();
+        assert_eq!(
+            db.next_pending_ocr().unwrap().map(|(r, _)| r),
+            Some("photo.png".to_string())
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn pdf_low_text_heuristic() {
+        assert!(pdf_text_is_sparse(""));
+        assert!(pdf_text_is_sparse("  \n \t 12 \n"));
+        assert!(!pdf_text_is_sparse(&"word ".repeat(50)));
     }
 
     #[test]
