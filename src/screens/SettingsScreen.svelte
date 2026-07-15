@@ -272,6 +272,26 @@
     </div>
 
     <div class="card">
+      <div class="card-title">Video transcription</div>
+      <div class="row">
+        <label class="radio">
+          <input
+            type="checkbox"
+            checked={app.transcribeVideosOnIndex}
+            onchange={(e) =>
+              void app.setTranscribeVideosOnIndex(e.currentTarget.checked)}
+          />
+          Transcribe videos during indexing
+        </label>
+      </div>
+      <p class="note">
+        Runs on-device speech-to-text (Whisper) to make video audio searchable
+        as files are indexed. Off by default because it's slow and CPU-heavy;
+        you can always transcribe a single video on demand from its player.
+      </p>
+    </div>
+
+    <div class="card">
       <div class="card-title">Sync &amp; collaboration</div>
       {#if sync?.mode === "git"}
         <div class="row">

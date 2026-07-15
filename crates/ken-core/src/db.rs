@@ -598,6 +598,14 @@ impl Db {
         tx.execute("DELETE FROM extractions", [])?;
         tx.execute("DELETE FROM entities", [])?; // cascades entity_edges
         tx.execute("DELETE FROM events", [])?;
+        // Drop the knowledge-model build stamp too, so after a reindex the Map
+        // reads as "not built yet" instead of showing a stale "built at" time
+        // for a model whose entities/events we just deleted. User data
+        // (chats/chat_messages) is intentionally left untouched.
+        tx.execute(
+            "DELETE FROM meta WHERE key = 'knowledge_model_built_at'",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2540,9 +2548,19 @@ mod tests {
     #[test]
     fn clear_empties_everything() {
         let mut db = seeded();
+        // Stamp a knowledge-model build so we can prove clear() resets it.
+        let (ents, evs) = sample_model();
+        db.replace_knowledge_model(&ents, &evs, 200).unwrap();
+        assert_eq!(db.knowledge_model_built_at().unwrap(), Some(200));
+
         db.clear().unwrap();
         assert_eq!(db.file_count().unwrap(), 0);
         assert!(db.search("billing", 10).unwrap().is_empty());
+        // From scratch: no entities/events and no stale build stamp.
+        let (entities, edges) = db.list_entities_with_edges().unwrap();
+        assert!(entities.is_empty() && edges.is_empty());
+        assert!(db.list_events().unwrap().is_empty());
+        assert!(db.knowledge_model_built_at().unwrap().is_none());
     }
 
     #[test]

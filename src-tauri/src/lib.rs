@@ -58,6 +58,9 @@ struct ActiveProject {
     digest_running: Arc<AtomicBool>,
     /// True while a knowledge-model build thread is running.
     knowledge_running: Arc<AtomicBool>,
+    /// True while a background reindex (clear + full rescan) is running, so a
+    /// second `reindex` command can't stack another rebuild on top.
+    reindex_running: Arc<AtomicBool>,
     /// Change/scan/build bookkeeping behind automatic Map & Timeline builds.
     auto_knowledge: Arc<AutoBuildTracker>,
     /// Stops the per-project extraction worker when this project closes.
@@ -411,6 +414,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         digest_running: Arc::new(AtomicBool::new(false)),
         knowledge_running: Arc::new(AtomicBool::new(false)),
+        reindex_running: Arc::new(AtomicBool::new(false)),
         auto_knowledge: auto_knowledge.clone(),
         _extraction_worker: StopOnDrop(stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
@@ -952,14 +956,72 @@ fn extracted_text(state: State<SharedState>, rel_path: String) -> CmdResult<Stri
 
 #[tauri::command]
 fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
-    let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
-    let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
-    let videos = stats.videos_needing_transcript.clone();
-    drop(guard);
-    enqueue_transcriptions(&app, state.inner(), &videos);
-    let _ = app.emit("index-updated", stats.clone());
-    Ok(stats)
+    // Reindex is a full `db.clear()` + recursive rescan — far too heavy to run
+    // inline on the IPC thread while holding the global state mutex (that froze
+    // the whole app and every worker that needs the lock). Instead we mirror the
+    // initial activation scan: lock only long enough to read what the rebuild
+    // needs (and to claim a guard so two rebuilds can't stack), then run the
+    // clear+rescan on a detached thread with its OWN `Db::open` handle. That
+    // handle writes to the same SQLite file the main `active.db` reads, so once
+    // it commits, the main handle and the read-only search handle see the
+    // rebuilt index. Progress reaches the UI via `scan-started`/`index-updated`
+    // /`scan-error`, and the command returns immediately so the button never
+    // hangs.
+    let (project, base, sync, knowledge, running) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        (
+            active.project.clone(),
+            guard.base_dir.clone(),
+            active.sync.clone(),
+            active.auto_knowledge.clone(),
+            active.reindex_running.clone(),
+        )
+    };
+    // Already rebuilding? Don't stack a second clear+rescan.
+    if running.swap(true, Ordering::SeqCst) {
+        return Ok(ScanStats::default());
+    }
+
+    let bg_app = app.clone();
+    let bg_state = state.inner().clone();
+    std::thread::spawn(move || {
+        match Db::open(&base, project.config.id) {
+            Ok(mut db) => {
+                let _ = bg_app.emit("scan-started", ());
+                match scan::reindex(&project, &mut db) {
+                    Ok(stats) => {
+                        // A from-scratch rebuild touches everything: push the
+                        // changed set to sync, trigger a knowledge rebuild, and
+                        // re-enqueue any videos that still need transcripts.
+                        if !stats.changed_paths.is_empty() {
+                            sync.changed(stats.changed_paths.clone());
+                        }
+                        knowledge.changed();
+                        enqueue_transcriptions(
+                            &bg_app,
+                            &bg_state,
+                            &stats.videos_needing_transcript,
+                        );
+                        let _ = bg_app.emit("index-updated", stats);
+                    }
+                    Err(e) => {
+                        let _ = bg_app.emit("scan-error", e.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = bg_app.emit("scan-error", e.to_string());
+            }
+        }
+        // The folder is no longer being walked — a knowledge build may now read
+        // a complete file list.
+        knowledge.scan_finished();
+        running.store(false, Ordering::SeqCst);
+    });
+
+    // Return immediately; the real stats arrive on the `index-updated` event.
+    Ok(ScanStats::default())
 }
 
 #[tauri::command]
@@ -2226,6 +2288,11 @@ fn enqueue_transcriptions(app: &AppHandle, state: &SharedState, rels: &[String])
         let Some(active) = guard.active.as_ref() else {
             return;
         };
+        // Auto-transcription during indexing is opt-in (off by default). The
+        // manual `generate_transcript` command bypasses this and always runs.
+        if !transcript::transcribe_on_index_enabled(&active.project) {
+            return;
+        }
         (
             active.project.root.clone(),
             guard.base_dir.clone(),
@@ -3394,6 +3461,30 @@ fn set_background_index(state: State<SharedState>, enabled: bool) -> CmdResult<(
         .config
         .extra
         .insert("backgroundIndex".into(), serde_json::Value::Bool(enabled));
+    active.project.save().map_err(err)
+}
+
+/// Is automatic on-device transcription of videos during indexing enabled?
+#[tauri::command]
+fn get_transcribe_on_index(state: State<SharedState>) -> CmdResult<bool> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    Ok(transcript::transcribe_on_index_enabled(&active.project))
+}
+
+/// Turn automatic video transcription during indexing on or off. Persisted in
+/// `project.json`; off by default. Every automatic scan reads this before
+/// enqueueing Whisper jobs, so the manual `generate_transcript` command is
+/// unaffected either way.
+#[tauri::command]
+fn set_transcribe_on_index(state: State<SharedState>, enabled: bool) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    active
+        .project
+        .config
+        .extra
+        .insert("transcribeVideosOnIndex".into(), serde_json::Value::Bool(enabled));
     active.project.save().map_err(err)
 }
 
@@ -4612,6 +4703,8 @@ pub fn run() {
             set_ingest_runner_mode,
             get_background_index,
             set_background_index,
+            get_transcribe_on_index,
+            set_transcribe_on_index,
             claude_doctor,
             mcp_info,
             current_digest,

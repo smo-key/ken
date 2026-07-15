@@ -103,6 +103,10 @@ class AppStore {
    *  default). Shared so Settings and the Home footer agree instantly. */
   backgroundIndex = $state(true);
 
+  /** Whether videos are auto-transcribed on-device during indexing (off by
+   *  default — Whisper is slow). Shared so Settings reflects it instantly. */
+  transcribeVideosOnIndex = $state(false);
+
   /** Files the user has ignored (per-user, app-data, never synced). Their
    *  issues are hidden but they stay indexed and searchable. */
   ignored = $state<string[]>([]);
@@ -239,6 +243,7 @@ class AppStore {
     this.syncDetail = null;
     this.loadProjectLocalState();
     void this.loadBackgroundIndex();
+    void this.loadTranscribeOnIndex();
     void this.loadIgnored();
     void this.loadUnread();
     this.screen = "home";
@@ -258,6 +263,17 @@ class AppStore {
   async setBackgroundIndex(enabled: boolean) {
     this.backgroundIndex = enabled;
     await api.setBackgroundIndex(enabled);
+  }
+
+  /** Read the persisted auto-transcription preference for the open project. */
+  private async loadTranscribeOnIndex() {
+    this.transcribeVideosOnIndex = await api.getTranscribeOnIndex().catch(() => false);
+  }
+
+  /** Toggle automatic video transcription during indexing (persisted). */
+  async setTranscribeVideosOnIndex(enabled: boolean) {
+    this.transcribeVideosOnIndex = enabled;
+    await api.setTranscribeOnIndex(enabled);
   }
 
   /** Restore tabs + favorites + recents for the current project from localStorage. */

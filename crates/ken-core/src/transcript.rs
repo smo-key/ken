@@ -8,7 +8,24 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::project::Project;
 use crate::{Error, Result};
+
+/// Is automatic on-device transcription during indexing enabled for this
+/// project?
+///
+/// Persisted like the other per-project toggles — `project.json` extra
+/// `"transcribeVideosOnIndex"` — but OFF by default: Whisper transcription is
+/// slow and CPU-heavy, so it only runs when the user opts in. The manual
+/// "generate transcript" action is unaffected by this flag.
+pub fn transcribe_on_index_enabled(project: &Project) -> bool {
+    project
+        .config
+        .extra
+        .get("transcribeVideosOnIndex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 /// One transcript line with its time window. Untimed sources (a plain docx)
 /// still land here with synthetic sequential windows so the emitted track is
@@ -698,6 +715,32 @@ mod tests {
         let both = transcription_blocker(false, false, model).unwrap();
         assert!(both.contains("ffmpeg"));
         assert!(both.contains("ggml-base.en.bin"));
+    }
+
+    #[test]
+    fn transcribe_on_index_defaults_off_and_honors_flag() {
+        use crate::project::{Project, ProjectConfig};
+        let mut config = ProjectConfig {
+            name: "t".into(),
+            id: uuid::Uuid::new_v4(),
+            excluded: Vec::new(),
+            extra: serde_json::Map::new(),
+        };
+        let project = Project { root: PathBuf::from("/tmp/x"), config: config.clone() };
+        // Absent → off.
+        assert!(!transcribe_on_index_enabled(&project));
+
+        config
+            .extra
+            .insert("transcribeVideosOnIndex".into(), serde_json::Value::Bool(true));
+        let on = Project { root: PathBuf::from("/tmp/x"), config: config.clone() };
+        assert!(transcribe_on_index_enabled(&on));
+
+        config
+            .extra
+            .insert("transcribeVideosOnIndex".into(), serde_json::Value::Bool(false));
+        let off = Project { root: PathBuf::from("/tmp/x"), config };
+        assert!(!transcribe_on_index_enabled(&off));
     }
 
     #[test]

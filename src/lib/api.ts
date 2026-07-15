@@ -593,6 +593,10 @@ export const api = {
   getBackgroundIndex: () => invoke<boolean>("get_background_index"),
   setBackgroundIndex: (enabled: boolean) =>
     invoke<void>("set_background_index", { enabled }),
+  /// Whether videos are auto-transcribed on-device (Whisper) during indexing.
+  getTranscribeOnIndex: () => invoke<boolean>("get_transcribe_on_index"),
+  setTranscribeOnIndex: (enabled: boolean) =>
+    invoke<void>("set_transcribe_on_index", { enabled }),
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
 

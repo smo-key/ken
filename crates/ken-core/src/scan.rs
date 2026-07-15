@@ -244,8 +244,22 @@ fn is_hidden_rel(rel: &str) -> bool {
 }
 
 /// Full rebuild: drop everything and rescan.
+///
+/// "Everything" includes the on-disk transcript cache (`.ken/transcripts`): a
+/// reindex means "start from scratch", so regenerated transcripts must not
+/// reuse stale VTTs keyed off paths that may no longer exist. The DB is cleared
+/// (files, contents, extractions, entities, events, knowledge-model stamp) and
+/// the cache dir removed before the fresh scan repopulates the index.
 pub fn reindex(project: &Project, db: &mut Db) -> Result<ScanStats> {
     db.clear()?;
+    // Remove the generated-transcript cache. Ignore a missing dir (nothing was
+    // ever transcribed); surface real I/O errors.
+    let cache = crate::transcript::cache_dir(&project.root);
+    match std::fs::remove_dir_all(&cache) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(crate::Error::io(&cache, e)),
+    }
     scan(project, db)
 }
 
@@ -570,9 +584,18 @@ mod tests {
         // Poison the index, then reindex.
         db.upsert_file("ghost.md", "md", 1, 1, "indexed", None, "ghost content")
             .unwrap();
+        // Seed a stale generated-transcript cache; reindex must purge it so
+        // regenerated transcripts never reuse it.
+        let cache = crate::transcript::cache_dir(&project.root);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("stale.vtt"), "WEBVTT\n").unwrap();
+        assert!(cache.exists());
+
         let stats = reindex(&project, &mut db).unwrap();
         assert_eq!(stats.added, 11);
         assert!(db.search("ghost content", 5).unwrap().is_empty());
+        // From scratch: the on-disk transcript cache is gone.
+        assert!(!cache.exists(), "transcript cache dir should be removed");
     }
 
     #[test]
