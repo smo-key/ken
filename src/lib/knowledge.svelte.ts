@@ -19,11 +19,19 @@ class KnowledgeStore {
     );
   }
 
-  /** "N of M files analyzed", or null when fully caught up / nothing indexed. */
-  get coverage(): { analyzed: number; total: number } | null {
+  /**
+   * "N of M files analyzed" (plus any terminal failures), or null when fully
+   * caught up with no failures / nothing indexed. When every extractable file
+   * has been accounted for (analyzed + failed >= total) but some failed, we
+   * still surface the line so the failures aren't silently hidden.
+   */
+  get coverage(): { analyzed: number; total: number; failed: number } | null {
     const m = this.model;
-    if (!m || m.total === 0 || m.analyzed >= m.total) return null;
-    return { analyzed: m.analyzed, total: m.total };
+    if (!m || m.total === 0) return null;
+    const failed = m.failed ?? 0;
+    // Nothing left to analyze and nothing failed → fully caught up, hide.
+    if (m.analyzed >= m.total && failed === 0) return null;
+    return { analyzed: m.analyzed, total: m.total, failed };
   }
 
   /** The local model can't extract right now — show the plain notice. */

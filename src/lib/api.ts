@@ -341,6 +341,8 @@ export interface KnowledgeModel {
   /** Files extracted so far / indexed files — the coverage line. */
   analyzed: number;
   total: number;
+  /** Files whose extraction terminally failed (retry budget exhausted). */
+  failed: number;
   /** `ready` | `notInstalled` | `error`. */
   llmStatus: "ready" | "notInstalled" | "error";
   llmError: string | null;

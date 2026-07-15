@@ -382,8 +382,8 @@
       {#if knowledge.llmPaused}
         <div class="status-overlay">{knowledge.llmNotice}</div>
       {:else if knowledge.coverage}
-        <div class="status-overlay pulse">
-          {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed
+        <div class="status-overlay" class:pulse={knowledge.coverage.analyzed < knowledge.coverage.total}>
+          {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed{#if knowledge.coverage.failed > 0}<span class="muted"> · {knowledge.coverage.failed} failed</span>{/if}
         </div>
       {:else if knowledge.building}
         <div class="status-overlay pulse">Deep rebuild in progress…</div>
@@ -651,6 +651,10 @@
   }
   .status-overlay.error {
     color: var(--danger);
+  }
+  /* The failed tally rides alongside the coverage count as a quiet aside. */
+  .status-overlay .muted {
+    color: var(--ink-tertiary);
   }
 
   .detail {
