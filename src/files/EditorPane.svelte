@@ -6,6 +6,7 @@
   import Lock from "@lucide/svelte/icons/lock";
   import Search from "@lucide/svelte/icons/search";
   import { api, type FileRow } from "../lib/api";
+  import type { HydrationProgress } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { find } from "../lib/find.svelte";
   import FindBar from "./FindBar.svelte";
@@ -36,6 +37,13 @@
   // Cloud-storage placeholder being fetched, and why a fetch gave up.
   let downloading = $state(false);
   let cloudError = $state<string | null>(null);
+  // Live byte progress for THIS file's cloud pull (on-demand or the background
+  // worker happening to fetch the open file).
+  let hydration = $state<HydrationProgress | null>(null);
+
+  function fmtMb(n: number): string {
+    return `${Math.max(1, Math.round(n / (1024 * 1024)))} MB`;
+  }
   // A cloud-only file too big to auto-download (> CLOUD_DOWNLOAD_MAX): we hold
   // off the fetch and show a prompt so the user opts into the pull explicitly.
   let needsCloudConfirm = $state(false);
@@ -55,6 +63,7 @@
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let latest = "";
   let unlisten: (() => void) | undefined;
+  let unlistenHydration: (() => void) | undefined;
 
   // Editing limits: a 25MB CSV opened as an editable grid (or a huge doc fed
   // to the WYSIWYG editor) allocates unboundedly and freezes the app.
@@ -92,11 +101,15 @@
   onMount(async () => {
     await load();
     unlisten = await api.onIndexUpdated(() => void checkDisk());
+    unlistenHydration = await api.onHydrationProgress((ev) => {
+      if (ev.relPath === relPath) hydration = ev;
+    });
   });
 
   async function load(forceCloudDownload = false) {
     loadError = null;
     cloudError = null;
+    hydration = null;
     needsCloudConfirm = false;
     resolving = true;
     try {
@@ -152,6 +165,7 @@
 
   onDestroy(() => {
     unlisten?.();
+    unlistenHydration?.();
     if (saveTimer) {
       clearTimeout(saveTimer);
       if (dirty) void doSave(); // flush pending edits on close
@@ -305,6 +319,12 @@
     <PreviewLoading
       label="Downloading from the cloud"
       detail="{relPath.split('/').pop()} is stored online only. This can take a moment for a large file."
+      progress={hydration && hydration.total > 0
+        ? {
+            pct: Math.round((hydration.downloaded / hydration.total) * 100),
+            note: `${fmtMb(hydration.downloaded)} / ${fmtMb(hydration.total)}`,
+          }
+        : { pct: null }}
     />
   {:else if cloudError}
     <div class="cloud">
