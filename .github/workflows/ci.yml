@@ -134,13 +134,15 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
+      # pwsh, not bash: under Git Bash /usr/bin/link (coreutils) shadows the
+      # MSVC linker that the msvc-dev-cmd environment puts on PATH.
       - name: Build ken-mcp sidecar
-        shell: bash
+        shell: pwsh
         run: |
           cargo build --release -p ken-mcp
-          mkdir -p src-tauri/binaries
-          triple=$(rustc -vV | sed -n 's/^host: //p')
-          cp target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          Copy-Item target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
 
       # createUpdaterArtifacts is enabled in tauri.conf.json, so `tauri build`
       # needs the updater signing key even in CI.

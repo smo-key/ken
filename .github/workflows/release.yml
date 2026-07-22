@@ -111,16 +111,24 @@ jobs:
         run: pnpm install
 
       - name: Build ken-mcp
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           cargo build --release -p ken-mcp
           mkdir -p src-tauri/binaries
           triple=$(rustc -vV | sed -n 's/^host: //p')
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
-          else
-            cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$triple"
-          fi
+          cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$triple"
+
+      # pwsh, not bash: under Git Bash /usr/bin/link (coreutils) shadows the
+      # MSVC linker that the msvc-dev-cmd environment puts on PATH.
+      - name: Build ken-mcp sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p ken-mcp
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          Copy-Item target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
 
       - name: Build app bundles and create draft release
         id: tauri
