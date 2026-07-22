@@ -61,7 +61,9 @@ struct HydrationProgress {
 }
 ```
 
-- `download_placeholder` (on-demand hydration) and the background hydration worker chunk the byte read and emit this event, throttled via the existing `ProgressThrottle` (1% / 250ms).
+- Hydration is provider-driven (OneDrive/iCloud materialize the file; the app only polls in `cloud::poll_until_hydrated`), so the app cannot count bytes it reads. Instead, on each poll tick (2s) the hydration path samples on-disk **allocated** bytes (`MetadataExt::blocks() * 512`) against the file's logical size (`len()`, which macOS reports in full even for dataless files) and emits that as `downloaded`/`total`, gated by the existing `ProgressThrottle`.
+- `cloud.rs` gains `hydrate_with_progress(path, deadline, on_progress)`; the existing `hydrate`/`hydrate_with_deadline` delegate with a no-op callback.
+- Both the `hydrate_file` command (on-demand open) and the background hydration worker emit the event.
 - Both paths always emit; the frontend only renders progress when that file is currently on screen. This keeps the Rust side ignorant of UI state.
 
 Existing error events are unchanged (`transcript-error`, coarse hydration status strings on failure).
