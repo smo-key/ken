@@ -35,30 +35,36 @@ hound = "3.5"
 # proxy (which re-signs certs with a private root installed in the OS keychain)
 # fail the download with `invalid peer certificate: UnknownIssuer`.
 ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
-# On-device speech-to-text for video transcripts. Bundles whisper.cpp and
-# builds it from source (needs cmake + a C/C++ toolchain), so it is gated
-# behind a default feature: everything else in ken-core still builds if the
-# native toolchain is unavailable (`--no-default-features`).
-# `metal` here is load-bearing beyond whisper itself: whisper-rs and
-# llama-cpp-2 each bundle a ggml, and the linker resolves the shared ggml
-# symbols from whisper's copy. Without this feature that copy is CPU-only,
-# which silently strips the Metal backend from llama.cpp too (all layers
-# land on CPU despite n_gpu_layers).
-whisper-rs = { version = "0.16", features = ["metal"], optional = true }
-# Embedded on-device LLM (llama.cpp) for instant quick answers and Map entity
-# extraction. Bundles llama.cpp and builds it from source with Metal GPU
-# offload (needs cmake + a C/C++ toolchain), so it is gated behind a default
-# feature — like `whisper`, everything else still builds with
-# `--no-default-features`. default-features off drops the crate's own default
-# backends; we opt into just `metal`.
-llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["metal"], optional = true }
-
 [features]
 default = ["whisper", "local-llm"]
 whisper = ["dep:whisper-rs"]
 local-llm = ["dep:llama-cpp-2"]
 
+# On-device speech-to-text (whisper.cpp) and embedded LLM (llama.cpp) for
+# quick answers and Map entity extraction. Both bundle ggml and build it from
+# source (cmake + C/C++ toolchain), so each is gated behind a default feature:
+# everything else in ken-core still builds with `--no-default-features`.
+#
+# The GPU backend feature is target-specific, and it is load-bearing that BOTH
+# crates enable the SAME backend on each platform: whisper-rs and llama-cpp-2
+# each bundle a ggml, and the linker resolves the shared ggml symbols from
+# whisper's copy. A mismatch silently strips the GPU backend from llama.cpp
+# (all layers land on CPU despite n_gpu_layers).
+#   macOS   -> metal
+#   Windows -> vulkan (needs the Vulkan SDK's glslc at build time; at runtime
+#              vulkan-1.dll ships with GPU drivers)
+#   other   -> CPU-only (what Linux CI exercises)
+[target.'cfg(windows)'.dependencies]
+whisper-rs = { version = "0.16", features = ["vulkan"], optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["vulkan"], optional = true }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
+whisper-rs = { version = "0.16", optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"], optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["metal"], optional = true }
 screencapturekit = "8.0.0"
 objc2 = "0.6"
 objc2-av-foundation = "0.3"
