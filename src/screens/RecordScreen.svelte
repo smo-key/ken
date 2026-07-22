@@ -5,6 +5,7 @@
   import LevelMeter from "../record/LevelMeter.svelte";
   import PermissionNotice from "../record/PermissionNotice.svelte";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
+  import ProgressBar from "../lib/ProgressBar.svelte";
   import Mic from "@lucide/svelte/icons/mic";
   import Speaker from "@lucide/svelte/icons/volume-2";
 
@@ -131,7 +132,14 @@
     {/if}
 
     {#if record.transcribing}
-      <p class="status">Transcribing on your Mac…</p>
+      <div class="transcribe">
+        <ProgressBar
+          pct={record.transcribePct}
+          label={record.transcribePct === null
+            ? "Transcribing on your Mac…"
+            : `Transcribing on your Mac… ${record.transcribePct}%`}
+        />
+      </div>
     {/if}
     {#if record.savedPath}
       <p class="status done">
@@ -324,6 +332,10 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
+  }
+  .transcribe {
+    width: min(320px, 100%);
+    margin: 8px 0 0;
   }
   .status {
     font-size: 12.5px;

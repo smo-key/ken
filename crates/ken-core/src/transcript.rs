@@ -492,11 +492,42 @@ pub fn extract_audio_f32(ffmpeg: &Path, video: &Path) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// Progress from the transcription pipeline: a quick unmeterable ffmpeg
+/// extraction, then Whisper's native 0–100 percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptPhase {
+    Extracting,
+    Transcribing(u8),
+}
+
+/// Shared, thread-safe progress sink. `Arc` because whisper-rs demands a
+/// `'static` callback, and the same closure is observed from the caller side.
+pub type ProgressFn = std::sync::Arc<dyn Fn(TranscriptPhase) + Send + Sync>;
+
+/// The do-nothing sink for callers that don't surface progress.
+pub fn noop_progress() -> ProgressFn {
+    std::sync::Arc::new(|_| {})
+}
+
+/// Map one channel's 0–100 into an overall percent across `count` sequential
+/// channels (a two-channel recording transcribes Me then Them; the bar must
+/// not jump back to 0 in between).
+pub fn scale_channel_pct(idx: usize, count: usize, pct: u8) -> u8 {
+    if count == 0 {
+        return 0;
+    }
+    (((idx.min(count - 1) * 100) + pct.min(100) as usize) / count).min(100) as u8
+}
+
 /// Transcribe 16 kHz mono samples to timed cues with Whisper. Compiled only
 /// with the `whisper` feature; the fallback returns an actionable error so the
 /// rest of Ken builds without the native toolchain.
 #[cfg(feature = "whisper")]
-pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
+pub fn transcribe_with_progress(
+    model: &Path,
+    samples: &[f32],
+    on_progress: ProgressFn,
+) -> Result<Vec<Cue>> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
     // whisper-rs 0.16 accepts any `AsRef<Path>`, so the model path passes through
@@ -513,6 +544,12 @@ pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    {
+        let cb = on_progress.clone();
+        params.set_progress_callback_safe(move |pct: i32| {
+            cb(TranscriptPhase::Transcribing(pct.clamp(0, 100) as u8));
+        });
+    }
 
     state
         .full(params, samples)
@@ -543,20 +580,41 @@ pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
 }
 
 #[cfg(not(feature = "whisper"))]
-pub fn transcribe(_model: &Path, _samples: &[f32]) -> Result<Vec<Cue>> {
+pub fn transcribe_with_progress(
+    _model: &Path,
+    _samples: &[f32],
+    _on_progress: ProgressFn,
+) -> Result<Vec<Cue>> {
     Err(Error::Other(
         "This build of Ken was compiled without on-device transcription support.".into(),
     ))
 }
 
+/// [`transcribe_with_progress`] without a progress sink.
+pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
+    transcribe_with_progress(model, samples, noop_progress())
+}
+
 /// Full pipeline: video → ffmpeg audio → Whisper → WebVTT. Blocking; call from
 /// a worker thread.
 pub fn generate_vtt(ffmpeg: &Path, model: &Path, video: &Path) -> Result<String> {
+    generate_vtt_with_progress(ffmpeg, model, video, noop_progress())
+}
+
+/// [`generate_vtt`] reporting phase progress: `Extracting` before ffmpeg runs,
+/// then Whisper's percent stream.
+pub fn generate_vtt_with_progress(
+    ffmpeg: &Path,
+    model: &Path,
+    video: &Path,
+    on_progress: ProgressFn,
+) -> Result<String> {
+    on_progress(TranscriptPhase::Extracting);
     let samples = extract_audio_f32(ffmpeg, video)?;
     if samples.is_empty() {
         return Err(Error::Other("this video has no audio to transcribe".into()));
     }
-    let cues = transcribe(model, &samples)?;
+    let cues = transcribe_with_progress(model, &samples, on_progress)?;
     Ok(emit_webvtt(&cues))
 }
 
@@ -569,8 +627,19 @@ pub fn generate_and_cache(
     project_root: &Path,
     video_rel: &str,
 ) -> Result<PathBuf> {
+    generate_and_cache_with_progress(ffmpeg, model, project_root, video_rel, noop_progress())
+}
+
+/// [`generate_and_cache`] with a progress sink (see [`TranscriptPhase`]).
+pub fn generate_and_cache_with_progress(
+    ffmpeg: &Path,
+    model: &Path,
+    project_root: &Path,
+    video_rel: &str,
+    on_progress: ProgressFn,
+) -> Result<PathBuf> {
     let video_abs = project_root.join(video_rel);
-    let vtt = generate_vtt(ffmpeg, model, &video_abs)?;
+    let vtt = generate_vtt_with_progress(ffmpeg, model, &video_abs, on_progress)?;
     let dir = cache_dir(project_root);
     std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     let out = dir.join(cache_name(video_rel));
@@ -837,5 +906,18 @@ mod tests {
         xml.push_str("</w:body></w:document>");
         zip.write_all(xml.as_bytes()).unwrap();
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn channel_percentages_scale_into_one_overall_bar() {
+        // Two channels: channel 0 covers 0–50, channel 1 covers 50–100.
+        assert_eq!(scale_channel_pct(0, 2, 0), 0);
+        assert_eq!(scale_channel_pct(0, 2, 100), 50);
+        assert_eq!(scale_channel_pct(1, 2, 0), 50);
+        assert_eq!(scale_channel_pct(1, 2, 100), 100);
+        // One channel passes through; degenerate inputs stay in range.
+        assert_eq!(scale_channel_pct(0, 1, 37), 37);
+        assert_eq!(scale_channel_pct(0, 0, 50), 0);
+        assert_eq!(scale_channel_pct(3, 2, 100), 100);
     }
 }

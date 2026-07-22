@@ -11,6 +11,7 @@
   import { registerDomFind } from "../../lib/find-dom.svelte";
   import PreviewLoading from "./PreviewLoading.svelte";
   import ModelDownloadDialog from "./ModelDownloadDialog.svelte";
+  import ProgressBar from "../../lib/ProgressBar.svelte";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -31,6 +32,9 @@
   // When the Whisper model is missing, offer an in-app download instead of a
   // raw blocker error; once installed we auto-continue to generation.
   let missingModel = $state<ModelStatus | null>(null);
+  // Live generation progress for THIS video; null until the first event lands.
+  let genPhase = $state<"extracting" | "transcribing" | null>(null);
+  let genPct = $state<number | null>(null);
 
   // Captions can't point at an external URL (CSP), so the VTT string is served
   // to the <track> as a same-doc blob. Kept in a ref so it's revoked on swap.
@@ -73,6 +77,8 @@
 
   async function generate() {
     generateError = null;
+    genPhase = null;
+    genPct = null;
     // Gate on the model first: if it's missing, show the downloader rather than
     // a raw "download it yourself" blocker. Other prerequisites (ffmpeg) still
     // surface through generateTranscript's error below.
@@ -136,6 +142,8 @@
     activeIdx = -1;
     generateError = null;
     missingModel = null;
+    genPhase = null;
+    genPct = null;
 
     api
       .mediaSrc(rel)
@@ -157,8 +165,17 @@
         if (status === "generating") loadTranscript(relPath);
       })
       .then((u) => (unlisten = u));
+    let unlistenProgress: UnlistenFn | undefined;
+    api
+      .onTranscriptProgress((ev) => {
+        if (ev.relPath !== relPath) return;
+        genPhase = ev.phase;
+        genPct = ev.pct;
+      })
+      .then((u) => (unlistenProgress = u));
     return () => {
       unlisten?.();
+      unlistenProgress?.();
       if (trackUrl) URL.revokeObjectURL(trackUrl);
     };
   });
@@ -198,10 +215,20 @@
       {#if status === "loading"}
         <PreviewLoading label="Loading transcript…" />
       {:else if status === "generating"}
-        <PreviewLoading
-          label="Transcribing this video…"
-          detail="On-device transcription is running in the background. The transcript and captions will appear here when it finishes."
-        />
+        {#if genPhase === "transcribing" && genPct !== null}
+          <div class="note">
+            <p class="lead">Transcribing this video…</p>
+            <ProgressBar pct={genPct} label={`Transcribing… ${genPct}%`} />
+            <p>The transcript and captions will appear here when it finishes.</p>
+          </div>
+        {:else}
+          <PreviewLoading
+            label={genPhase === "extracting"
+              ? "Preparing audio…"
+              : "Transcribing this video…"}
+            detail="On-device transcription is running in the background. The transcript and captions will appear here when it finishes."
+          />
+        {/if}
       {:else if status === "none"}
         <div class="note">
           <p class="lead">No transcript</p>

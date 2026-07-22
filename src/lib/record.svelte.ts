@@ -16,6 +16,8 @@ class RecordStore {
   screenSettingsUrl = $state("");
   storage = $state<"transcript" | "audio" | "both">("both");
   transcribing = $state(false);
+  /** 0–100 while the post-stop transcription runs; null until the first sample. */
+  transcribePct = $state<number | null>(null);
   savedPath = $state<string | null>(null);
   error = $state<string | null>(null);
   // Readiness of the recommended/selected transcription model. Null until the
@@ -75,14 +77,24 @@ class RecordStore {
       // is produced and the finish path goes straight to `record-saved`, so
       // gating on `storage !== "audio"` prevents a misleading "Transcribing…"
       // flash. record-saved/record-error remain the authoritative resolvers.
+      this.transcribePct = null;
       if (this.storage !== "audio") this.transcribing = true;
+    });
+    await api.onTranscriptProgress((ev) => {
+      // Recording docs land under Recordings/; that prefix keeps a concurrent
+      // video transcription from driving this bar.
+      if (this.transcribing && ev.relPath.startsWith("Recordings/")) {
+        this.transcribePct = ev.pct;
+      }
     });
     await api.onRecordSaved((ev) => {
       this.transcribing = false;
+      this.transcribePct = null;
       this.savedPath = ev.relPath;
     });
     await api.onRecordError((ev) => {
       this.transcribing = false;
+      this.transcribePct = null;
       this.error = ev.message;
     });
   }
