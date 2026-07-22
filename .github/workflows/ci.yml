@@ -48,6 +48,16 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
 
+      # tauri.conf.json declares externalBin binaries/ken-mcp, so ken-app's
+      # build script refuses to compile — even for tests — unless the
+      # host-triple sidecar file exists.
+      - name: Build ken-mcp sidecar
+        run: |
+          cargo build --release -p ken-mcp
+          mkdir -p src-tauri/binaries
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$triple"
+
       - name: Rust tests
         run: cargo test --workspace
 
@@ -69,6 +79,8 @@ jobs:
   # shell script and curl hook callbacks, which are not Windows-portable.
   build-windows:
     runs-on: windows-latest
+    env:
+      VULKAN_VERSION: "1.4.309.0"
     steps:
       - uses: actions/checkout@v4
 
@@ -76,13 +88,23 @@ jobs:
       # which ships in the LunarG SDK (same install recipe as llama.cpp's CI).
       - name: Install Vulkan SDK
         shell: pwsh
-        env:
-          VULKAN_VERSION: "1.4.309.0"
         run: |
           curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+
+      # The SDK installer's default components ship no SPIRV-Headers CMake
+      # config, but ggml's Vulkan backend hard-requires it
+      # (find_package(SPIRV-Headers CONFIG REQUIRED)). Install the headers
+      # ourselves, pinned to the tag matching the SDK version above.
+      - name: Install SPIRV-Headers
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "vulkan-sdk-$env:VULKAN_VERSION" https://github.com/KhronosGroup/SPIRV-Headers.git "$env:RUNNER_TEMP\spirv-headers"
+          cmake -S "$env:RUNNER_TEMP\spirv-headers" -B "$env:RUNNER_TEMP\spirv-headers\build" -DCMAKE_INSTALL_PREFIX="C:\SPIRV-Headers"
+          cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\SPIRV-Headers"
 
       - uses: pnpm/action-setup@v4
         with:
