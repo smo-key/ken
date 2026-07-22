@@ -8,6 +8,12 @@ importers:
 
   .:
     dependencies:
+      '@fontsource/arimo':
+        specifier: ^5.3.0
+        version: 5.3.0
+      '@fontsource/carlito':
+        specifier: ^5.3.0
+        version: 5.3.0
       '@fontsource/ibm-plex-mono':
         specifier: ^5.2.7
         version: 5.2.7
@@ -17,6 +23,9 @@ importers:
       '@fontsource/source-serif-4':
         specifier: ^5.2.9
         version: 5.2.9
+      '@fontsource/tinos':
+        specifier: ^5.3.0
+        version: 5.3.0
       '@lucide/svelte':
         specifier: ^1.24.0
         version: 1.24.0(svelte@5.56.4)
@@ -35,6 +44,12 @@ importers:
       '@tauri-apps/plugin-opener':
         specifier: ^2.5.4
         version: 2.5.4
+      '@tauri-apps/plugin-process':
+        specifier: ^2.3.1
+        version: 2.3.1
+      '@tauri-apps/plugin-updater':
+        specifier: ^2.10.1
+        version: 2.10.1
       '@xterm/addon-fit':
         specifier: ^0.11.0
         version: 0.11.0
@@ -221,6 +236,12 @@ packages:
   '@floating-ui/utils@0.2.12':
     resolution: {integrity: sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==}
 
+  '@fontsource/arimo@5.3.0':
+    resolution: {integrity: sha512-nhxZ2sTVZYX8DJBgLuyX360B5vE4mxqpmjlKTRfucIqfcWRVx9vOYzWBc1IgEX0ist48VMC10PRKbFyH+4QFvQ==}
+
+  '@fontsource/carlito@5.3.0':
+    resolution: {integrity: sha512-oPqvLGK/dtVzC4KjdDcV/YzQq37sZdMXxD58ADvguPo3dm6yzbBKs40ADmevJF0wLvyvJY7/fPl5YkCQ1njWUw==}
+
   '@fontsource/ibm-plex-mono@5.2.7':
     resolution: {integrity: sha512-MKAb8qV+CaiMQn2B0dIi1OV3565NYzp3WN5b4oT6LTkk+F0jR6j0ZN+5BKJiIhffDC3rtBULsYZE65+0018z9w==}
 
@@ -229,6 +250,9 @@ packages:
 
   '@fontsource/source-serif-4@5.2.9':
     resolution: {integrity: sha512-er/Pym9emsEVJNf947umJ4kXarXfsiN6CN7kTYinefKRaHLwiquiiHOZvKvxWgkV8JMCf3pV3g0NcsPFpVCH9w==}
+
+  '@fontsource/tinos@5.3.0':
+    resolution: {integrity: sha512-VVDyyZdbcsLKxo/W7rClAvacD/7DsGc7J5xzzp51Tndib8kDkEe/0bqbb3Xb3iH6+IUjt07aRsvtQ9MGeGGi4w==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -666,6 +690,12 @@ packages:
 
   '@tauri-apps/plugin-opener@2.5.4':
     resolution: {integrity: sha512-1HnPkb+AmgO29HBazm4uPLKB+r7zzcTBW1d0fyYp1uP+jwtpoiNDGKMMzz58SFp49nOIrxdE3aUJtT57lfO9CQ==}
+
+  '@tauri-apps/plugin-process@2.3.1':
+    resolution: {integrity: sha512-nCa4fGVaDL/B9ai03VyPOjfAHRHSBz5v6F/ObsB73r/dA3MHHhZtldaDMIc0V/pnUw9ehzr2iEG+XkSEyC0JJA==}
+
+  '@tauri-apps/plugin-updater@2.10.1':
+    resolution: {integrity: sha512-NFYMg+tWOZPJdzE/PpFj2qfqwAWwNS3kXrb1tm1gnBJ9mYzZ4WDRrwy8udzWoAnfGCHLuePNLY1WVCNHnh3eRA==}
 
   '@tsconfig/svelte@5.0.8':
     resolution: {integrity: sha512-UkNnw1/oFEfecR8ypyHIQuWYdkPvHiwcQ78sh+ymIiYoF+uc5H1UBetbjyqT+vgGJ3qQN6nhucJviX6HesWtKQ==}
@@ -1932,11 +1962,17 @@ snapshots:
 
   '@floating-ui/utils@0.2.12': {}
 
+  '@fontsource/arimo@5.3.0': {}
+
+  '@fontsource/carlito@5.3.0': {}
+
   '@fontsource/ibm-plex-mono@5.2.7': {}
 
   '@fontsource/oregano@5.2.7': {}
 
   '@fontsource/source-serif-4@5.2.9': {}
+
+  '@fontsource/tinos@5.3.0': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
@@ -2520,6 +2556,14 @@ snapshots:
       '@tauri-apps/api': 2.11.1
 
   '@tauri-apps/plugin-opener@2.5.4':
+    dependencies:
+      '@tauri-apps/api': 2.11.1
+
+  '@tauri-apps/plugin-process@2.3.1':
+    dependencies:
+      '@tauri-apps/api': 2.11.1
+
+  '@tauri-apps/plugin-updater@2.10.1':
     dependencies:
       '@tauri-apps/api': 2.11.1
 
