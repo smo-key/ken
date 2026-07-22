@@ -4,6 +4,10 @@
 #   Ken-<target-triple>.app.tar.gz   (macOS app bundle, tarred)
 #   Ken-<target-triple>.AppImage     (Linux)
 #   ken-mcp-<target-triple>[.exe]    (all platforms)
+# Auto-update contract: tauri-action also uploads signed updater artifacts
+# and latest.json (endpoint in tauri.conf.json). Requires repo secrets
+# TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+# (generated with: pnpm tauri signer generate).
 name: Release
 
 on:
@@ -70,6 +74,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Ken ${{ github.ref_name }}"
