@@ -154,11 +154,12 @@ jobs:
 
   # Proves Ken builds for aarch64-apple-darwin (Apple Silicon): workspace
   # compile with the metal ggml backend, plus the .app/.dmg bundles via
-  # `tauri build` — the same leg release.yml ships. macos-15, not macos-14:
-  # screencapturekit's apple-metal Swift bridge uses macOS 15 Metal APIs
-  # (MTLLogState), which macos-14's Xcode SDK cannot compile.
+  # `tauri build` — the same leg release.yml ships. macos-26, not macos-15:
+  # apple-metal (via screencapturekit) needs the macOS 26 SDK (e.g.
+  # MTLSamplerDescriptor.reductionMode / MTLSamplerReductionMode), which
+  # macos-15's default Xcode 16.4 lacks; macos-26's default Xcode 26.x has it.
   build-macos:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 

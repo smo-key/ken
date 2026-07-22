@@ -226,9 +226,11 @@ jobs:
           # Each runner builds natively for its own architecture,
           # so no cross-compilation targets are needed.
           #
-          # macos-15 (NOT macos-14): screencapturekit's apple-metal Swift bridge
-          # needs the macOS 15 SDK to compile.
-          - os: macos-15 # aarch64-apple-darwin
+          # macos-26 (NOT macos-15): apple-metal (via screencapturekit) needs the
+          # macOS 26 SDK (e.g. MTLSamplerDescriptor.reductionMode /
+          # MTLSamplerReductionMode), which macos-15's default Xcode 16.4 lacks;
+          # macos-26's default Xcode 26.x has it.
+          - os: macos-26 # aarch64-apple-darwin
           # macos-13 (the old Intel image) was retired by GitHub;
           # macos-15-intel is the current x86_64 macOS runner.
           - os: macos-15-intel # x86_64-apple-darwin
@@ -315,6 +317,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+
+      # The Intel image defaults to Xcode 16.4, whose SDK predates the macOS 26
+      # Metal APIs apple-metal (via screencapturekit) requires; the image also
+      # ships Xcode 26.3 — select it.
+      - name: Select Xcode 26 (Intel)
+        if: matrix.os == 'macos-15-intel'
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - uses: pnpm/action-setup@v4
         with:
