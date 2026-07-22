@@ -6,9 +6,7 @@ name: CI
 
 on:
   push:
-    # worktree-windows-x64-build is temporary, to exercise build-windows
-    # before this branch has a PR — drop it when the branch merges.
-    branches: [main, worktree-windows-x64-build]
+    branches: [main]
   pull_request:
     branches: [main]
 
