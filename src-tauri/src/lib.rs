@@ -1620,15 +1620,42 @@ fn finish_recording(
             if !model.is_file() {
                 return Err("Download a transcription model in Settings to make transcripts.".into());
             }
+            let channel_count =
+                mic_moved.is_some() as usize + sys_moved.is_some() as usize;
+            // One continuous bar across sequential channels: Me fills the first
+            // half, Them the second (or the whole bar when only one exists).
+            let scaled_sink = |idx: usize| -> transcript::ProgressFn {
+                let app = app.clone();
+                let rel = md_rel.clone();
+                let last = std::sync::atomic::AtomicI32::new(-1);
+                std::sync::Arc::new(move |phase| {
+                    if let transcript::TranscriptPhase::Transcribing(p) = phase {
+                        let overall = transcript::scale_channel_pct(idx, channel_count, p);
+                        if last.swap(overall as i32, Ordering::Relaxed) == overall as i32 {
+                            return;
+                        }
+                        emit_transcript_phase(
+                            &app,
+                            &rel,
+                            transcript::TranscriptPhase::Transcribing(overall),
+                        );
+                    }
+                })
+            };
             let mut me_cues = Vec::new();
             let mut them_cues = Vec::new();
+            let mut idx = 0usize;
             if let Some((p, _)) = &mic_moved {
                 let samples = record::read_wav_f32(p).map_err(err)?;
-                me_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+                me_cues = transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
+                    .map_err(err)?;
+                idx += 1;
             }
             if let Some((p, _)) = &sys_moved {
                 let samples = record::read_wav_f32(p).map_err(err)?;
-                them_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+                them_cues =
+                    transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
+                        .map_err(err)?;
             }
             let channels: Vec<record::LabeledChannel> = if single {
                 vec![record::LabeledChannel {
@@ -2272,6 +2299,41 @@ fn media_src(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     Ok(to_asset_url(&abs))
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptProgress {
+    rel_path: String,
+    /// "extracting" | "transcribing"
+    phase: String,
+    /// 0–100; present only while transcribing.
+    pct: Option<u8>,
+}
+
+fn emit_transcript_phase(app: &AppHandle, rel: &str, phase: transcript::TranscriptPhase) {
+    let (phase, pct) = match phase {
+        transcript::TranscriptPhase::Extracting => ("extracting", None),
+        transcript::TranscriptPhase::Transcribing(p) => ("transcribing", Some(p)),
+    };
+    let _ = app.emit(
+        "transcript-progress",
+        TranscriptProgress { rel_path: rel.to_string(), phase: phase.into(), pct },
+    );
+}
+
+/// A `ProgressFn` that forwards to `transcript-progress`, dropping repeated
+/// percents (Whisper's callback re-fires the same value between segments).
+fn transcript_progress_sink(app: AppHandle, rel: String) -> transcript::ProgressFn {
+    let last = std::sync::atomic::AtomicI32::new(-1);
+    std::sync::Arc::new(move |phase| {
+        if let transcript::TranscriptPhase::Transcribing(p) = phase {
+            if last.swap(p as i32, Ordering::Relaxed) == p as i32 {
+                return;
+            }
+        }
+        emit_transcript_phase(&app, &rel, phase);
+    })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscriptDto {
@@ -2421,8 +2483,10 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
     }
     let app = app.clone();
     std::thread::spawn(move || {
-        let result =
-            transcript::generate_and_cache(&job.ffmpeg, &job.model, &job.root, &job.rel_path);
+        let on_progress = transcript_progress_sink(app.clone(), job.rel_path.clone());
+        let result = transcript::generate_and_cache_with_progress(
+            &job.ffmpeg, &job.model, &job.root, &job.rel_path, on_progress,
+        );
         match result {
             Ok(_) => {
                 // Re-index the video so the fresh transcript is searchable.
