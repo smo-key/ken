@@ -99,11 +99,18 @@
   );
 
   onMount(async () => {
+    // Attach the hydration listener BEFORE load() runs: load() awaits
+    // hydrateFile(), which blocks for the whole cloud download while streaming
+    // hydration-progress events. Registering it first (fire-and-forget) means
+    // the progress bar receives data during that download rather than only
+    // after it finishes.
+    api
+      .onHydrationProgress((ev) => {
+        if (ev.relPath === relPath) hydration = ev;
+      })
+      .then((u) => (unlistenHydration = u));
     await load();
     unlisten = await api.onIndexUpdated(() => void checkDisk());
-    unlistenHydration = await api.onHydrationProgress((ev) => {
-      if (ev.relPath === relPath) hydration = ev;
-    });
   });
 
   async function load(forceCloudDownload = false) {
