@@ -4,8 +4,11 @@
 //! One model is loaded per app process, lazily, on first use, and driven by a
 //! single worker thread behind a two-priority inference queue: `Interactive`
 //! work (quick answers) is always served before `Background` work (Map
-//! extraction), so an interactive request waits at most one already-running
-//! generation. The real llama.cpp engine lives behind the [`Engine`] trait seam
+//! extraction). A running Background generation is *preempted* the moment an
+//! Interactive job arrives — it is aborted mid-decode and re-queued to run again
+//! from scratch (extraction jobs are idempotent) — so an interactive request
+//! waits at most one token, not a whole background generation. The real
+//! llama.cpp engine lives behind the [`Engine`] trait seam
 //! (like `model.rs`'s `ByteSource`) so every scheduling / cancel / JSON-retry
 //! rule is unit-tested against a fake with no model download; only the
 //! `#[ignore]`d integration test touches a real GGUF.
@@ -21,12 +24,13 @@ pub enum Priority {
 }
 
 /// How many tokens a generation may emit, chosen per job by priority. Quick
-/// answers (Interactive) can run long, so they keep the full budget. Background
-/// Map extraction only ever emits a small, bounded JSON delta (≤ 40 entities /
-/// 60 relations / 20 events per file — see `knowledge_model`), so half the
-/// budget is ample and roughly halves the per-file decode work, the dominant
-/// cost of indexing a large project.
-pub(crate) const INTERACTIVE_MAX_TOKENS: usize = 1024;
+/// answers (Interactive) are a short, streamed summary, so 256 tokens covers a
+/// full answer while keeping the tail latency low. Background Map extraction
+/// only ever emits a small, bounded JSON delta (≤ 40 entities / 60 relations /
+/// 20 events per file — see `knowledge_model`), so its budget is ample and
+/// keeps the per-file decode work — the dominant cost of indexing a large
+/// project — bounded.
+pub(crate) const INTERACTIVE_MAX_TOKENS: usize = 256;
 pub(crate) const BACKGROUND_MAX_TOKENS: usize = 512;
 
 /// The generation length cap for a job at this priority. Scoping the cap here
@@ -179,7 +183,22 @@ struct Job {
     max_tokens: usize,
     tx: Sender<Msg>,
     reply_rx: Receiver<bool>,
+    /// A warm-up job: only ensure the engine is loaded, then finish — no
+    /// generation. Enqueued by [`LlmService::warm`] so the (slow) model load is
+    /// paid before the first real quick answer. Always Background priority.
+    warmup: bool,
+    /// How many times this (Background) job has already been preempted by an
+    /// arriving Interactive request and re-queued to run from scratch. Capped at
+    /// [`MAX_BACKGROUND_REQUEUES`] so a stream of interactive work can't starve a
+    /// background job forever. Interactive jobs are never preempted, so this
+    /// stays 0 for them.
+    retries: u32,
 }
+
+/// The per-job preemption cap: after this many aborts-and-requeues, a Background
+/// job is allowed to run to completion even while Interactive work waits, so a
+/// steady trickle of quick answers can't livelock one extraction file forever.
+const MAX_BACKGROUND_REQUEUES: u32 = 3;
 
 #[derive(Default)]
 struct Queues {
@@ -289,6 +308,8 @@ impl LlmService {
             max_tokens: max_tokens_for(priority),
             tx,
             reply_rx,
+            warmup: false,
+            retries: 0,
         };
         {
             let (m, cv) = &*self.shared;
@@ -312,6 +333,33 @@ impl LlmService {
                 Err(_) => return Err(Error::Other("the local model worker stopped".into())),
             }
         }
+    }
+
+    /// Enqueue a fire-and-forget warm-up: a Background job that only ensures the
+    /// engine is loaded (the same lazy `make_engine` path a real job takes) and
+    /// then finishes without generating — a no-op if the engine is already
+    /// loaded. Returns immediately; the caller never blocks on the load. Runs at
+    /// Background priority so it never delays a real Interactive request (the
+    /// engine load itself isn't preemptable, which is fine: it's the cost we're
+    /// paying up front precisely so the first quick answer doesn't).
+    pub fn warm(&self) {
+        // Unused ends of the channels: a warm-up streams no tokens, and nothing
+        // blocks on its completion, so the `Done` is simply dropped.
+        let (tx, _rx) = mpsc::channel();
+        let (_reply_tx, reply_rx) = mpsc::channel();
+        let job = Job {
+            prompt: String::new(),
+            greedy: false,
+            max_tokens: 0,
+            tx,
+            reply_rx,
+            warmup: true,
+            retries: 0,
+        };
+        let (m, cv) = &*self.shared;
+        let mut q = m.lock().unwrap();
+        q.background.push_back(job);
+        cv.notify_one();
     }
 
     /// Greedy generation parsed as JSON, retried once on a parse failure. The
@@ -442,23 +490,67 @@ fn worker_loop<F>(
             max_tokens,
             tx,
             reply_rx,
+            warmup,
+            retries,
         } = job;
 
+        // A background generation is preemptable: if an interactive job arrives
+        // mid-decode we abort and re-run it from scratch later. Interactive jobs
+        // never preempt, and a job that has already hit the requeue cap runs to
+        // completion so a stream of quick answers can't starve it forever.
+        // (During a background generation `running_interactive` is false, so the
+        // yield flag is true exactly when an interactive job is *waiting* — the
+        // signal we poll each token.)
+        let can_preempt = !is_interactive && retries < MAX_BACKGROUND_REQUEUES;
+        let mut preempted = false;
+
         let result = if let Some(eng) = engine.as_mut() {
-            let mut cb = |piece: &str| -> bool {
-                if tx.send(Msg::Token(piece.to_string())).is_err() {
-                    return false; // caller hung up
-                }
-                // Block for the caller's decision; false (or a dropped reply
-                // channel) cancels the generation on the next token boundary.
-                matches!(reply_rx.recv(), Ok(true))
-            };
-            eng.generate(&prompt, greedy, max_tokens, &mut cb)
+            if warmup {
+                // Engine is loaded (built just above, or already resident):
+                // nothing to generate.
+                Ok(String::new())
+            } else {
+                let mut cb = |piece: &str| -> bool {
+                    // Preempt before streaming this token: an interactive request
+                    // is waiting, so drop this background generation and re-queue
+                    // it (handled below) to re-run once the queue drains.
+                    if can_preempt && interactive_pending.load(Ordering::SeqCst) {
+                        preempted = true;
+                        return false;
+                    }
+                    if tx.send(Msg::Token(piece.to_string())).is_err() {
+                        return false; // caller hung up
+                    }
+                    // Block for the caller's decision; false (or a dropped reply
+                    // channel) cancels the generation on the next token boundary.
+                    matches!(reply_rx.recv(), Ok(true))
+                };
+                eng.generate(&prompt, greedy, max_tokens, &mut cb)
+            }
         } else {
             Err(Error::Other(
                 unavailable.unwrap_or_else(|| "the local model is unavailable".into()),
             ))
         };
+
+        // Preempted for an interactive request: don't answer the caller — put the
+        // job back at the tail of the background queue (retry bumped) so it re-runs
+        // from scratch after the interactive work, and take the next job now.
+        if preempted {
+            let (m, cv) = &*shared;
+            let mut q = m.lock().unwrap();
+            q.background.push_back(Job {
+                prompt,
+                greedy,
+                max_tokens,
+                tx,
+                reply_rx,
+                warmup,
+                retries: retries + 1,
+            });
+            cv.notify_one();
+            continue;
+        }
 
         let _ = tx.send(Msg::Done(result));
 
@@ -518,6 +610,15 @@ pub fn generate_stream(
 /// Greedy JSON generation, retried once (with a nudged prompt) on a parse failure.
 pub fn generate_json(prompt: &str, priority: Priority) -> Result<serde_json::Value> {
     service().generate_json_via(prompt, priority)
+}
+
+/// Fire-and-forget warm-up: enqueue a Background job that just loads the engine
+/// (no generation), so the slow first-time model load is paid before the first
+/// quick answer instead of during it. Cheap and non-blocking; spawns the service
+/// if needed and is a no-op once the engine is resident. Designed to be called
+/// straight from a Tauri command (`warm_llm`) with no extra state.
+pub fn warm() {
+    service().warm();
 }
 
 /// True while an Interactive job is queued or running (the Background yield
@@ -736,12 +837,12 @@ mod tests {
     }
 
     #[test]
-    fn background_gets_a_smaller_generation_budget_than_interactive() {
-        // Quick answers keep the full budget; background Map extraction asks for
-        // half, roughly halving per-file decode cost. Guards the two constants.
-        assert_eq!(max_tokens_for(Priority::Interactive), 1024);
+    fn generation_budget_is_bounded_per_priority() {
+        // Quick answers get a short, streamed budget (256) to keep tail latency
+        // low; background Map extraction keeps its own bounded budget. Guards the
+        // two constants against accidental change.
+        assert_eq!(max_tokens_for(Priority::Interactive), 256);
         assert_eq!(max_tokens_for(Priority::Background), 512);
-        assert!(max_tokens_for(Priority::Background) < max_tokens_for(Priority::Interactive));
     }
 
     #[test]
@@ -1090,6 +1191,211 @@ mod tests {
         let bi = log.iter().position(|s| s == "B-bg").unwrap();
         assert!(ci < bi, "interactive must run before background: {log:?}");
         assert!(!svc.interactive_pending());
+    }
+
+    // --- Preemption: an interactive job aborts a running background one ---
+
+    /// An engine whose reply is keyed by prompt (so a job re-run from scratch
+    /// produces the same script) and that logs each generation's prompt as it
+    /// starts. One instance serves every job — the service builds the engine
+    /// once and reuses it — so `order` is the exact, single-threaded sequence of
+    /// generations, ideal for asserting preempt/re-queue scheduling.
+    struct ByPromptEngine {
+        replies: std::collections::HashMap<String, Vec<String>>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+    impl Engine for ByPromptEngine {
+        fn generate(
+            &mut self,
+            prompt: &str,
+            _greedy: bool,
+            _max_tokens: usize,
+            on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<String> {
+            self.order.lock().unwrap().push(prompt.to_string());
+            let pieces = self.replies.get(prompt).cloned().unwrap_or_default();
+            let mut out = String::new();
+            for p in &pieces {
+                out.push_str(p);
+                if !on_token(p) {
+                    return Ok(out); // aborted (cancel or preempt): partial text
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    fn by_prompt_service(order: Arc<Mutex<Vec<String>>>) -> Arc<LlmService> {
+        Arc::new(LlmService::spawn(move || {
+            let mut replies = std::collections::HashMap::new();
+            // "BG" emits three tokens; only the first reaches the caller before a
+            // preempt fires on the next token boundary, so an aborted attempt is
+            // observable and a completed one yields "BG!".
+            replies.insert(
+                "BG".to_string(),
+                vec!["B".to_string(), "G".to_string(), "!".to_string()],
+            );
+            replies.insert("INT".to_string(), vec!["i".to_string()]);
+            Ok(Box::new(ByPromptEngine {
+                replies,
+                order: order.clone(),
+            }) as Box<dyn Engine>)
+        }))
+    }
+
+    #[test]
+    fn interactive_preempts_and_requeues_the_running_background_job() {
+        use std::sync::atomic::AtomicBool;
+        // A background generation is in flight; an interactive request arrives
+        // mid-decode. The background job must abort, the interactive must run to
+        // completion first, and the background job must then re-run from scratch
+        // and complete. The single-threaded `order` log makes this deterministic.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = by_prompt_service(order.clone());
+
+        let injected = Arc::new(AtomicBool::new(false));
+        let int_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
+        let bg = {
+            let svc = svc.clone();
+            let injected = injected.clone();
+            let int_handle = int_handle.clone();
+            thread::spawn(move || {
+                let out = svc
+                    .run("BG", false, Priority::Background, &mut |_| {
+                        // On the first streamed token, enqueue an interactive job
+                        // and wait until the scheduler registers it as pending, so
+                        // the very next token boundary preempts this generation.
+                        if !injected.swap(true, Ordering::SeqCst) {
+                            let s = svc.clone();
+                            let h = thread::spawn(move || {
+                                let o = s
+                                    .run("INT", false, Priority::Interactive, &mut |_| true)
+                                    .unwrap();
+                                assert_eq!(o, "i");
+                            });
+                            *int_handle.lock().unwrap() = Some(h);
+                            while !svc.interactive_pending() {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap();
+                // Re-run from scratch produced the full text.
+                assert_eq!(out, "BG!");
+            })
+        };
+
+        bg.join().unwrap();
+        int_handle.lock().unwrap().take().unwrap().join().unwrap();
+
+        // Generations, in order: BG starts → preempted; INT runs to completion;
+        // BG re-runs and completes. Interactive is served before the re-queued
+        // background job, and appears once (never restarted).
+        let log = order.lock().unwrap().clone();
+        assert_eq!(log, vec!["BG", "INT", "BG"], "preempt → interactive → re-run: {log:?}");
+        assert!(!svc.interactive_pending());
+    }
+
+    #[test]
+    fn background_requeue_cap_lets_the_job_finish_despite_pending_interactive() {
+        use std::sync::atomic::AtomicUsize;
+        // A relentless trickle of interactive requests must not livelock a
+        // background job. After MAX_BACKGROUND_REQUEUES preemptions the job runs
+        // to completion even with an interactive request waiting. We inject a
+        // fresh interactive on every background attempt (whenever none is
+        // pending); the job should start MAX_BACKGROUND_REQUEUES + 1 times and
+        // then finish.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = by_prompt_service(order.clone());
+
+        let injections = Arc::new(AtomicUsize::new(0));
+        // Inject one more than the cap's worth so that a request is *still*
+        // pending on the final, non-preemptable attempt — proving the cap, not a
+        // lull, is what lets the job through.
+        let max_injections = (MAX_BACKGROUND_REQUEUES + 1) as usize;
+        let int_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let bg = {
+            let svc = svc.clone();
+            let injections = injections.clone();
+            let int_handles = int_handles.clone();
+            thread::spawn(move || {
+                let out = svc
+                    .run("BG", false, Priority::Background, &mut |_| {
+                        // Once per attempt (the previous interactive has drained,
+                        // so nothing is pending), enqueue a fresh interactive and
+                        // wait for it to register.
+                        if injections.load(Ordering::SeqCst) < max_injections
+                            && !svc.interactive_pending()
+                        {
+                            injections.fetch_add(1, Ordering::SeqCst);
+                            let s = svc.clone();
+                            let h = thread::spawn(move || {
+                                s.run("INT", false, Priority::Interactive, &mut |_| true)
+                                    .unwrap();
+                            });
+                            int_handles.lock().unwrap().push(h);
+                            while !svc.interactive_pending() {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap();
+                assert_eq!(out, "BG!", "capped job finishes despite pending interactive");
+            })
+        };
+
+        bg.join().unwrap();
+        for h in int_handles.lock().unwrap().drain(..) {
+            h.join().unwrap();
+        }
+
+        // The background job started exactly cap + 1 times: preempted on the
+        // first `MAX_BACKGROUND_REQUEUES` attempts, then run to completion.
+        let bg_starts = order.lock().unwrap().iter().filter(|p| *p == "BG").count();
+        assert_eq!(bg_starts, (MAX_BACKGROUND_REQUEUES + 1) as usize, "{:?}", order.lock().unwrap());
+        assert_eq!(injections.load(Ordering::SeqCst), max_injections);
+    }
+
+    #[test]
+    fn warm_up_loads_the_engine_without_generating() {
+        use std::sync::atomic::AtomicUsize;
+        // warm() enqueues a Background job that only builds the engine (no
+        // generation): the factory runs, but no generate call is logged.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = {
+            let builds = builds.clone();
+            let order = order.clone();
+            Arc::new(LlmService::spawn(move || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                let mut replies = std::collections::HashMap::new();
+                replies.insert("q".to_string(), vec!["hi".to_string()]);
+                Ok(Box::new(ByPromptEngine {
+                    replies,
+                    order: order.clone(),
+                }) as Box<dyn Engine>)
+            }))
+        };
+
+        svc.warm();
+        // Wait for the warm-up to have built the engine (no completion channel to
+        // block on — that's the fire-and-forget contract).
+        while builds.load(Ordering::SeqCst) < 1 {
+            std::hint::spin_loop();
+        }
+        // No generation happened for the warm-up.
+        assert!(order.lock().unwrap().is_empty(), "warm-up must not generate");
+
+        // A subsequent real job reuses the already-loaded engine (no second
+        // build) and generates normally.
+        let out = svc.run("q", false, Priority::Interactive, &mut |_| true).unwrap();
+        assert_eq!(out, "hi");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "warm-up left the engine loaded");
+        assert_eq!(order.lock().unwrap().clone(), vec!["q"]);
     }
 
     #[test]

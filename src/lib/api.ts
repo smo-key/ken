@@ -625,6 +625,9 @@ export const api = {
   refreshDigest: () => invoke<void>("refresh_digest"),
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
   llmStatus: () => invoke<"ready" | "notInstalled" | "error">("llm_status"),
+  /// Fire-and-forget: warm the on-device model (⌘K open) so the first answer
+  /// streams without paying the load. No-op when no local model is installed.
+  warmLlm: () => invoke<void>("warm_llm"),
 
   knowledgeModel: () => invoke<KnowledgeModel>("knowledge_model"),
   refreshKnowledgeModel: () => invoke<void>("refresh_knowledge_model"),

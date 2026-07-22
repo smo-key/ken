@@ -34,6 +34,10 @@
   onMount(() => {
     input.focus();
     void api.llmStatus().then((s) => (modelInstalled = s !== "notInstalled"));
+    // Warm the on-device model as the overlay opens so the (slow) first-time
+    // load is paid before the user's first question, not during it. No-op when
+    // no local model is installed.
+    void api.warmLlm().catch(() => {});
     let unlistenFinal: UnlistenFn | undefined;
     let unlistenDelta: UnlistenFn | undefined;
     void api
@@ -82,7 +86,7 @@
     // A fresh dispatch (below) re-arms it after the debounce.
     if (thinking !== q) thinking = null;
     if (!cached && aiAvailable && isQuestionQuery(q)) {
-      aiTimer = setTimeout(() => void ask(q), 800);
+      aiTimer = setTimeout(() => void ask(q), 250);
     }
   }
 

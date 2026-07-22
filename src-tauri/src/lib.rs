@@ -3751,14 +3751,14 @@ struct QuickAnswerDelta {
     delta: String,
 }
 
-/// Build the local-model quick-answer prompt: the same FTS grounding as the
-/// Claude path, wrapped in Qwen3 ChatML, ending with the `SOURCES:` convention
-/// `digest::parse_digest` already understands.
-fn local_quick_answer_prompt(query: &str, hits: &[SearchHit]) -> String {
+/// Build the local-model quick-answer prompt: the same grounding as the Claude
+/// path (paragraph excerpts, one `rel_path: text` line per source), wrapped in
+/// Qwen3 ChatML, ending with the `SOURCES:` convention `digest::parse_digest`
+/// already understands.
+fn local_quick_answer_prompt(query: &str, sources: &[(String, String)]) -> String {
     let mut material = String::new();
-    for hit in hits {
-        let snippet = hit.snippet.replace("<mark>", "").replace("</mark>", "");
-        material.push_str(&format!("- {}: {}\n", hit.rel_path, snippet));
+    for (rel_path, text) in sources {
+        material.push_str(&format!("- {rel_path}: {text}\n"));
     }
     let system = "You answer questions using only the provided project material. \
 Answer in one or two sentences. If the material doesn't answer it, say you don't \
@@ -3768,13 +3768,12 @@ paths you used (omit the line if none).";
     ken_core::local_llm::chatml_prompt(system, &user)
 }
 
-fn quick_answer_prompt(query: &str, hits: &[SearchHit]) -> String {
+fn quick_answer_prompt(query: &str, sources: &[(String, String)]) -> String {
     let mut p = format!(
         "Question: {query}\n\nMaterial from the project's search index:\n\n"
     );
-    for hit in hits {
-        let snippet = hit.snippet.replace("<mark>", "").replace("</mark>", "");
-        p.push_str(&format!("- {}: {}\n", hit.rel_path, snippet));
+    for (rel_path, text) in sources {
+        p.push_str(&format!("- {rel_path}: {text}\n"));
     }
     p.push_str(
         "\nAnswer the question in one or two sentences using ONLY this \
@@ -3794,19 +3793,55 @@ listing the project-relative paths you used (omit the line if none).\n",
 /// bumps `qa_gen`, cancelling any in-flight generation so a stale answer never
 /// lands in the card.
 #[tauri::command]
-fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> CmdResult<bool> {
-    let (hits, root, qa_gen, claude) = {
+async fn quick_answer(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    query: String,
+) -> CmdResult<bool> {
+    // Hold the global lock only long enough to clone the read-only handle + the
+    // supersede counter (microseconds), then release it so the FTS query and the
+    // per-source excerpt reads run on the dedicated read-only handle off the lock
+    // (mirrors the `search` command), never freezing the UI event loop.
+    let (search_db, root, qa_gen, claude) = {
         let guard = state.lock().unwrap();
         let active = guard.active.as_ref().ok_or("no project open")?;
-        let hits = active.db.search(&query, 8).map_err(err)?;
         (
-            hits,
+            active.search_db.clone(),
             active.project.root.clone(),
             guard.qa_gen.clone(),
             ken_core::runner::discover_claude(),
         )
     };
-    if hits.is_empty() {
+
+    // The same meaningful-term tokenization `Db::search` now uses internally
+    // (alphanumeric split minus English stopwords, with as-you-type guards), so
+    // each excerpt centers on a term the search actually ranked on ("operating",
+    // "model") rather than a stopword ("what", "the").
+    let tokens = ken_core::db::significant_tokens(&query);
+
+    // Search + build a ~350-char paragraph excerpt per hit on the blocking pool
+    // (richer grounding than the ~12-token FTS snippet); fall back to the FTS
+    // snippet when a source has no stored content (binary / OCR-pending).
+    let query_for_search = query.clone();
+    let sources: Vec<(String, String)> = tauri::async_runtime::spawn_blocking(
+        move || -> CmdResult<Vec<(String, String)>> {
+            let db = search_db.lock().unwrap();
+            let hits = db.search(&query_for_search, 8).map_err(err)?;
+            Ok(hits
+                .into_iter()
+                .map(|hit| {
+                    let text = db.excerpt(&hit.rel_path, &tokens, 350).unwrap_or_else(|| {
+                        hit.snippet.replace("<mark>", "").replace("</mark>", "")
+                    });
+                    (hit.rel_path, text)
+                })
+                .collect())
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if sources.is_empty() {
         return Ok(true); // nothing to ground on — no card, but AI is "available"
     }
 
@@ -3817,7 +3852,7 @@ fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> Cmd
     );
 
     if local_ready {
-        let prompt = local_quick_answer_prompt(&query, &hits);
+        let prompt = local_quick_answer_prompt(&query, &sources);
         std::thread::spawn(move || {
             let mut on_token = |piece: &str| -> bool {
                 if qa_gen.load(Ordering::SeqCst) != my_gen {
@@ -3845,7 +3880,7 @@ fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> Cmd
                 Err(_) => {
                     // Runtime load/inference failure → fall back to Claude,
                     // still honouring the generation id.
-                    run_claude_quick_answer(app, root, claude, query, hits, qa_gen, my_gen);
+                    run_claude_quick_answer(app, root, claude, query, sources, qa_gen, my_gen);
                 }
             }
         });
@@ -3857,7 +3892,7 @@ fn quick_answer(app: AppHandle, state: State<SharedState>, query: String) -> Cmd
         return Ok(false); // neither local nor Claude — stop asking
     };
     std::thread::spawn(move || {
-        run_claude_quick_answer(app, root, Some(binary), query, hits, qa_gen, my_gen);
+        run_claude_quick_answer(app, root, Some(binary), query, sources, qa_gen, my_gen);
     });
     Ok(true)
 }
@@ -3869,12 +3904,12 @@ fn run_claude_quick_answer(
     root: std::path::PathBuf,
     claude: Option<std::path::PathBuf>,
     query: String,
-    hits: Vec<SearchHit>,
+    sources: Vec<(String, String)>,
     qa_gen: Arc<AtomicU64>,
     my_gen: u64,
 ) {
     let Some(binary) = claude else { return };
-    let prompt = quick_answer_prompt(&query, &hits);
+    let prompt = quick_answer_prompt(&query, &sources);
     if let Ok(OneshotOutcome::Completed(text)) = assistant::oneshot(
         &binary,
         &root,
@@ -3900,6 +3935,21 @@ fn llm_status() -> &'static str {
         ken_core::local_llm::LlmStatus::Ready => "ready",
         ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
         ken_core::local_llm::LlmStatus::Error(_) => "error",
+    }
+}
+
+/// Fire-and-forget: pay the (slow) on-device model load up front — on ⌘K open —
+/// so the first quick answer streams without waiting on it. Returns immediately.
+/// Only meaningful when the local model is the active backend, so skip the
+/// warm-up entirely when no usable model is installed (nothing to load, and the
+/// Claude path never warms).
+#[tauri::command]
+fn warm_llm() {
+    if matches!(
+        ken_core::local_llm::llm_status(),
+        ken_core::local_llm::LlmStatus::Ready
+    ) {
+        ken_core::local_llm::warm();
     }
 }
 
@@ -4871,6 +4921,7 @@ pub fn run() {
             current_digest,
             refresh_digest,
             quick_answer,
+            warm_llm,
             knowledge_model,
             refresh_knowledge_model,
             list_chats,

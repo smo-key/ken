@@ -527,6 +527,92 @@ impl Db {
         }
     }
 
+    /// A ~`window_chars` paragraph excerpt from a file's stored text, centered
+    /// on the first case-insensitive occurrence of any `query_tokens` token and
+    /// trimmed to word boundaries so neither end splits a UTF-8 char or lands
+    /// mid-word. Richer context than the ~12-token FTS `snippet()` for feeding a
+    /// quick-answer prompt. Returns `None` when there is no stored content
+    /// (binary/OCR-pending/failed) or no token matches, so the caller can fall
+    /// back to the FTS snippet. Pass tokens from [`query_tokens`] for the same
+    /// tokenization the search used.
+    pub fn excerpt(
+        &self,
+        rel_path: &str,
+        query_tokens: &[String],
+        window_chars: usize,
+    ) -> Option<String> {
+        let text = self.get_text(rel_path).ok().flatten()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        // First match of any token, case-insensitively. Lowercasing can shift
+        // byte offsets for exotic Unicode, so we only use `pos` to locate the
+        // match and always re-snap to a char boundary of the *original* text
+        // before slicing.
+        let lower = text.to_lowercase();
+        let raw_pos = query_tokens
+            .iter()
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| lower.find(&t.to_lowercase()))
+            .min()?;
+        let mut pos = raw_pos.min(text.len());
+        while pos > 0 && !text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+
+        // Grow a window of ~`window_chars` chars centered on the match: half the
+        // budget of chars before `pos`, half from `pos` forward (which covers the
+        // matched token itself). `char_indices` keeps every offset on a boundary.
+        let half = window_chars / 2;
+        let start = text[..pos]
+            .char_indices()
+            .rev()
+            .take(half)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let end = text[pos..]
+            .char_indices()
+            .take(half.max(1))
+            .last()
+            .map(|(i, c)| pos + i + c.len_utf8())
+            .unwrap_or_else(|| text.len());
+
+        // Pull each edge in to the nearest whitespace so we never emit a partial
+        // word (only when we actually cut — a window that reaches the document
+        // edge keeps that edge).
+        let mut s = start;
+        if s > 0 {
+            if let Some(off) = text[s..].find(char::is_whitespace) {
+                s += off;
+            }
+            let trimmed = text[s..].trim_start();
+            s = text.len() - trimmed.len();
+        }
+        let mut e = end;
+        if e < text.len() {
+            if let Some(off) = text[..e].rfind(char::is_whitespace) {
+                e = off;
+            }
+        }
+        if s >= e {
+            return None;
+        }
+        let mut excerpt = text[s..e].trim().to_string();
+        if excerpt.is_empty() {
+            return None;
+        }
+        // Leading/trailing ellipses mark a mid-document fragment, matching the
+        // shape of FTS snippets.
+        if s > 0 {
+            excerpt = format!("…{excerpt}");
+        }
+        if e < text.len() {
+            excerpt.push('…');
+        }
+        Some(excerpt)
+    }
+
     pub fn list_files(&self) -> Result<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT rel_path, kind, size, mtime, status, error FROM files ORDER BY rel_path",
@@ -557,28 +643,73 @@ impl Db {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
+        // Drop stopwords before building any pass (FTS, phrase, filename LIKE) so
+        // question-form queries don't pay for intersecting their giant posting
+        // lists — the last (prefix) token and pure-stopword queries are preserved
+        // by `significant_token_list`.
+        let tokens = significant_token_list(&tokens);
         let fts_query = build_fts_query(&tokens);
         let mut stmt = self.conn.prepare(
             r#"SELECT f.rel_path, f.kind, f.status,
                       snippet(search, 0, '<mark>', '</mark>', '…', 12),
-                      bm25(search, 1.0, 4.0)
+                      bm25(search, 1.0, 4.0), f.mtime
                FROM search JOIN files f ON f.id = search.rowid
                WHERE search MATCH ?1
                ORDER BY bm25(search, 1.0, 4.0)
                LIMIT ?2"#,
         )?;
+        // `mtimes` carries each hit's file mtime (unix seconds) out of the query
+        // rows so the recency blend can be applied after all passes merge,
+        // without widening `SearchHit` (the frontend never needs it).
+        let mut mtimes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         let mut hits: Vec<SearchHit> = stmt
             .query_map(params![fts_query, limit as i64], |r| {
-                Ok(SearchHit {
-                    rel_path: r.get(0)?,
-                    kind: r.get(1)?,
-                    status: r.get(2)?,
-                    snippet: r.get(3)?,
-                    rank: r.get(4)?,
-                })
+                let rel_path: String = r.get(0)?;
+                let mtime: i64 = r.get(5)?;
+                Ok((
+                    SearchHit {
+                        rel_path,
+                        kind: r.get(1)?,
+                        status: r.get(2)?,
+                        snippet: r.get(3)?,
+                        rank: r.get(4)?,
+                    },
+                    mtime,
+                ))
             })?
-            .collect::<std::result::Result<_, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(h, m)| {
+                mtimes.insert(h.rel_path.clone(), m);
+                h
+            })
+            .collect();
         drop(stmt);
+
+        // Phrase boost: for multi-token queries, docs where the tokens occur as
+        // an adjacent phrase are the strongest lexical matches. A second MATCH
+        // pass with an FTS5 phrase query ("tok1 tok2 …") finds them; each such
+        // rel_path gets `PHRASE_BONUS` shaved off its rank. A phrase match always
+        // contains every token, so it is already a subset of the main pass — we
+        // only ever adjust ranks here, never introduce new hits.
+        if tokens.len() >= 2 {
+            let phrase_query = format!("\"{}\"", tokens.join(" "));
+            let mut pstmt = self.conn.prepare(
+                r#"SELECT f.rel_path FROM search JOIN files f ON f.id = search.rowid
+                   WHERE search MATCH ?1
+                   ORDER BY bm25(search, 1.0, 4.0)
+                   LIMIT ?2"#,
+            )?;
+            let phrase_paths: std::collections::HashSet<String> = pstmt
+                .query_map(params![phrase_query, limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(pstmt);
+            for hit in hits.iter_mut() {
+                if phrase_paths.contains(&hit.rel_path) {
+                    hit.rank -= PHRASE_BONUS;
+                }
+            }
+        }
 
         // Filename pass: every token as a case-insensitive substring of the
         // rel_path. Catches what FTS name tokens can't — mid-word matches
@@ -589,16 +720,17 @@ impl Db {
         // char) scans and returns the whole `files` table, which — combined with
         // this running synchronously on the command thread — froze the UI. We
         // only ever keep `limit` results anyway, so cap the scan there.
-        let sql =
-            format!("SELECT rel_path, kind, status FROM files WHERE {clauses} LIMIT {limit}");
+        let sql = format!(
+            "SELECT rel_path, kind, status, mtime FROM files WHERE {clauses} LIMIT {limit}"
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let patterns: Vec<String> = lowered
             .iter()
             .map(|t| format!("%{}%", like_escape(t)))
             .collect();
-        let name_rows: Vec<(String, String, String)> = stmt
+        let name_rows: Vec<(String, String, String, i64)> = stmt
             .query_map(rusqlite::params_from_iter(&patterns), |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
             .collect::<std::result::Result<_, _>>()?;
 
@@ -609,8 +741,9 @@ impl Db {
             .enumerate()
             .map(|(i, h)| (h.rel_path.clone(), i))
             .collect();
-        for (rel_path, kind, status) in name_rows {
+        for (rel_path, kind, status, mtime) in name_rows {
             let rank = name_match_rank(&rel_path, query);
+            mtimes.entry(rel_path.clone()).or_insert(mtime);
             match index.get(&rel_path) {
                 Some(&i) => {
                     // Both passes hit: keep the better rank, and the content
@@ -635,6 +768,20 @@ impl Db {
                     });
                 }
             }
+        }
+        // Recency blend: fold a small, bounded (magnitude ≤ RECENCY_MAX) negative
+        // offset from exponential mtime decay into every rank, so a recent file
+        // edges out an equally-scored stale one. RECENCY_MAX is far smaller than
+        // the gaps between the synthetic filename tiers (−2 / −50 / −100), so an
+        // exact/prefix filename match still dominates any content hit regardless
+        // of how recent the content is.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for hit in hits.iter_mut() {
+            let mtime = mtimes.get(&hit.rel_path).copied().unwrap_or(0);
+            hit.rank += recency_bonus(mtime, now_secs);
         }
         hits.sort_by(|a, b| {
             a.rank
@@ -2040,6 +2187,58 @@ fn query_tokens(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Common English stopwords dropped from the search path. Question-form
+/// queries ("what is the operating model for the AI pilot") otherwise force
+/// FTS5 to intersect the enormous posting lists of these ubiquitous words —
+/// ~40× slower than the keyword-only form — and the AND semantics wrongly
+/// exclude docs that simply lack a word like "what". Lowercase; compared
+/// case-insensitively.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "does", "for", "from", "has",
+    "have", "how", "i", "in", "is", "it", "my", "of", "on", "or", "that", "the", "this", "to",
+    "was", "we", "what", "when", "where", "which", "who", "why", "will", "with", "you",
+];
+
+fn is_stopword(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    STOPWORDS.contains(&lower.as_str())
+}
+
+/// Filter stopwords out of an already-tokenized query, with two guards that keep
+/// as-you-type and pure-stopword queries working:
+/// (a) the **last** token is never dropped — it is the as-you-type prefix token,
+///     and "the|" might be the user starting to type "theme";
+/// (b) if filtering would leave no non-stopword token *besides* that last one
+///     (e.g. a pure-stopword query like "what is the"), the original token list
+///     is returned unchanged so the query still matches something.
+fn significant_token_list(tokens: &[String]) -> Vec<String> {
+    if tokens.len() < 2 {
+        return tokens.to_vec();
+    }
+    let last = tokens.len() - 1;
+    let filtered: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .filter(|&(i, t)| i == last || !is_stopword(t))
+        .map(|(_, t)| t.clone())
+        .collect();
+    // Every survivor besides the always-kept last token is a non-stopword, so
+    // the count is simply `len - 1`. Fewer than one means the filter gutted the
+    // query — keep it verbatim.
+    if filtered.len().saturating_sub(1) < 1 {
+        tokens.to_vec()
+    } else {
+        filtered
+    }
+}
+
+/// Tokenize raw user input and drop stopwords per [`significant_token_list`]'s
+/// rules. Exposed so quick-answer / excerpt callers reuse the exact token set
+/// the search path builds its FTS query from, instead of hand-tokenizing.
+pub fn significant_tokens(query: &str) -> Vec<String> {
+    significant_token_list(&query_tokens(query))
+}
+
 /// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
 /// prefix for as-you-type feel.
 fn build_fts_query(tokens: &[String]) -> String {
@@ -2069,6 +2268,29 @@ fn build_fts_query(tokens: &[String]) -> String {
 const NAME_RANK_EXACT: f64 = -100.0;
 const NAME_RANK_PREFIX: f64 = -50.0;
 const NAME_RANK_SUBSTRING: f64 = -2.0;
+
+// Rank shaved off a doc whose query tokens occur as an adjacent phrase. Big
+// enough to lift a true phrase match over docs with the same tokens scattered,
+// small enough to stay well inside the gap to the filename tiers so filename
+// dominance is untouched.
+const PHRASE_BONUS: f64 = 5.0;
+
+// Recency blend. `RECENCY_MAX` bounds the (negative) bonus a file can earn from
+// being fresh; `RECENCY_TAU_DAYS` is the exponential decay constant. At ~1 week
+// old the bonus is still ~−2.7 (near the −RECENCY_MAX floor), and by ~1 year it
+// has decayed to essentially 0 — a recent file wins ties without ever
+// overpowering the filename tiers (RECENCY_MAX ≪ 48, the smallest tier gap).
+const RECENCY_MAX: f64 = 3.0;
+const RECENCY_TAU_DAYS: f64 = 60.0;
+
+/// Bounded negative recency offset for a file modified at `mtime` (unix
+/// seconds), given `now_secs`. Exponential decay on age: −`RECENCY_MAX` for a
+/// just-touched file, smoothly approaching 0 as the file ages. Future/clock-skew
+/// mtimes clamp to age 0 (max freshness).
+fn recency_bonus(mtime: i64, now_secs: i64) -> f64 {
+    let age_days = (now_secs - mtime).max(0) as f64 / 86_400.0;
+    -RECENCY_MAX * (-age_days / RECENCY_TAU_DAYS).exp()
+}
 
 /// Rank a filename match: exact basename (with or without extension) first,
 /// then basename prefix, then plain substring-in-path.
@@ -2791,6 +3013,154 @@ mod tests {
         let hits = db.search("a", 5).unwrap();
         assert!(hits.len() <= 5, "1-char query must respect limit: {}", hits.len());
         assert!(!hits.is_empty(), "1-char query should still return matches");
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn excerpt_centers_on_match_and_trims_word_boundaries() {
+        let mut db = Db::open_in_memory().unwrap();
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa \
+                    NEEDLE lambda mu nu xi omicron pi rho sigma tau upsilon phi";
+        db.upsert_file("doc.md", "md", 1, 1, "indexed", None, text).unwrap();
+
+        let ex = db
+            .excerpt("doc.md", &query_tokens("needle"), 40)
+            .expect("content present and token matches");
+        // Centered on the match (case-insensitive), and short of the full doc.
+        assert!(ex.to_lowercase().contains("needle"), "{ex:?}");
+        assert!(ex.len() < text.len(), "window must be smaller than the doc: {ex:?}");
+        // Match sits in the middle, so both ends are truncated with ellipses.
+        assert!(ex.starts_with('…') && ex.ends_with('…'), "{ex:?}");
+
+        // The core (sans ellipses) is a contiguous slice of the source that
+        // begins and ends on a word boundary — never mid-word, never mid-char.
+        let core = ex.trim_matches('…');
+        let idx = text.find(core).expect("core must be a contiguous source slice");
+        assert!(idx == 0 || text[..idx].ends_with(char::is_whitespace), "start mid-word: {core:?}");
+        let after = idx + core.len();
+        assert!(
+            after == text.len() || text[after..].starts_with(char::is_whitespace),
+            "end mid-word: {core:?}"
+        );
+    }
+
+    #[test]
+    fn excerpt_missing_or_empty_content_returns_none() {
+        let mut db = Db::open_in_memory().unwrap();
+        // No such file at all.
+        assert!(db.excerpt("ghost.md", &query_tokens("anything"), 350).is_none());
+        // File exists but has empty stored text (binary / OCR-pending shape).
+        db.upsert_file("scan.png", "png", 1, 1, "metadata_only", None, "").unwrap();
+        assert!(db.excerpt("scan.png", &query_tokens("anything"), 350).is_none());
+        // Content present but no token matches → also None (caller falls back).
+        db.upsert_file("note.md", "md", 1, 1, "indexed", None, "just some prose").unwrap();
+        assert!(db.excerpt("note.md", &query_tokens("absent"), 350).is_none());
+    }
+
+    #[test]
+    fn phrase_match_ranks_above_scattered_tokens() {
+        let mut db = Db::open_in_memory().unwrap();
+        // A: long doc containing the exact phrase "quick brown" (weaker bm25 on
+        // its own). B: short doc with both tokens but never adjacent in order.
+        db.upsert_file(
+            "a.md", "md", 1, 1, "indexed", None,
+            "In the morning report the quick brown metric rose sharply across \
+             every regional division and subteam over the quarter.",
+        )
+        .unwrap();
+        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "brown then quick").unwrap();
+        let hits = db.search("quick brown", 10).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].rel_path, "a.md", "phrase doc must rank first: {hits:?}");
+    }
+
+    #[test]
+    fn recency_breaks_ties_between_equal_content_matches() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Identical content → identical bm25. Names chosen so the alphabetical
+        // tie-break would put the *old* file first; recency must override that.
+        db.upsert_file("aaa-old.md", "md", 1, 1, "indexed", None, "unicorn stampede").unwrap();
+        db.upsert_file("zzz-new.md", "md", 1, now_secs(), "indexed", None, "unicorn stampede")
+            .unwrap();
+        let hits = db.search("unicorn", 10).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].rel_path, "zzz-new.md", "recent file must win the tie: {hits:?}");
+    }
+
+    #[test]
+    fn exact_filename_match_beats_recent_content_regardless_of_recency() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Old file whose *name* exactly matches the query, unrelated content.
+        db.upsert_file("budget.md", "md", 1, 1, "indexed", None, "quarterly figures").unwrap();
+        // Fresh file whose *content* matches the query.
+        db.upsert_file("notes.md", "md", 1, now_secs(), "indexed", None, "the budget was revised")
+            .unwrap();
+        let hits = db.search("budget", 10).unwrap();
+        assert_eq!(
+            hits[0].rel_path, "budget.md",
+            "exact filename match must dominate even a brand-new content match: {hits:?}"
+        );
+        // And its rank stays at the exact-name tier (recency barely perturbs an
+        // old file, and never enough to close the gap to content ranks anyway).
+        assert!(hits[0].rank <= NAME_RANK_EXACT + 0.001, "{hits:?}");
+    }
+
+    #[test]
+    fn stopwords_dropped_so_question_form_still_matches() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Content lacks "what"/"is"/"the" entirely; the pre-stopword AND query
+        // would exclude it. After filtering, only the content words remain.
+        db.upsert_file(
+            "brief.md", "md", 1, 1, "indexed", None,
+            "Operating model for our AI pilot program spans several teams.",
+        )
+        .unwrap();
+        let hits = db
+            .search("what is the operating model for the ai pilot", 10)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.rel_path == "brief.md"),
+            "question-form query should still find the content doc: {hits:?}"
+        );
+        // The filter keeps exactly the content-bearing tokens (last token kept).
+        assert_eq!(
+            significant_tokens("what is the operating model for the ai pilot"),
+            vec!["operating", "model", "ai", "pilot"],
+        );
+    }
+
+    #[test]
+    fn last_stopword_token_is_never_dropped() {
+        let mut db = Db::open_in_memory().unwrap();
+        // "the" is a stopword, but as the sole/last token it must survive so its
+        // as-you-type prefix still reaches "theme.txt".
+        db.upsert_file("theme.txt", "txt", 1, 1, "indexed", None, "themes and motifs").unwrap();
+        assert_eq!(significant_tokens("the"), vec!["the"]);
+        let hits = db.search("the", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.rel_path == "theme.txt"),
+            "sole stopword token must still prefix-match: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn pure_stopword_query_is_kept_verbatim() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("q.md", "md", 1, 1, "indexed", None, "what is the plan").unwrap();
+        // All tokens are stopwords → filter would gut the query, so it is kept
+        // unchanged and still matches as before.
+        assert_eq!(significant_tokens("what is"), vec!["what", "is"]);
+        let hits = db.search("what is", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.rel_path == "q.md"),
+            "pure-stopword query must still return results: {hits:?}"
+        );
     }
 
     #[test]
