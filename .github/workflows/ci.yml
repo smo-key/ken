@@ -154,10 +154,11 @@ jobs:
 
   # Proves Ken builds for aarch64-apple-darwin (Apple Silicon): workspace
   # compile with the metal ggml backend, plus the .app/.dmg bundles via
-  # `tauri build` — the same leg release.yml ships from macos-14. Rust tests
-  # stay on the Ubuntu job.
+  # `tauri build` — the same leg release.yml ships. macos-15, not macos-14:
+  # screencapturekit's apple-metal Swift bridge uses macOS 15 Metal APIs
+  # (MTLLogState), which macos-14's Xcode SDK cannot compile.
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
