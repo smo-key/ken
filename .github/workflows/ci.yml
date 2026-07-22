@@ -6,7 +6,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # ci-macos-arm is temporary, to exercise build-macos before merge —
+    # drop it when the branch merges.
+    branches: [main, ci-macos-arm]
   pull_request:
     branches: [main]
 
@@ -145,6 +147,47 @@ jobs:
       # createUpdaterArtifacts is enabled in tauri.conf.json, so `tauri build`
       # needs the updater signing key even in CI.
       - name: Build app bundle (NSIS)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+  # Proves Ken builds for aarch64-apple-darwin (Apple Silicon): workspace
+  # compile with the metal ggml backend, plus the .app/.dmg bundles via
+  # `tauri build` — the same leg release.yml ships from macos-14. Rust tests
+  # stay on the Ubuntu job.
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build ken-mcp sidecar
+        shell: bash
+        run: |
+          cargo build --release -p ken-mcp
+          mkdir -p src-tauri/binaries
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$triple"
+
+      # createUpdaterArtifacts is enabled in tauri.conf.json, so `tauri build`
+      # needs the updater signing key even in CI.
+      - name: Build app bundle
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
