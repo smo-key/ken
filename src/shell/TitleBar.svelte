@@ -1,12 +1,16 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
+  import { updater } from "../lib/updater.svelte";
   import { timeAgo } from "../lib/format";
   import ProjectSwitcher from "./ProjectSwitcher.svelte";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import Search from "@lucide/svelte/icons/search";
   import MessagesSquare from "@lucide/svelte/icons/messages-square";
+  import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import KenMark from "../lib/ui/KenMark.svelte";
+
+  updater.start();
 
   let switcherOpen = $state(false);
 
@@ -21,6 +25,14 @@
     return app.lastScanAt
       ? `Watching · updated ${timeAgo(Math.floor(app.lastScanAt / 1000))}`
       : "Watching";
+  });
+  const updateTitle = $derived.by(() => {
+    if (updater.phase === "downloading") {
+      return updater.progress === null
+        ? "Downloading update…"
+        : `Downloading update… ${Math.round(updater.progress * 100)}%`;
+    }
+    return `Restart Ken to update to v${updater.version}`;
   });
 </script>
 
@@ -47,6 +59,18 @@
     <span class="hint">Search project knowledge…</span>
     <span class="kbd">⌘K</span>
   </button>
+
+  {#if updater.phase === "downloading"}
+    <span class="update downloading" title={updateTitle}>
+      <RefreshCw size={13} strokeWidth={1.75} aria-hidden="true" />
+      Downloading update…
+    </span>
+  {:else if updater.phase === "ready"}
+    <button class="update ready" title={updateTitle} onclick={() => updater.restart()}>
+      <RefreshCw size={13} strokeWidth={1.75} aria-hidden="true" />
+      Update ready — Restart
+    </button>
+  {/if}
 
   <button
     class="chats"
@@ -189,5 +213,33 @@
     height: 7px;
     border-radius: 4px;
     background: var(--needs-input);
+  }
+  .update {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 28px;
+    padding: 0 11px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .update.downloading {
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink-tertiary);
+  }
+  .update.downloading :global(svg) {
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .update.ready {
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    color: var(--accent-deep);
+    cursor: pointer;
+  }
+  .update.ready:hover {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
   }
 </style>
