@@ -5,6 +5,33 @@
 @import "@fontsource/ibm-plex-mono/400.css";
 @import "@fontsource/ibm-plex-mono/500.css";
 @import "@fontsource/oregano/400.css";
+/* Metric-compatible stand-ins for the Office fonts decks name but that ship with
+   neither macOS nor Office's own install: Carlito for Calibri, Arimo for Arial,
+   Tinos for Times New Roman. Identical advance widths, so a .pptx/.docx preview
+   wraps where PowerPoint wraps instead of at a fallback's wider metrics.
+   Bold/italic are needed because decks use them and a synthesized face has
+   different metrics again. Latin and latin-ext only: a Tauri bundle ships every
+   subset it imports whether or not a deck ever needs it, and the full set costs
+   ~4 MB for scripts these faces are rarely asked to render. Other scripts fall
+   back as they did before. */
+@import "@fontsource/carlito/latin-400.css";
+@import "@fontsource/carlito/latin-400-italic.css";
+@import "@fontsource/carlito/latin-700.css";
+@import "@fontsource/carlito/latin-700-italic.css";
+@import "@fontsource/carlito/latin-ext-400.css";
+@import "@fontsource/carlito/latin-ext-700.css";
+@import "@fontsource/arimo/latin-400.css";
+@import "@fontsource/arimo/latin-400-italic.css";
+@import "@fontsource/arimo/latin-700.css";
+@import "@fontsource/arimo/latin-700-italic.css";
+@import "@fontsource/arimo/latin-ext-400.css";
+@import "@fontsource/arimo/latin-ext-700.css";
+@import "@fontsource/tinos/latin-400.css";
+@import "@fontsource/tinos/latin-400-italic.css";
+@import "@fontsource/tinos/latin-700.css";
+@import "@fontsource/tinos/latin-700-italic.css";
+@import "@fontsource/tinos/latin-ext-400.css";
+@import "@fontsource/tinos/latin-ext-700.css";
 
 :root {
   /* neutrals — paper */

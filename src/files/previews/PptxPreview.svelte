@@ -4,19 +4,27 @@
   import { registerDomFind } from "../../lib/find-dom.svelte";
   import { mimeForExtension } from "../../lib/mime";
   import {
+    cssFontStack,
     parseBackground,
+    parseDefaultTextStyle,
     parseMasterTextStyles,
     parsePlaceholders,
     parseRels,
     parseSlide,
     parseSlideSize,
+    parseTableStyles,
     parseTheme,
+    isHiddenSlide,
+    ptToPx,
     resolvePath,
     slidePathsInOrder,
     type MasterTextStyles,
+    type Paragraph,
     type Placeholder,
     type Shape,
+    type ShapeLine,
     type SlideSize,
+    type TableCell,
     type ThemeContext,
   } from "./pptx";
   import { extractZip, type PartFiles } from "./pptx.worker";
@@ -69,22 +77,120 @@
     return shape.defaultSizePt ?? (shape.isTitle ? 40 : 18);
   }
 
-  /** Points → CSS px (72pt/inch, 96px/inch) within the slide's native frame. */
-  function ptToPx(pt: number): number {
-    return pt * (96 / 72);
+  /** A px length that the shrink-to-fit pass can scale via the shape's --fit. */
+  function fitPx(px: number): string {
+    return `calc(${px}px * var(--fit, 1))`;
   }
 
   function runStyle(
     run: RenderShape["paragraphs"][number]["runs"][number],
     shape: RenderShape,
   ): string {
-    const parts = [`font-size:${ptToPx(run.sizePt ?? defaultSizePt(shape))}px`];
+    const parts = [`font-size:${fitPx(ptToPx(run.sizePt ?? defaultSizePt(shape)))}`];
     if (run.bold) parts.push("font-weight:700");
     if (run.italic) parts.push("font-style:italic");
     if (run.underline) parts.push("text-decoration:underline");
     if (run.color) parts.push(`color:${run.color}`);
-    if (run.font) parts.push(`font-family:'${run.font}',sans-serif`);
+    if (run.highlight) parts.push(`background-color:${run.highlight}`);
+    if (run.letterSpacingPx) parts.push(`letter-spacing:${run.letterSpacingPx}px`);
+    const stack = cssFontStack(run.font);
+    if (stack) parts.push(`font-family:${stack}`);
     return parts.join(";");
+  }
+
+  /** A CSS `content` string literal, so a bullet glyph can ride in a custom property. */
+  function cssString(s: string): string {
+    return `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+  }
+
+  /** A resolved outline as a CSS border shorthand, or `none` when absent. */
+  function borderCss(line: ShapeLine | undefined): string {
+    if (!line) return "none";
+    const style = line.dash === "dot" ? "dotted" : line.dash ? "dashed" : "solid";
+    return `${line.width}px ${style} ${line.color}`;
+  }
+
+  /** Paragraph box metrics: alignment, resolved leading, spacing and indents. */
+  function paraStyle(para: Paragraph, shape: RenderShape): string {
+    const parts = [`text-align:${para.align ?? "left"}`];
+    if (para.lineHeightPx) parts.push(`line-height:${fitPx(para.lineHeightPx)}`);
+    else if (para.lineHeight) parts.push(`line-height:${para.lineHeight}`);
+    if (para.spaceBeforePx) parts.push(`margin-top:${fitPx(para.spaceBeforePx)}`);
+    if (para.spaceAfterPx) parts.push(`margin-bottom:${fitPx(para.spaceAfterPx)}`);
+    // marL is the text edge and indent the (usually negative) first-line offset,
+    // so the hanging bullet sits at marL+indent. A bulleted paragraph that
+    // authored neither gets a default hang rather than a bullet over its text.
+    let marL = para.marginLeftPx ?? para.level * 24;
+    let indent = para.indentPx;
+    if (para.bullet && marL === 0 && indent === undefined) {
+      marL = 18;
+      indent = -18;
+    }
+    if (marL) parts.push(`padding-left:${marL}px`);
+    // The hang belongs to the bullet, not the text: PowerPoint starts every line
+    // of a bulleted paragraph at marL and parks the marker at marL+indent. Only
+    // an unbulleted paragraph gets a real first-line indent, otherwise its first
+    // line would sit a hang's width left of the ones that wrap after it.
+    if (indent && !para.bullet) parts.push(`text-indent:${indent}px`);
+    const sizePx = ptToPx(para.sizePt ?? defaultSizePt(shape));
+    if (para.bullet) {
+      parts.push(`--bullet-left:${marL + (indent ?? 0)}px`);
+      parts.push(`--bullet-text:${cssString(para.bulletText ?? "•")}`);
+      // The bullet is a ::before on the paragraph, which has no font of its own;
+      // without these it would render at the stage default, not the run's size.
+      parts.push(`--bullet-size:${fitPx(para.bulletSizePx ?? sizePx)}`);
+      const color = para.bulletColor ?? para.runs[0]?.color;
+      if (color) parts.push(`--bullet-color:${color}`);
+      const stack = cssFontStack(para.bulletFont ?? para.runs[0]?.font);
+      if (stack) parts.push(`--bullet-font:${stack}`);
+    }
+    // An empty paragraph has no runs to give the line box a height.
+    if (!para.runs.length) parts.push(`font-size:${fitPx(sizePx)}`);
+    return parts.join(";");
+  }
+
+  /** Per-cell fill, margins and the four edges a:lnL/R/T/B actually declared. */
+  function cellStyle(cell: TableCell): string {
+    const parts: string[] = [];
+    if (cell.fill) parts.push(`background-color:${cell.fill}`);
+    parts.push(
+      `vertical-align:${cell.anchor === "center" ? "middle" : cell.anchor === "bottom" ? "bottom" : "top"}`,
+    );
+    const m = cell.margins;
+    if (m) parts.push(`padding:${m.t}px ${m.r}px ${m.b}px ${m.l}px`);
+    const b = cell.borders;
+    parts.push(`border-left:${borderCss(b?.l)}`);
+    parts.push(`border-right:${borderCss(b?.r)}`);
+    parts.push(`border-top:${borderCss(b?.t)}`);
+    parts.push(`border-bottom:${borderCss(b?.b)}`);
+    // Diagonals have no border property; paint them as gradients over the fill.
+    const diag: string[] = [];
+    if (b?.tlToBr) diag.push(diagonal(b.tlToBr, "to bottom right"));
+    if (b?.blToTr) diag.push(diagonal(b.blToTr, "to top right"));
+    if (diag.length) parts.push(`background-image:${diag.join(",")}`);
+    return parts.join(";");
+  }
+
+  function diagonal(line: ShapeLine, dir: string): string {
+    const w = Math.max(line.width, 0.5);
+    return `linear-gradient(${dir}, transparent calc(50% - ${w}px), ${line.color} 50%, transparent calc(50% + ${w}px))`;
+  }
+
+  /** Image sizing: a:stretch fills the frame, a:srcRect scales-and-offsets to crop. */
+  function imgStyle(shape: RenderShape): string {
+    const c = shape.crop;
+    if (!c) return shape.stretch ? "object-fit:fill" : "";
+    // Show only the uncropped window: blow the picture up by 1/(1-l-r) and slide
+    // the cropped-away margin out of the (clipped) frame.
+    const kw = 1 - c.l - c.r;
+    const kh = 1 - c.t - c.b;
+    return [
+      "object-fit:fill",
+      `width:${100 / kw}%`,
+      `height:${100 / kh}%`,
+      `margin-left:${(-c.l / kw) * 100}%`,
+      `margin-top:${(-c.t / kh) * 100}%`,
+    ].join(";");
   }
 
   /** SVG stroke-dasharray (px, relative to line width) for a dash family. */
@@ -106,6 +212,8 @@
     ];
     if (shape.w !== null) parts.push(`width:${shape.w}px`);
     if (shape.h !== null) parts.push(`height:${shape.h}px`);
+    const ins = shape.insets;
+    if (ins) parts.push(`padding:${ins.t}px ${ins.r}px ${ins.b}px ${ins.l}px`);
     parts.push(
       `justify-content:${shape.anchor === "center" ? "center" : shape.anchor === "bottom" ? "flex-end" : "flex-start"}`,
     );
@@ -118,23 +226,41 @@
         parts.push(`background-image:url(${shape.fillImageUrl})`, "background-size:cover");
       else if (shape.gradient) parts.push(`background-image:${shape.gradient}`);
       else if (shape.fill) parts.push(`background:${shape.fill}`);
-      if (shape.line) {
-        const style =
-          shape.line.dash === "dot" ? "dotted" : shape.line.dash ? "dashed" : "solid";
-        parts.push(`border:${shape.line.width}px ${style} ${shape.line.color}`);
-      }
+      if (shape.line) parts.push(`border:${borderCss(shape.line)}`);
       if (shape.geom === "ellipse") parts.push("border-radius:50%");
-      else if (shape.geom === "roundRect") parts.push("border-radius:8%");
+      else if (shape.geom === "roundRect") parts.push(`border-radius:${cornerPx(shape)}px`);
     }
     if (shape.shadow) {
       parts.push(isPath ? `filter:drop-shadow(${shape.shadow})` : `box-shadow:${shape.shadow}`);
+    }
+    // PowerPoint's default is vertOverflow="overflow": text spills out of its
+    // box rather than being clipped, and our metrics are close but never exact,
+    // so clipping would silently drop a last line. Only a picture fill has to
+    // stay inside its frame.
+    // A table likewise grows past its frame when a cell wraps further than
+    // PowerPoint's metrics did; clipping would drop whole rows.
+    if (!shape.fillImageUrl && (shape.paragraphs.length || shape.table)) {
+      parts.push("overflow:visible");
     }
     const tf: string[] = [];
     if (shape.rot) tf.push(`rotate(${shape.rot}deg)`);
     if (shape.flipH) tf.push("scaleX(-1)");
     if (shape.flipV) tf.push("scaleY(-1)");
+    // Vertical text: vertical-rl runs top-to-bottom/right-to-left (a:bodyPr
+    // vert); vert270 is the same flow rotated a half-turn to read bottom-up.
+    if (shape.vert) {
+      parts.push("writing-mode:vertical-rl");
+      if (shape.vert === "vert270") tf.push("rotate(180deg)");
+    }
     if (tf.length) parts.push(`transform:${tf.join(" ")}`);
     return parts.join(";");
+  }
+
+  /** roundRect radius in px: a fraction of the shorter side, per a:avLst's adj. */
+  function cornerPx(shape: RenderShape): number {
+    const frac = shape.cornerRadius ?? 1 / 6;
+    const side = Math.min(shape.w ?? 0, shape.h ?? 0);
+    return side > 0 ? side * frac : 0;
   }
 
   function stageStyle(slide: RenderSlide): string {
@@ -147,14 +273,64 @@
     return parts.join(";");
   }
 
-  /** Set --scale so a native-sized slide fills the responsive wrapper width. */
+  /**
+   * Set --scale so the native-sized .stage fills its responsive wrapper. This
+   * must measure the WRAPPER: the stage's own width is pinned to nativeWidth,
+   * so measuring it would always yield a scale of exactly 1.
+   */
   function fitScale(node: HTMLElement, nativeWidth: number) {
+    let native = nativeWidth;
     const apply = () =>
-      node.style.setProperty("--scale", String(node.clientWidth / nativeWidth));
+      node.style.setProperty("--scale", String(node.clientWidth / native));
     const ro = new ResizeObserver(apply);
     ro.observe(node);
     apply();
-    return { destroy: () => ro.disconnect() };
+    return {
+      update(nw: number) {
+        native = nw;
+        apply();
+      },
+      destroy: () => ro.disconnect(),
+    };
+  }
+
+  // PowerPoint's own shrink-to-fit bottoms out around a quarter of the authored
+  // size; below that it lets the text overflow instead.
+  const MIN_FIT = 0.25;
+
+  /**
+   * Measured shrink-to-fit for a:normAutofit shapes. The fontScale PowerPoint
+   * stored was computed for the authored font; with a substituted (usually
+   * wider) one the text still overflows, so measure once after layout and
+   * binary-search --fit down until it fits. Shapes without normAutofit never get
+   * this action — PowerPoint lets those overflow and so do we.
+   */
+  function shrinkToFit(node: HTMLElement, enabled: boolean) {
+    if (!enabled) return;
+    let done = false;
+    const fits = () => node.scrollHeight <= node.clientHeight + 0.5;
+    const apply = () => {
+      if (done || cancelled) return;
+      done = true;
+      // A box with no resolved height can't overflow; nothing to measure.
+      if (!node.clientHeight || fits()) return;
+      let lo = MIN_FIT;
+      let hi = 1;
+      // 6 halvings land within ~1% of the largest scale that still fits.
+      for (let i = 0; i < 6; i++) {
+        const mid = (lo + hi) / 2;
+        node.style.setProperty("--fit", String(mid));
+        if (fits()) lo = mid;
+        else hi = mid;
+      }
+      node.style.setProperty("--fit", String(lo));
+    };
+    // Webfonts settle after first layout and would invalidate the measurement,
+    // so wait for them where the browser can tell us; one pass either way.
+    const ready = document.fonts?.ready;
+    if (ready) ready.then(apply, apply);
+    else requestAnimationFrame(apply);
+    return { destroy() { done = true; } };
   }
 
   // --- Media (built as worker/main-thread streams entries in) -----------------
@@ -305,6 +481,9 @@
           return na - nb;
         });
     }
+    // Hidden slides are skipped outright, so the numbers we show keep matching
+    // PowerPoint's (which renumbers around them) rather than the file order.
+    slidePaths = slidePaths.filter((p) => !isHiddenSlide(files[p]));
     if (slidePaths.length > MAX_SLIDES) {
       slidePaths = slidePaths.slice(0, MAX_SLIDES);
       truncated = true;
@@ -315,6 +494,9 @@
     const layoutPhCache = new Map<string, Placeholder[]>();
     const masterPhCache = new Map<string, Placeholder[]>();
     const textStyleCache = new Map<string, MasterTextStyles>();
+    const defaultTextStyle = parseDefaultTextStyle(presXml);
+    // Deck-wide, so parse it once: a:tblPr's tableStyleId indexes into it.
+    const tableStyles = parseTableStyles(files["ppt/tableStyles.xml"]);
 
     for (let i = 0; i < slidePaths.length; i++) {
       if (cancelled) return;
@@ -343,21 +525,37 @@
         layout: memo(layoutPhCache, layoutPath, () => parsePlaceholders(layoutXml)),
         master: memo(masterPhCache, masterPath, () => parsePlaceholders(masterXml)),
         textStyles: memo(textStyleCache, masterPath, () => parseMasterTextStyles(masterXml)),
+        defaultTextStyle,
+        layoutXml,
+        masterXml,
+        tableStyles,
       };
 
       const parsed = parseSlide(xml, theme, inherit);
 
+      // A shape's embed ids are relative to the part it came from, so layout and
+      // master shapes must resolve through that part's rels and base directory.
+      const partOf = (shape: Shape): [Map<string, string> | null, string] =>
+        shape.source === "layout"
+          ? [layoutRels, layoutDir]
+          : shape.source === "master"
+            ? [masterRels, masterDir]
+            : [slideRels, slideDir];
+
       const render: RenderShape[] = [];
       for (const shape of parsed.shapes) {
         const rs: RenderShape = { ...shape };
+        const [rels, dir] = partOf(shape);
         if (shape.kind === "image") {
-          const m = mediaByEmbed(shape.embedId, slideRels, slideDir);
+          const m = mediaByEmbed(shape.embedId, rels, dir);
           if (m?.url) rs.imgSrc = m.url;
-          else if (m) rs.imgUndecodable = true; // known media, no decoder
-          else continue; // unresolved reference → nothing to show
+          // A hatched "can't decode" box is honest for a slide's own picture but
+          // just noise for template decoration, so drop those silently.
+          else if (m && !shape.source) rs.imgUndecodable = true;
+          else continue;
         }
         if (shape.fillImageEmbedId) {
-          rs.fillImageUrl = mediaByEmbed(shape.fillImageEmbedId, slideRels, slideDir)?.url;
+          rs.fillImageUrl = mediaByEmbed(shape.fillImageEmbedId, rels, dir)?.url;
         }
         render.push(rs);
       }
@@ -422,15 +620,18 @@
   {:else}
     <div class="deck" bind:this={deck}>
       {#each slides as slide (slide.number)}
-        <figure class="slide-wrap" style="aspect-ratio:{size.width}/{size.height}">
-          <div
-            class="stage"
-            class:flow={!slide.positioned}
-            style={stageStyle(slide)}
-            use:fitScale={size.width}
-          >
+        <figure
+          class="slide-wrap"
+          style="aspect-ratio:{size.width}/{size.height}"
+          use:fitScale={size.width}
+        >
+          <div class="stage" class:flow={!slide.positioned} style={stageStyle(slide)}>
             {#each slide.shapes as shape, si (si)}
-              <div class="shape" style={boxStyle(shape)}>
+              <div
+                class="shape"
+                style={boxStyle(shape)}
+                use:shrinkToFit={shape.shrinkToFit === true}
+              >
                 {#if shape.geomPath}
                   <svg
                     class="geom"
@@ -448,8 +649,10 @@
                   </svg>
                 {/if}
                 {#if shape.kind === "image"}
-                  {#if shape.imgSrc}
-                    <img src={shape.imgSrc} alt="" />
+                  {#if shape.imgSrc && shape.tile}
+                    <div class="tiled" style="background-image:url({shape.imgSrc})"></div>
+                  {:else if shape.imgSrc}
+                    <img src={shape.imgSrc} alt="" style={imgStyle(shape)} />
                   {:else if shape.imgUndecodable}
                     <div class="ph">Vector image (EMF/WMF)</div>
                   {/if}
@@ -470,16 +673,10 @@
                               <td
                                 colspan={cell.gridSpan}
                                 rowspan={cell.rowSpan}
-                                style="{cell.fill
-                                  ? `background:${cell.fill};`
-                                  : ''}vertical-align:{cell.anchor === 'center'
-                                  ? 'middle'
-                                  : cell.anchor === 'bottom'
-                                    ? 'bottom'
-                                    : 'top'}"
+                                style={cellStyle(cell)}
                               >
                                 {#each cell.paragraphs as para, pi (pi)}
-                                  <p class="para" style="text-align:{para.align ?? 'left'}">
+                                  <p class="para" style={paraStyle(para, shape)}>
                                     {#each para.runs as run, rii (rii)}<span
                                         style={runStyle(run, shape)}>{run.text}</span
                                       >{/each}
@@ -494,13 +691,7 @@
                   </table>
                 {:else}
                   {#each shape.paragraphs as para, pi (pi)}
-                    <p
-                      class="para"
-                      class:bullet={para.bullet}
-                      style="text-align:{para.align ??
-                        (shape.isTitle ? 'center' : 'left')};padding-left:{para.level *
-                        24}px"
-                    >
+                    <p class="para" class:bullet={para.bullet} style={paraStyle(para, shape)}>
                       {#each para.runs as run, ri (ri)}<span
                           style={runStyle(run, shape)}>{run.text}</span
                         >{/each}
@@ -585,6 +776,12 @@
     height: 100%;
     object-fit: contain;
   }
+  /* a:tile repeats the picture at its natural size instead of scaling it. */
+  .tiled {
+    flex: 1;
+    align-self: stretch;
+    background-repeat: repeat;
+  }
   /* Auto-flow shapes have no fixed height, so let the image size to its box. */
   .stage.flow .shape img {
     height: auto;
@@ -628,9 +825,11 @@
     table-layout: fixed;
     font-size: 14px;
   }
+  /* Every edge, margin and fill comes from the cell's own a:tcPr (and, beneath
+     it, the table style) — a default grid would invent lines PowerPoint doesn't
+     draw. border-collapse still needs a declared border-style to win a tie. */
   .tbl td {
-    border: 1px solid #bbb;
-    padding: 2px 6px;
+    border: 0 solid transparent;
     overflow: hidden;
     word-break: break-word;
   }
@@ -641,14 +840,19 @@
     word-break: break-word;
     position: relative;
   }
-  .para.bullet {
-    position: relative;
-    padding-left: 1.1em;
-  }
   .para.bullet::before {
-    content: "•";
+    content: var(--bullet-text, "•");
     position: absolute;
-    left: 0.15em;
+    left: var(--bullet-left, 0);
+    color: var(--bullet-color, inherit);
+    font-family: var(--bullet-font, inherit);
+    font-size: var(--bullet-size, inherit);
+    line-height: inherit;
+  }
+  /* An empty paragraph carries real vertical rhythm, but an empty inline box has
+     no height — a zero-width space gives it one without adding findable text. */
+  .para:empty::before {
+    content: "\200b";
   }
   .badge {
     position: absolute;

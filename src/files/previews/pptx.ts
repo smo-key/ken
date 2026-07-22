@@ -2,15 +2,44 @@
 // XML; the component owns the zip/media I/O, this module owns turning slide XML
 // into a positioned, styled model the view can lay out absolutely. Kept free of
 // Svelte/jszip so it runs under vitest with only a DOMParser (happy-dom).
+// Colour/theme/font and text-style inheritance live in ./pptx-style.
 
-// OOXML measures in EMU: 914400 per inch, and CSS is 96px per inch, so one CSS
-// pixel is exactly 9525 EMU. We render each slide at these native px then scale
-// the whole slide with a CSS transform, which keeps DOM text crisp at any size.
-const EMU_PER_PX = 9525;
+import {
+  applyRPr,
+  cssFontStack,
+  directChild,
+  emuToPx,
+  firstChildTag,
+  firstClrChild,
+  levelStyles,
+  parseTheme,
+  parseXml,
+  phFamily,
+  ptToPx,
+  relAttr,
+  resolveClrEl,
+  resolveColor,
+  resolveGradient,
+  resolveParagraphStyle,
+  resolveRunStyle,
+  resolveStyleRef,
+  resolveTypeface,
+  type LevelStyles,
+  type StyleChain,
+  type TextAlign,
+  type TextStyle,
+  type ThemeContext,
+} from "./pptx-style";
 
-export function emuToPx(emu: number): number {
-  return emu / EMU_PER_PX;
-}
+export {
+  cssFontStack,
+  emuToPx,
+  parseTheme,
+  ptToPx,
+  resolveColor,
+  resolveGradient,
+  type ThemeContext,
+};
 
 export interface SlideSize {
   width: number;
@@ -25,13 +54,42 @@ export interface TextRun {
   color?: string;
   sizePt?: number;
   font?: string;
+  /** a:highlight — a background colour behind just this run. */
+  highlight?: string;
+  /** a:rPr@spc tracking in px (negative tightens); absent when zero. */
+  letterSpacingPx?: number;
 }
 
 export interface Paragraph {
   runs: TextRun[];
-  align?: "left" | "center" | "right" | "justify";
+  align?: TextAlign;
   level: number;
   bullet: boolean;
+  /**
+   * a:lnSpc as a unitless CSS line-height. Percentage line spacing is relative
+   * to each run's own size, so it must stay unitless: a paragraph that mixes an
+   * 18pt heading run with a 12pt body run gets two different line boxes, as it
+   * does in PowerPoint.
+   */
+  lineHeight?: number;
+  /** a:lnSpc given as exact points (a:spcPts) → a fixed px line box. */
+  lineHeightPx?: number;
+  /** a:spcBef / a:spcAft resolved against the paragraph's own font size. */
+  spaceBeforePx?: number;
+  spaceAfterPx?: number;
+  /** a:marL / a:indent in px; indent is negative for a hanging bullet. */
+  marginLeftPx?: number;
+  indentPx?: number;
+  /** Font size of the line box, which is all an empty paragraph contributes. */
+  sizePt?: number;
+  /** The bullet glyph or list number to draw, when `bullet` is true. */
+  bulletText?: string;
+  /** a:buFont for the glyph; bullets routinely use a different family. */
+  bulletFont?: string;
+  /** a:buClr, when the bullet is coloured independently of the text. */
+  bulletColor?: string;
+  /** Bullet size in px, resolved from a:buSzPct/a:buSzPts against the run size. */
+  bulletSizePx?: number;
 }
 
 export type ShapeKind =
@@ -42,12 +100,26 @@ export type ShapeKind =
   | "table"
   | "placeholder";
 
+/** Which part a shape came from — decides which rels resolve its media. */
+export type ShapeSource = "slide" | "layout" | "master";
+
 /** Resolved outline: CSS colour + width in px, plus optional dash pattern. */
 export interface ShapeLine {
   color: string;
   width: number;
   /** Preset dash style (a:prstDash) mapped to a coarse family, when dashed. */
   dash?: "dash" | "dot" | "dashDot";
+}
+
+/** Per-edge cell outlines; an absent edge draws nothing at all. */
+export interface CellBorders {
+  l?: ShapeLine;
+  r?: ShapeLine;
+  t?: ShapeLine;
+  b?: ShapeLine;
+  /** a:lnTlToBr / a:lnBlToTr, drawn as an overlaid diagonal. */
+  tlToBr?: ShapeLine;
+  blToTr?: ShapeLine;
 }
 
 export interface TableCell {
@@ -61,6 +133,10 @@ export interface TableCell {
   /** Continuation of a vertical span → the view skips it. */
   vMerge: boolean;
   anchor: "top" | "center" | "bottom";
+  /** a:lnL/R/T/B, plus whatever the table style contributes beneath them. */
+  borders?: CellBorders;
+  /** a:tcPr marL/marR/marT/marB in px (OOXML defaults when unset). */
+  margins?: Insets;
 }
 
 export interface TableRow {
@@ -72,6 +148,24 @@ export interface TableRow {
 export interface Table {
   colWidths: number[];
   rows: TableRow[];
+}
+
+/** a:tblPr's banding/emphasis flags — which table-style parts apply. */
+interface TableFlags {
+  firstRow: boolean;
+  lastRow: boolean;
+  firstCol: boolean;
+  lastCol: boolean;
+  bandRow: boolean;
+  bandCol: boolean;
+}
+
+/** a:bodyPr text insets in px. */
+export interface Insets {
+  l: number;
+  t: number;
+  r: number;
+  b: number;
 }
 
 export interface Shape {
@@ -110,11 +204,27 @@ export interface Shape {
   table?: Table;
   isTitle: boolean;
   anchor: "top" | "center" | "bottom";
+  /** Resolved a:bodyPr text insets, defaulted per the OOXML spec. */
+  insets?: Insets;
   /** Clockwise rotation in degrees (from a:xfrm rot, 60000ths of a degree). */
   rot?: number;
   /** Horizontal / vertical flip flags (from a:xfrm flipH/flipV). */
   flipH?: boolean;
   flipV?: boolean;
+  /** a:blipFill/a:stretch → the picture fills its frame instead of letterboxing. */
+  stretch?: boolean;
+  /** a:srcRect crop, as the fraction of the source inset from each edge. */
+  crop?: Insets;
+  /** a:tile → the picture repeats at its natural size instead of stretching. */
+  tile?: boolean;
+  /** roundRect corner radius as a fraction of the shorter side (a:avLst adj). */
+  cornerRadius?: number;
+  /** a:bodyPr vert — rotated text flow inside the shape. */
+  vert?: "vert" | "vert270";
+  /** a:normAutofit: the view may measure and shrink the text to fit the box. */
+  shrinkToFit?: boolean;
+  /** Absent means the slide's own spTree. */
+  source?: ShapeSource;
 }
 
 /** A resolved slide background fill: solid colour, CSS gradient, or picture. */
@@ -131,19 +241,23 @@ export interface ParsedSlide {
   background?: SlideBackground;
 }
 
-/** A placeholder's inheritable geometry/anchor, read from a layout or master. */
+/** A placeholder's inheritable geometry/anchor/styling, from a layout or master. */
 export interface Placeholder {
   type: string | null;
   idx: number | null;
   box: Pick<Shape, "x" | "y" | "w" | "h"> | null;
   anchor?: Shape["anchor"];
+  /** The placeholder's a:lstStyle level overrides, for the inheritance chain. */
+  levels?: LevelStyles;
+  /** Its a:bodyPr, so insets/autofit inherit when the slide shape omits them. */
+  bodyPr?: Element | null;
 }
 
-/** Default text sizes (pt) by placeholder family, read from a master's txStyles. */
+/** A master's p:txStyles: nine level styles per placeholder family. */
 export interface MasterTextStyles {
-  title?: number;
-  body?: number;
-  other?: number;
+  title: LevelStyles;
+  body: LevelStyles;
+  other: LevelStyles;
 }
 
 /** Inheritance context threaded from the slide's layout + master into parseSlide. */
@@ -151,37 +265,13 @@ export interface InheritContext {
   layout?: Placeholder[];
   master?: Placeholder[];
   textStyles?: MasterTextStyles;
-}
-
-const parser = new DOMParser();
-
-// happy-dom silently drops prefixed *attributes* (r:embed, r:id) when parsing
-// namespaced XML, so relationship ids would vanish in tests. Rewrite the colon
-// in attribute names to an underscore before parsing — applied uniformly so the
-// webview and happy-dom agree — while leaving element tag names and xmlns
-// declarations (needed for namespace resolution) untouched.
-function normalizeNsAttrs(xml: string): string {
-  return xml.replace(
-    /(\s)([A-Za-z][\w-]*):([A-Za-z][\w-]*)=/g,
-    (m, sp, prefix, local) => (prefix === "xmlns" ? m : `${sp}${prefix}_${local}=`),
-  );
-}
-
-function parseXml(xml: string): Document {
-  return parser.parseFromString(normalizeNsAttrs(xml), "application/xml");
-}
-
-/** Read a relationships-namespace attribute (r:embed → r_embed after normalize). */
-function relAttr(el: Element, local: string): string | null {
-  return (
-    el.getAttribute(`r_${local}`) ??
-    Array.from(el.attributes).find((a) => a.name.endsWith(`_${local}`))?.value ??
-    null
-  );
-}
-
-function firstChildTag(parent: Element, tag: string): Element | null {
-  return parent.getElementsByTagName(tag)[0] ?? null;
+  /** presentation.xml's p:defaultTextStyle — the floor for plain text boxes. */
+  defaultTextStyle?: LevelStyles;
+  /** Layout/master XML, so their own shapes render beneath the slide's. */
+  layoutXml?: string;
+  masterXml?: string;
+  /** ppt/tableStyles.xml, indexed by styleId (see parseTableStyles). */
+  tableStyles?: Map<string, Element>;
 }
 
 export function parseSlideSize(presentationXml: string | undefined): SlideSize {
@@ -236,6 +326,15 @@ export function slidePathsInOrder(
     if (target) paths.push(resolvePath("ppt", target));
   }
   return paths;
+}
+
+/** presentation.xml's p:defaultTextStyle levels, the floor for plain text boxes. */
+export function parseDefaultTextStyle(
+  presentationXml: string | undefined,
+): LevelStyles {
+  if (!presentationXml) return levelStyles(null);
+  const doc = parseXml(presentationXml);
+  return levelStyles(doc.getElementsByTagName("p:defaultTextStyle")[0] ?? null);
 }
 
 function xfrmOf(sp: Element): Pick<Shape, "x" | "y" | "w" | "h"> {
@@ -311,265 +410,6 @@ function applyCtx(
   };
 }
 
-export interface ThemeContext {
-  colors: Record<string, string>;
-}
-
-// --- Color helpers (sRGB <-> HSL for lumMod/lumOff) ---------------------------
-
-function clamp01(n: number): number {
-  return n < 0 ? 0 : n > 1 ? 1 : n;
-}
-
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  let h = 0, s = 0;
-  if (max !== min) {
-    const d = max - min;
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-    else if (max === g) h = (b - r) / d + 2;
-    else h = (r - g) / d + 4;
-    h /= 6;
-  }
-  return [h, s, l];
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  if (s === 0) {
-    const v = Math.round(l * 255);
-    return [v, v, v];
-  }
-  const hue = (p: number, q: number, t: number) => {
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1 / 6) return p + (q - p) * 6 * t;
-    if (t < 1 / 2) return q;
-    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-    return p;
-  };
-  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-  const p = 2 * l - q;
-  return [
-    Math.round(hue(p, q, h + 1 / 3) * 255),
-    Math.round(hue(p, q, h) * 255),
-    Math.round(hue(p, q, h - 1 / 3) * 255),
-  ];
-}
-
-function hex2(n: number): string {
-  return Math.max(0, Math.min(255, Math.round(n))).toString(16).toUpperCase().padStart(2, "0");
-}
-
-/**
- * Apply DrawingML colour-transform child elements (in document order) to a base
- * RGB. Returns the final CSS colour string (#RRGGBB, or rgba(...) if alpha set).
- * frac = val/100000 (val is in thousandths). See Global Constraints for formulas.
- */
-function applyColorTransforms(clr: Element, rgb: [number, number, number]): string {
-  let [r, g, b] = rgb;
-  let alpha = 1;
-  for (const t of Array.from(clr.children)) {
-    const frac = Number(t.getAttribute("val")) / 100000;
-    switch (t.tagName) {
-      case "a:shade":
-        r *= frac; g *= frac; b *= frac;
-        break;
-      case "a:tint":
-        r = r * frac + 255 * (1 - frac);
-        g = g * frac + 255 * (1 - frac);
-        b = b * frac + 255 * (1 - frac);
-        break;
-      case "a:lumMod": {
-        const [h, s, l] = rgbToHsl(r, g, b);
-        [r, g, b] = hslToRgb(h, s, clamp01(l * frac));
-        break;
-      }
-      case "a:lumOff": {
-        const [h, s, l] = rgbToHsl(r, g, b);
-        [r, g, b] = hslToRgb(h, s, clamp01(l + frac));
-        break;
-      }
-      case "a:satMod": {
-        const [h, s, l] = rgbToHsl(r, g, b);
-        [r, g, b] = hslToRgb(h, clamp01(s * frac), l);
-        break;
-      }
-      case "a:hueMod": {
-        const [h, s, l] = rgbToHsl(r, g, b);
-        // hue is 0..1 (a full turn); hueMod multiplies the angle, wrapping.
-        [r, g, b] = hslToRgb((h * frac) % 1, s, l);
-        break;
-      }
-      case "a:alpha":
-        alpha = frac;
-        break;
-      // a:gamma/a:invGamma and other rare transforms: still ignored.
-    }
-  }
-  if (alpha < 1) {
-    return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(b)},${+alpha.toFixed(3)})`;
-  }
-  return `#${hex2(r)}${hex2(g)}${hex2(b)}`;
-}
-
-/** Hex ("RRGGBB") for a single scheme slot element (dk1/lt1/accentN/...). */
-function schemeSlotHex(slot: Element | null): string | undefined {
-  if (!slot) return undefined;
-  const srgb = firstChildTag(slot, "a:srgbClr");
-  if (srgb) return srgb.getAttribute("val")?.toUpperCase() ?? undefined;
-  const sys = firstChildTag(slot, "a:sysClr");
-  if (sys) return sys.getAttribute("lastClr")?.toUpperCase() ?? undefined;
-  return undefined;
-}
-
-export function parseTheme(
-  themeXml: string | undefined,
-  masterXml: string | undefined,
-): ThemeContext {
-  const colors: Record<string, string> = {};
-  if (!themeXml) return { colors };
-  const scheme = firstChildTag(parseXml(themeXml).documentElement, "a:clrScheme");
-  if (!scheme) return { colors };
-  for (const slot of Array.from(scheme.children)) {
-    const name = slot.tagName.replace(/^a:/, ""); // dk1, lt1, accent1, ...
-    const hex = schemeSlotHex(slot);
-    if (hex) colors[name] = hex;
-  }
-  // clrMap maps document names (bg1/tx1/bg2/tx2/accentN/...) onto scheme slots.
-  if (masterXml) {
-    const clrMap = firstChildTag(parseXml(masterXml).documentElement, "p:clrMap");
-    if (clrMap) {
-      for (const attr of Array.from(clrMap.attributes)) {
-        const target = colors[attr.value];
-        if (target) colors[attr.name] = target;
-      }
-    }
-  }
-  return { colors };
-}
-
-/** First DIRECT child with the given tag (unlike firstChildTag's descendant search). */
-function directChild(parent: Element, tag: string): Element | null {
-  for (const c of Array.from(parent.children)) if (c.tagName === tag) return c;
-  return null;
-}
-
-/**
- * Resolve a solid colour off `clrParent` (a spPr, ln, rPr, tcPr, or a bare
- * a:solidFill) to a CSS colour, applying colour transforms. schemeClr needs the
- * theme. Replaces the old solidFillColor.
- *
- * IMPORTANT: uses DIRECT-child lookup, not firstChildTag's descendant search —
- * otherwise a shape with `<a:noFill/>` but an outlined `<a:ln><a:solidFill>` would
- * wrongly report the line's colour as its fill (these text-less shapes are now
- * rendered, not dropped, so the bug would be visible).
- */
-/** Resolve a single colour element (a:srgbClr | a:schemeClr | a:sysClr | a:prstClr)
- *  to CSS, applying its colour transforms. Returns undefined if unresolvable. */
-function resolveClrEl(el: Element, theme?: ThemeContext): string | undefined {
-  if (el.tagName === "a:srgbClr") {
-    const val = el.getAttribute("val");
-    if (!val) return undefined;
-    return applyColorTransforms(el, [
-      parseInt(val.slice(0, 2), 16),
-      parseInt(val.slice(2, 4), 16),
-      parseInt(val.slice(4, 6), 16),
-    ]);
-  }
-  if (el.tagName === "a:schemeClr") {
-    const name = el.getAttribute("val");
-    const hex = name ? theme?.colors[name] : undefined;
-    if (!hex) return undefined;
-    return applyColorTransforms(el, [
-      parseInt(hex.slice(0, 2), 16),
-      parseInt(hex.slice(2, 4), 16),
-      parseInt(hex.slice(4, 6), 16),
-    ]);
-  }
-  if (el.tagName === "a:sysClr") {
-    const last = el.getAttribute("lastClr");
-    if (!last) return undefined;
-    return applyColorTransforms(el, [
-      parseInt(last.slice(0, 2), 16),
-      parseInt(last.slice(2, 4), 16),
-      parseInt(last.slice(4, 6), 16),
-    ]);
-  }
-  return undefined;
-}
-
-/** First colour child (srgb/scheme/sys) of an element, if any. */
-function firstClrChild(parent: Element): Element | null {
-  for (const c of Array.from(parent.children)) {
-    if (
-      c.tagName === "a:srgbClr" ||
-      c.tagName === "a:schemeClr" ||
-      c.tagName === "a:sysClr" ||
-      c.tagName === "a:prstClr"
-    ) {
-      return c;
-    }
-  }
-  return null;
-}
-
-export function resolveColor(
-  clrParent: Element | null,
-  theme?: ThemeContext,
-): string | undefined {
-  if (!clrParent) return undefined;
-  // An explicit noFill on this element means "no colour" (e.g. spPr or ln).
-  if (directChild(clrParent, "a:noFill")) return undefined;
-  // clrParent may BE the solidFill (bare-fill callers) or CONTAIN one directly.
-  const fill = clrParent.tagName === "a:solidFill"
-    ? clrParent
-    : directChild(clrParent, "a:solidFill");
-  if (!fill) return undefined;
-  const clr = firstClrChild(fill);
-  return clr ? resolveClrEl(clr, theme) : undefined;
-}
-
-/**
- * Resolve an a:gradFill element to a CSS gradient string, or undefined if it has
- * no usable stops. `fillParent` may BE the a:gradFill or CONTAIN one directly.
- * Linear gradients map a:lin ang (60000ths deg, clockwise from 3 o'clock) to the
- * CSS convention (deg from 12 o'clock) via +90; radial paths become radial-gradient.
- */
-export function resolveGradient(
-  fillParent: Element | null,
-  theme?: ThemeContext,
-): string | undefined {
-  if (!fillParent) return undefined;
-  const grad = fillParent.tagName === "a:gradFill"
-    ? fillParent
-    : directChild(fillParent, "a:gradFill");
-  if (!grad) return undefined;
-  const gsLst = directChild(grad, "a:gsLst");
-  if (!gsLst) return undefined;
-  const stops: string[] = [];
-  for (const gs of Array.from(gsLst.children)) {
-    if (gs.tagName !== "a:gs") continue;
-    const clr = firstClrChild(gs);
-    const css = clr ? resolveClrEl(clr, theme) : undefined;
-    if (!css) continue;
-    const pos = Number(gs.getAttribute("pos")) / 1000; // thousandths of a % → %
-    stops.push(`${css} ${Number.isFinite(pos) ? pos : 0}%`);
-  }
-  if (stops.length < 2) return undefined;
-  const path = directChild(grad, "a:path");
-  if (path) {
-    // Radial / rectangular: approximate all as a centred radial gradient.
-    return `radial-gradient(circle, ${stops.join(", ")})`;
-  }
-  const lin = directChild(grad, "a:lin");
-  const ang = lin ? Number(lin.getAttribute("ang")) / 60000 : 90;
-  const cssAng = (((Number.isFinite(ang) ? ang : 90) + 90) % 360 + 360) % 360;
-  return `linear-gradient(${cssAng}deg, ${stops.join(", ")})`;
-}
-
 /** Resolve a picture fill (a:blipFill) to its embed relationship id, if any. */
 function blipEmbedId(fillParent: Element): string | null {
   const blipFill = fillParent.tagName === "a:blipFill"
@@ -617,72 +457,185 @@ function backgroundFromEl(bg: Element, theme?: ThemeContext): SlideBackground | 
   return undefined;
 }
 
-const ALIGN: Record<string, Paragraph["align"]> = {
-  l: "left",
-  ctr: "center",
-  r: "right",
-  just: "justify",
-};
+// --- Text ---------------------------------------------------------------------
 
-function parseRun(r: Element, theme?: ThemeContext): TextRun {
-  const text = Array.from(r.getElementsByTagName("a:t"))
-    .map((t) => t.textContent ?? "")
-    .join("");
-  const rPr = firstChildTag(r, "a:rPr");
+// PowerPoint's "single" line spacing is the font's natural line box, which for
+// the Office families is ≈1.2× the point size; a:lnSpc percentages scale that.
+const SINGLE_LINE = 1.2;
+
+function runFrom(style: TextStyle, text: string): TextRun {
   const run: TextRun = { text };
-  if (rPr) {
-    if (rPr.getAttribute("b") === "1") run.bold = true;
-    if (rPr.getAttribute("i") === "1") run.italic = true;
-    const u = rPr.getAttribute("u");
-    if (u && u !== "none") run.underline = true;
-    const sz = Number(rPr.getAttribute("sz"));
-    if (sz) run.sizePt = sz / 100; // sz is in hundredths of a point
-    const color = resolveColor(rPr, theme);
-    if (color) run.color = color;
-    const font = firstChildTag(rPr, "a:latin")?.getAttribute("typeface");
-    if (font) run.font = font;
-  }
+  if (style.bold) run.bold = true;
+  if (style.italic) run.italic = true;
+  if (style.underline) run.underline = true;
+  if (style.color) run.color = style.color;
+  if (style.sizePt) run.sizePt = style.sizePt;
+  if (style.font) run.font = style.font;
+  if (style.highlight) run.highlight = style.highlight;
+  if (style.spcPt) run.letterSpacingPx = ptToPx(style.spcPt);
   return run;
 }
 
-function parseParagraph(p: Element, theme?: ThemeContext): Paragraph {
+/** 1 → "a", 26 → "z", 27 → "aa" — a:buAutoNum's alphabetic sequence. */
+function alphaNum(n: number): string {
+  let out = "";
+  let v = Math.max(1, n);
+  while (v > 0) {
+    const r = (v - 1) % 26;
+    out = String.fromCharCode(97 + r) + out;
+    v = Math.floor((v - 1) / 26);
+  }
+  return out;
+}
+
+const ROMAN: [number, string][] = [
+  [1000, "m"], [900, "cm"], [500, "d"], [400, "cd"], [100, "c"], [90, "xc"],
+  [50, "l"], [40, "xl"], [10, "x"], [9, "ix"], [5, "v"], [4, "iv"], [1, "i"],
+];
+
+function romanNum(n: number): string {
+  let v = Math.max(1, Math.min(3999, n));
+  let out = "";
+  for (const [val, sym] of ROMAN) {
+    while (v >= val) {
+      out += sym;
+      v -= val;
+    }
+  }
+  return out;
+}
+
+/**
+ * a:buAutoNum's type names are `<sequence><punctuation>`, e.g. alphaLcParenR →
+ * "a)". Anything unrecognised degrades to a bare arabic number rather than a
+ * missing bullet.
+ */
+function autoNumText(type: string, n: number): string {
+  const body = type.startsWith("alphaLc")
+    ? alphaNum(n)
+    : type.startsWith("alphaUc")
+      ? alphaNum(n).toUpperCase()
+      : type.startsWith("romanLc")
+        ? romanNum(n)
+        : type.startsWith("romanUc")
+          ? romanNum(n).toUpperCase()
+          : String(n);
+  if (type.endsWith("ParenBoth")) return `(${body})`;
+  if (type.endsWith("ParenR")) return `${body})`;
+  if (type.endsWith("Period")) return `${body}.`;
+  if (type.endsWith("Dash")) return `- ${body}`;
+  return body;
+}
+
+function parseParagraph(p: Element, chain: StyleChain): { para: Paragraph; style: TextStyle } {
+  const pPr = directChild(p, "a:pPr");
+  const level = Number(pPr?.getAttribute("lvl") ?? 0) || 0;
+  const paraStyle = resolveParagraphStyle(chain, level, pPr);
+
   const runs: TextRun[] = [];
   // a:r runs and a:fld fields (slide numbers, dates) both carry a:t text.
   for (const child of Array.from(p.children)) {
     const tag = child.tagName;
-    if (tag === "a:r" || tag === "a:fld") runs.push(parseRun(child, theme));
-    else if (tag === "a:br") runs.push({ text: "\n" });
+    if (tag === "a:r" || tag === "a:fld") {
+      const text = Array.from(child.getElementsByTagName("a:t"))
+        .map((t) => t.textContent ?? "")
+        .join("");
+      runs.push(runFrom(resolveRunStyle(chain, paraStyle, directChild(child, "a:rPr")), text));
+    } else if (tag === "a:br") {
+      runs.push({ text: "\n" });
+    }
   }
-  const pPr = firstChildTag(p, "a:pPr");
-  const level = Number(pPr?.getAttribute("lvl") ?? 0) || 0;
-  const align = pPr ? ALIGN[pPr.getAttribute("algn") ?? ""] : undefined;
-  // Explicit bullet markup, or any indented list line, gets a bullet; a:buNone
-  // suppresses it. Titles are handled by the shape, never bulleted here.
-  const hasBullet = !!(
-    pPr &&
-    (pPr.getElementsByTagName("a:buChar").length ||
-      pPr.getElementsByTagName("a:buAutoNum").length)
-  );
-  const noBullet = !!pPr && pPr.getElementsByTagName("a:buNone").length > 0;
-  const bullet = !noBullet && (hasBullet || level > 0);
-  return { runs, align, level, bullet };
+
+  // An empty paragraph still occupies a line; a:endParaRPr sizes it.
+  const endStyle = { ...paraStyle };
+  if (!runs.length) {
+    applyRPr(endStyle, directChild(p, "a:endParaRPr"), chain.theme);
+    if (chain.fontScale && endStyle.sizePt) endStyle.sizePt *= chain.fontScale;
+  }
+  const sizePt = runs.length
+    ? runs.reduce((m, r) => Math.max(m, r.sizePt ?? 0), 0) || paraStyle.sizePt
+    : endStyle.sizePt;
+
+  const para: Paragraph = {
+    runs,
+    align: paraStyle.align,
+    level,
+    // Bullets only exist where the chain says so; titles are never bulleted.
+    // An empty paragraph never draws one either — PowerPoint keeps its line box
+    // but no glyph, and a bullet-only paragraph would collapse to zero height
+    // because the marker is positioned out of flow.
+    bullet: paraStyle.bullet === true && runs.some((r) => r.text.length > 0),
+  };
+  if (sizePt) para.sizePt = sizePt;
+
+  // Percent-based metrics resolve against the paragraph's own size; a:normAutofit
+  // shrinks line spacing on top of that.
+  const basePx = ptToPx(sizePt ?? 18);
+  if (paraStyle.linePts !== undefined) {
+    para.lineHeightPx = ptToPx(paraStyle.linePts);
+  } else {
+    const pct = Math.max(0.1, (paraStyle.linePct ?? 1) - (chain.lnSpcReduction ?? 0));
+    para.lineHeight = pct * SINGLE_LINE;
+  }
+
+  if (paraStyle.spcBefPts !== undefined) para.spaceBeforePx = ptToPx(paraStyle.spcBefPts);
+  else if (paraStyle.spcBefPct !== undefined) para.spaceBeforePx = basePx * paraStyle.spcBefPct;
+  if (paraStyle.spcAftPts !== undefined) para.spaceAfterPx = ptToPx(paraStyle.spcAftPts);
+  else if (paraStyle.spcAftPct !== undefined) para.spaceAfterPx = basePx * paraStyle.spcAftPct;
+
+  // marL/indent of exactly 0 are meaningful overrides of an inherited hanging
+  // indent, so they must survive as 0 rather than be dropped as falsy.
+  if (paraStyle.marL !== undefined) para.marginLeftPx = paraStyle.marL;
+  if (paraStyle.indent !== undefined) para.indentPx = paraStyle.indent;
+
+  if (para.bullet) {
+    if (paraStyle.buChar) para.bulletText = paraStyle.buChar;
+    if (paraStyle.buFont) para.bulletFont = paraStyle.buFont;
+    if (paraStyle.buClr) para.bulletColor = paraStyle.buClr;
+    if (paraStyle.buSzPts !== undefined) para.bulletSizePx = ptToPx(paraStyle.buSzPts);
+    else if (paraStyle.buSzPct !== undefined) para.bulletSizePx = basePx * paraStyle.buSzPct;
+  }
+  return { para, style: paraStyle };
 }
 
-function paragraphsOf(el: Element, theme?: ThemeContext): Paragraph[] {
+function paragraphsOf(el: Element, chain: StyleChain): Paragraph[] {
   // Shapes carry p:txBody; table cells carry a:txBody.
   const body = firstChildTag(el, "p:txBody") ?? firstChildTag(el, "a:txBody");
   if (!body) return [];
-  return Array.from(body.getElementsByTagName("a:p"))
-    .map((p) => parseParagraph(p, theme))
-    .filter((p) => p.runs.some((r) => r.text.trim().length > 0));
+  const parsed = Array.from(body.getElementsByTagName("a:p")).map((p) =>
+    parseParagraph(p, chain));
+  numberAutoLists(parsed);
+  return parsed.map((x) => x.para);
+}
+
+/**
+ * Fill in a:buAutoNum bullet text. Numbering is per level and per text body:
+ * a deeper level starts its own count and is discarded once the list returns to
+ * a shallower one, and any non-numbered paragraph at a level ends that level's
+ * run (so a following numbered paragraph restarts at its own startAt).
+ */
+function numberAutoLists(parsed: { para: Paragraph; style: TextStyle }[]): void {
+  const counters: (number | undefined)[] = [];
+  for (const { para, style } of parsed) {
+    const lvl = para.level;
+    for (let i = lvl + 1; i < counters.length; i++) counters[i] = undefined;
+    if (!para.bullet || !style.buAutoNum) {
+      counters[lvl] = undefined;
+      continue;
+    }
+    const start = style.buStartAt ?? 1;
+    counters[lvl] = counters[lvl] === undefined ? start : (counters[lvl] as number) + 1;
+    para.bulletText = autoNumText(style.buAutoNum, counters[lvl] as number);
+  }
+}
+
+/** True when a text body would draw nothing at all (no glyphs in any run). */
+function hasVisibleText(paragraphs: Paragraph[]): boolean {
+  return paragraphs.some((p) => p.runs.some((r) => r.text.trim().length > 0));
 }
 
 function placeholderEl(sp: Element): Element | null {
   return firstChildTag(sp, "p:ph");
-}
-
-function placeholderType(sp: Element): string | null {
-  return placeholderEl(sp)?.getAttribute("type") ?? null;
 }
 
 function placeholderIdx(sp: Element): number | null {
@@ -690,28 +643,72 @@ function placeholderIdx(sp: Element): number | null {
   return idx != null ? Number(idx) : null;
 }
 
-/** Normalize placeholder types so title/ctrTitle (and the body family) match. */
-function phFamily(type: string | null): "title" | "body" | "other" {
-  if (type === "title" || type === "ctrTitle") return "title";
-  if (
-    type == null ||
-    type === "body" ||
-    type === "subTitle" ||
-    type === "obj"
-  ) {
-    return "body";
-  }
-  return "other";
+function bodyPrOf(el: Element): Element | null {
+  return firstChildTag(el, "a:bodyPr");
 }
 
 function bodyAnchor(el: Element): Shape["anchor"] | undefined {
-  const a = firstChildTag(el, "a:bodyPr")?.getAttribute("anchor");
+  const a = bodyPrOf(el)?.getAttribute("anchor");
   return a === "ctr" ? "center" : a === "b" ? "bottom" : a === "t" ? "top" : undefined;
 }
 
+// OOXML a:bodyPr inset defaults, in EMU.
+const DEFAULT_INSETS: Insets = {
+  l: emuToPx(91440),
+  t: emuToPx(45720),
+  r: emuToPx(91440),
+  b: emuToPx(45720),
+};
+
+/** Text insets, taking each side from the first bodyPr in the chain that sets it. */
+function resolveInsets(chain: (Element | null | undefined)[]): Insets {
+  const pick = (attr: string, fallback: number): number => {
+    for (const bp of chain) {
+      const raw = bp?.getAttribute(attr);
+      if (raw != null && raw !== "") {
+        const n = Number(raw);
+        if (Number.isFinite(n)) return emuToPx(n);
+      }
+    }
+    return fallback;
+  };
+  return {
+    l: pick("lIns", DEFAULT_INSETS.l),
+    t: pick("tIns", DEFAULT_INSETS.t),
+    r: pick("rIns", DEFAULT_INSETS.r),
+    b: pick("bIns", DEFAULT_INSETS.b),
+  };
+}
+
 /**
- * Read a layout/master part's placeholders (type/idx + geometry + anchor) so a
- * slide shape without its own xfrm can inherit them. Walks the spTree directly.
+ * a:normAutofit from the first bodyPr in the chain that carries one. `shrink`
+ * records that PowerPoint was in shrink-to-fit mode at all: the stored
+ * fontScale was computed for the authored font, so with a substituted (wider)
+ * one the view still has to measure and shrink further. Shapes WITHOUT
+ * normAutofit are left to overflow, exactly as PowerPoint lets them.
+ */
+function autofit(chain: (Element | null | undefined)[]): {
+  fontScale?: number;
+  lnSpcReduction?: number;
+  shrink?: boolean;
+} {
+  for (const bp of chain) {
+    const fit = bp && directChild(bp, "a:normAutofit");
+    if (!fit) continue;
+    const fs = Number(fit.getAttribute("fontScale"));
+    const ls = Number(fit.getAttribute("lnSpcReduction"));
+    return {
+      fontScale: fs ? fs / 100000 : undefined,
+      lnSpcReduction: ls ? ls / 100000 : undefined,
+      shrink: true,
+    };
+  }
+  return {};
+}
+
+/**
+ * Read a layout/master part's placeholders (type/idx + geometry + anchor + the
+ * a:lstStyle and a:bodyPr a slide shape inherits from). Walks the spTree.
  */
 export function parsePlaceholders(xml: string | undefined): Placeholder[] {
   if (!xml) return [];
@@ -727,6 +724,8 @@ export function parsePlaceholders(xml: string | undefined): Placeholder[] {
       idx: ph.getAttribute("idx") != null ? Number(ph.getAttribute("idx")) : null,
       box: box.x === null ? null : box,
       anchor: bodyAnchor(sp),
+      levels: levelStyles(firstChildTag(sp, "a:lstStyle")),
+      bodyPr: bodyPrOf(sp),
     });
   }
   return out;
@@ -747,25 +746,21 @@ function matchPlaceholder(
   return list.find((p) => phFamily(p.type) === fam);
 }
 
-/** Default text sizes (pt) per placeholder family from a master's p:txStyles. */
+/** A master's p:txStyles, as nine level styles per placeholder family. */
 export function parseMasterTextStyles(xml: string | undefined): MasterTextStyles {
-  const out: MasterTextStyles = {};
-  if (!xml) return out;
+  const empty = (): MasterTextStyles => ({
+    title: levelStyles(null),
+    body: levelStyles(null),
+    other: levelStyles(null),
+  });
+  if (!xml) return empty();
   const styles = parseXml(xml).getElementsByTagName("p:txStyles")[0];
-  if (!styles) return out;
-  const lvl1Size = (styleTag: string): number | undefined => {
-    const style = firstChildTag(styles, styleTag);
-    const lvl1 = style && firstChildTag(style, "a:lvl1pPr");
-    const sz = lvl1 && firstChildTag(lvl1, "a:defRPr")?.getAttribute("sz");
-    return sz ? Number(sz) / 100 : undefined;
+  if (!styles) return empty();
+  return {
+    title: levelStyles(directChild(styles, "p:titleStyle")),
+    body: levelStyles(directChild(styles, "p:bodyStyle")),
+    other: levelStyles(directChild(styles, "p:otherStyle")),
   };
-  const title = lvl1Size("p:titleStyle");
-  const body = lvl1Size("p:bodyStyle");
-  const other = lvl1Size("p:otherStyle");
-  if (title) out.title = title;
-  if (body) out.body = body;
-  if (other) out.other = other;
-  return out;
 }
 
 const GEOM: Record<string, Shape["geom"]> = {
@@ -815,12 +810,15 @@ function dashFamily(val: string | null): ShapeLine["dash"] {
   return "dash"; // dash, lgDash, sysDash, ...
 }
 
-/** a:ln → resolved outline (px width + CSS colour + dash), or undefined. */
-function parseLine(spPr: Element | null, theme?: ThemeContext): ShapeLine | undefined {
-  const ln = spPr && directChild(spPr, "a:ln");
+/** One a:ln element → resolved outline (px width + CSS colour + dash), or undefined. */
+function lineFrom(
+  ln: Element | null,
+  theme?: ThemeContext,
+  phClr?: string,
+): ShapeLine | undefined {
   if (!ln) return undefined;
   if (directChild(ln, "a:noFill")) return undefined;
-  const color = resolveColor(ln, theme);
+  const color = resolveColor(ln, theme, phClr);
   if (!color) return undefined;
   const w = Number(ln.getAttribute("w"));
   const dash = dashFamily(directChild(ln, "a:prstDash")?.getAttribute("val") ?? null);
@@ -830,12 +828,15 @@ function parseLine(spPr: Element | null, theme?: ThemeContext): ShapeLine | unde
 }
 
 /** a:effectLst/a:outerShdw → a CSS box-shadow/drop-shadow value (px), or undefined. */
-function parseShadow(spPr: Element | null, theme?: ThemeContext): string | undefined {
-  const fx = spPr && directChild(spPr, "a:effectLst");
+function shadowFrom(
+  fx: Element | null,
+  theme?: ThemeContext,
+  phClr?: string,
+): string | undefined {
   const shdw = fx && directChild(fx, "a:outerShdw");
   if (!shdw) return undefined;
   const clr = firstClrChild(shdw);
-  const color = (clr ? resolveClrEl(clr, theme) : undefined) ?? "rgba(0,0,0,0.4)";
+  const color = (clr ? resolveClrEl(clr, theme, phClr) : undefined) ?? "rgba(0,0,0,0.4)";
   const dist = emuToPx(Number(shdw.getAttribute("dist")) || 0);
   const blur = emuToPx(Number(shdw.getAttribute("blurRad")) || 0);
   const dir = (Number(shdw.getAttribute("dir")) || 0) / 60000; // deg, clockwise
@@ -843,6 +844,68 @@ function parseShadow(spPr: Element | null, theme?: ThemeContext): string | undef
   const dx = Math.round(Math.cos(rad) * dist);
   const dy = Math.round(Math.sin(rad) * dist);
   return `${dx}px ${dy}px ${Math.round(blur)}px ${color}`;
+}
+
+/** What a shape's p:style contributes before its own spPr overrides anything. */
+interface ThemeStyle {
+  fill?: string;
+  gradient?: string;
+  line?: ShapeLine;
+  shadow?: string;
+  /** a:fontRef → the shape's default text colour and family. */
+  text?: TextStyle;
+}
+
+/**
+ * Resolve p:style's a:fillRef/a:lnRef/a:effectRef/a:fontRef against the theme's
+ * a:fmtScheme. Shapes drawn from a gallery style carry no explicit fill or line
+ * at all, so without this they render as nothing.
+ */
+function parseThemeStyle(sp: Element, theme?: ThemeContext): ThemeStyle | undefined {
+  const style = firstChildTag(sp, "p:style");
+  if (!style) return undefined;
+  const fmt = theme?.format;
+  const out: ThemeStyle = {};
+
+  const fillRef = resolveStyleRef(directChild(style, "a:fillRef"), fmt?.fills, theme);
+  if (fillRef?.el) {
+    out.fill = resolveColor(fillRef.el, theme, fillRef.phClr);
+    if (!out.fill) out.gradient = resolveGradient(fillRef.el, theme, fillRef.phClr);
+  }
+  const lnRef = resolveStyleRef(directChild(style, "a:lnRef"), fmt?.lines, theme);
+  if (lnRef?.el) out.line = lineFrom(lnRef.el, theme, lnRef.phClr);
+  const fxRef = resolveStyleRef(directChild(style, "a:effectRef"), fmt?.effects, theme);
+  if (fxRef?.el) out.shadow = shadowFrom(fxRef.el, theme, fxRef.phClr);
+
+  // a:fontRef indexes the font scheme by name ("major"/"minor"), not by number,
+  // and its colour child is the shape's default text colour.
+  const fontRef = directChild(style, "a:fontRef");
+  if (fontRef) {
+    const text: TextStyle = {};
+    const clr = firstClrChild(fontRef);
+    const color = clr ? resolveClrEl(clr, theme) : undefined;
+    if (color) text.color = color;
+    const idx = fontRef.getAttribute("idx");
+    const font = resolveTypeface(idx === "major" ? "+mj-lt" : "+mn-lt", theme?.fonts);
+    if (font && idx !== "none") text.font = font;
+    if (text.color || text.font) out.text = text;
+  }
+  return out;
+}
+
+/** True when spPr states a fill of its own (including an explicit a:noFill). */
+function hasExplicitFill(spPr: Element | null): boolean {
+  if (!spPr) return false;
+  for (const c of Array.from(spPr.children)) {
+    if (
+      c.tagName === "a:noFill" || c.tagName === "a:solidFill" ||
+      c.tagName === "a:gradFill" || c.tagName === "a:blipFill" ||
+      c.tagName === "a:pattFill" || c.tagName === "a:grpFill"
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** a:custGeom → { d, w, h } SVG path in path space, or null if unusable. */
@@ -922,45 +985,112 @@ function parseCustGeom(spPr: Element): { d: string; w: number; h: number } | nul
   return { d: cmds.join(" "), w, h };
 }
 
-function parseSp(
+/** Per-part options for one pass over a spTree. */
+interface WalkOpts {
+  theme?: ThemeContext;
+  inherit?: InheritContext;
+  source: ShapeSource;
+  /** Layout/master pass: placeholder keys the slide fills itself, to skip. */
+  slidePhKeys?: Set<string>;
+  /** ppt/tableStyles.xml, indexed by styleId, for a:tblPr's tableStyleId. */
+  tableStyles?: Map<string, Element>;
+}
+
+/** Identity of a placeholder for slide-vs-layout matching. */
+function phKey(type: string | null, idx: number | null): string {
+  return `${phFamily(type)}#${idx ?? ""}`;
+}
+
+/**
+ * Build the level-style chain for one text body, lowest precedence first:
+ * presentation defaults (plain text boxes) or the master's family txStyles,
+ * then the master placeholder's lstStyle, the layout's, and the shape's own.
+ */
+function chainFor(
   sp: Element,
-  theme?: ThemeContext,
-  ctx: Ctx = IDENTITY,
-  inherit?: InheritContext,
-): Shape | null {
-  const paragraphs = paragraphsOf(sp, theme);
+  phType: string | null,
+  isPlaceholder: boolean,
+  layoutPh: Placeholder | undefined,
+  masterPh: Placeholder | undefined,
+  opts: WalkOpts,
+  fit: { fontScale?: number; lnSpcReduction?: number },
+  base?: TextStyle,
+): StyleChain {
+  const styles = opts.inherit?.textStyles;
+  const sources: LevelStyles[] = [];
+  if (isPlaceholder) {
+    const fam = phFamily(phType);
+    if (styles) sources.push(styles[fam]);
+  } else if (opts.inherit?.defaultTextStyle) {
+    sources.push(opts.inherit.defaultTextStyle);
+  } else if (styles) {
+    sources.push(styles.other);
+  }
+  if (masterPh?.levels) sources.push(masterPh.levels);
+  if (layoutPh?.levels) sources.push(layoutPh.levels);
+  const own = firstChildTag(sp, "a:lstStyle");
+  if (own) sources.push(levelStyles(own));
+  return { sources, base, theme: opts.theme, ...fit };
+}
+
+function parseSp(sp: Element, ctx: Ctx, opts: WalkOpts): Shape | null {
+  const theme = opts.theme;
   const spPr = firstChildTag(sp, "p:spPr");
-  const fill = resolveColor(spPr, theme);
-  const gradient = fill ? undefined : resolveGradient(spPr, theme);
+  const themeStyle = parseThemeStyle(sp, theme);
+  // spPr always wins where it speaks — including an explicit a:noFill or an
+  // <a:ln><a:noFill/>, which must suppress the p:style reference rather than
+  // fall through to it.
+  const ownFill = hasExplicitFill(spPr);
+  const fill = resolveColor(spPr, theme) ?? (ownFill ? undefined : themeStyle?.fill);
+  const gradient = fill
+    ? undefined
+    : (resolveGradient(spPr, theme) ?? (ownFill ? undefined : themeStyle?.gradient));
   const fillImageEmbedId = spPr ? (blipEmbedId(spPr) ?? undefined) : undefined;
-  const line = parseLine(spPr, theme);
-  const shadow = parseShadow(spPr, theme);
+  const ownLn = spPr && directChild(spPr, "a:ln");
+  const line = ownLn ? lineFrom(ownLn, theme) : themeStyle?.line;
+  const ownFx = spPr && directChild(spPr, "a:effectLst");
+  const shadow = ownFx ? shadowFrom(ownFx, theme) : themeStyle?.shadow;
   const custom = spPr ? parseCustGeom(spPr) : null;
   const prst = spPr
     ? firstChildTag(spPr, "a:prstGeom")?.getAttribute("prst")
     : null;
   const preset = custom ? null : presetPath(prst);
 
-  // Placeholder inheritance: a shape without its own xfrm borrows geometry and
-  // anchor from the matching layout/master placeholder (type/idx), which is what
-  // keeps titles/bodies in their authored positions instead of naive flow.
+  // Placeholder inheritance: a shape without its own xfrm borrows geometry,
+  // anchor, insets and text styling from the matching layout/master placeholder
+  // (type/idx), which is what keeps titles/bodies in their authored positions.
   const phEl = placeholderEl(sp);
   const phType = phEl?.getAttribute("type") ?? null;
   const phIdx = placeholderIdx(sp);
-  const inherited =
-    matchPlaceholder(inherit?.layout, phType, phIdx) ??
-    matchPlaceholder(inherit?.master, phType, phIdx);
+  // Only a slide shape inherits; a layout/master shape IS the template, so
+  // matching it against itself would hand it another placeholder's geometry.
+  const fromTemplate = opts.source !== "slide";
+  const inheritable = phEl && !fromTemplate;
+  const layoutPh = inheritable ? matchPlaceholder(opts.inherit?.layout, phType, phIdx) : undefined;
+  const masterPh = inheritable ? matchPlaceholder(opts.inherit?.master, phType, phIdx) : undefined;
+
+  // A layout/master placeholder the slide fills itself is drawn by the slide's
+  // own copy; and prompt text ("Click to edit…") is never rendered on a slide.
+  if (fromTemplate && phEl && opts.slidePhKeys?.has(phKey(phType, phIdx))) return null;
+
+  const bodyPrChain = [bodyPrOf(sp), layoutPh?.bodyPr, masterPh?.bodyPr];
+  const fit = autofit(bodyPrChain);
+  const chain = chainFor(sp, phType, !!phEl, layoutPh, masterPh, opts, fit, themeStyle?.text);
+  const paragraphs = fromTemplate && phEl ? [] : paragraphsOf(sp, chain);
+
   const own = xfrmOf(sp);
-  const box = own.x === null && inherited?.box ? inherited.box : own;
+  const inheritedBox = layoutPh?.box ?? masterPh?.box ?? null;
+  const box = own.x === null && inheritedBox ? inheritedBox : own;
   const anchor: Shape["anchor"] =
-    bodyAnchor(sp) ?? inherited?.anchor ?? "top";
+    bodyAnchor(sp) ?? layoutPh?.anchor ?? masterPh?.anchor ?? "top";
   const defaultSizePt = phEl
-    ? inherit?.textStyles?.[phFamily(phType)]
+    ? resolveParagraphStyle(chain, 0, null).sizePt
     : undefined;
 
-  // Drop only shapes with nothing to draw.
+  // Drop shapes with nothing to draw — including a text body whose runs are all
+  // whitespace, which would otherwise leave an invisible box swallowing clicks.
   if (
-    paragraphs.length === 0 &&
+    !hasVisibleText(paragraphs) &&
     !fill &&
     !gradient &&
     !fillImageEmbedId &&
@@ -983,7 +1113,11 @@ function parseSp(
     shadow,
     isTitle,
     anchor,
+    insets: resolveInsets(bodyPrChain),
     defaultSizePt,
+    ...(fit.shrink && paragraphs.length ? { shrinkToFit: true } : {}),
+    ...vertOf(bodyPrChain),
+    ...(opts.source === "slide" ? {} : { source: opts.source }),
   };
 
   if (custom) {
@@ -995,11 +1129,71 @@ function parseSp(
   }
 
   const geom: Shape["geom"] | undefined = prst ? (GEOM[prst] ?? "rect") : undefined;
+  if (geom === "roundRect") {
+    return { kind: "shape", ...base, geom, cornerRadius: roundRectAdj(spPr) };
+  }
   return { kind: "shape", ...base, geom };
 }
 
-function parsePic(pic: Element, ctx: Ctx = IDENTITY): Shape | null {
+// roundRect's `adj` guide is the corner radius as thousandths of a percent of
+// the shape's SHORTER side; 16667 (=1/6) is the preset's own default.
+const ROUND_RECT_DEFAULT_ADJ = 16667;
+
+function roundRectAdj(spPr: Element | null): number {
+  const geom = spPr && firstChildTag(spPr, "a:prstGeom");
+  const gd = geom
+    ? Array.from(geom.getElementsByTagName("a:gd")).find(
+        (g) => (g.getAttribute("name") ?? "adj") === "adj",
+      )
+    : undefined;
+  const raw = gd?.getAttribute("fmla")?.replace(/^val\s+/, "") ?? "";
+  const val = raw === "" ? NaN : Number(raw);
+  // The guide is clamped to [0, 50%] — beyond that the corners would overlap.
+  const pct = (Number.isFinite(val) ? val : ROUND_RECT_DEFAULT_ADJ) / 100000;
+  return Math.max(0, Math.min(0.5, pct));
+}
+
+/** a:bodyPr vert, from the first bodyPr in the chain that sets a rotated flow. */
+function vertOf(chain: (Element | null | undefined)[]): { vert?: Shape["vert"] } {
+  for (const bp of chain) {
+    const v = bp?.getAttribute("vert");
+    if (!v || v === "horz") continue;
+    // eaVert/mongolianVert/wordArtVert* all stack characters; the two that just
+    // rotate the whole run are the ones a CSS writing-mode can reproduce.
+    return { vert: v === "vert270" ? "vert270" : "vert" };
+  }
+  return {};
+}
+
+/**
+ * a:srcRect → the fraction of the source cropped away at each edge. Attributes
+ * are thousandths of a percent and may be negative (padding rather than crop).
+ * Returns undefined for the ubiquitous empty `<a:srcRect/>`, which crops nothing.
+ */
+function parseSrcRect(blipFill: Element | null): Insets | undefined {
+  const rect = blipFill && directChild(blipFill, "a:srcRect");
+  if (!rect) return undefined;
+  const side = (a: string) => {
+    const n = Number(rect.getAttribute(a));
+    return Number.isFinite(n) ? n / 100000 : 0;
+  };
+  const crop = { l: side("l"), t: side("t"), r: side("r"), b: side("b") };
+  if (!crop.l && !crop.t && !crop.r && !crop.b) return undefined;
+  // A crop that leaves nothing of an axis is unrenderable; ignore it.
+  if (crop.l + crop.r >= 1 || crop.t + crop.b >= 1) return undefined;
+  return crop;
+}
+
+function parsePic(pic: Element, ctx: Ctx, opts: WalkOpts): Shape | null {
   const embedId = relAttr(firstChildTag(pic, "a:blip") ?? pic, "embed");
+  const blipFill = firstChildTag(pic, "p:blipFill") ?? firstChildTag(pic, "a:blipFill");
+  // a:stretch/a:fillRect means "fill the frame", which is what PowerPoint does
+  // for every inserted picture — letterboxing it would leave the frame's own
+  // background showing through wherever the aspect ratios disagree. a:tile is
+  // the other half of that choice: repeat at natural size instead.
+  const stretch = !!firstChildTag(pic, "a:stretch");
+  const tile = !stretch && !!(blipFill && directChild(blipFill, "a:tile"));
+  const crop = parseSrcRect(blipFill);
   return {
     kind: "image",
     ...applyCtx(ctx, xfrmOf(pic)),
@@ -1008,6 +1202,10 @@ function parsePic(pic: Element, ctx: Ctx = IDENTITY): Shape | null {
     embedId: embedId ?? undefined,
     isTitle: false,
     anchor: "top",
+    ...(stretch ? { stretch: true } : {}),
+    ...(tile ? { tile: true } : {}),
+    ...(crop ? { crop } : {}),
+    ...(opts.source === "slide" ? {} : { source: opts.source }),
   };
 }
 
@@ -1025,25 +1223,163 @@ function frameXfrm(frame: Element): Pick<Shape, "x" | "y" | "w" | "h"> {
   };
 }
 
-function parseTableCell(tc: Element, theme?: ThemeContext): TableCell {
+/** ppt/tableStyles.xml → styleId → its a:tblStyle element. */
+export function parseTableStyles(xml: string | undefined): Map<string, Element> {
+  const out = new Map<string, Element>();
+  if (!xml) return out;
+  for (const st of Array.from(parseXml(xml).getElementsByTagName("a:tblStyle"))) {
+    const id = st.getAttribute("styleId");
+    if (id) out.set(id, st);
+  }
+  return out;
+}
+
+/** OOXML a:tcPr cell margin defaults, in EMU. */
+const DEFAULT_CELL_MARGINS: Insets = {
+  l: emuToPx(91440),
+  t: emuToPx(45720),
+  r: emuToPx(91440),
+  b: emuToPx(45720),
+};
+
+/** What a table style contributes to one cell, beneath its own a:tcPr. */
+interface CellStyle {
+  fill?: string;
+  borders: CellBorders;
+  text?: TextStyle;
+}
+
+/** Which a:tcBdr edge each cell side takes, given the cell's position. */
+type EdgeMap = Partial<Record<keyof CellBorders, string>>;
+
+function applyTablePart(
+  acc: CellStyle,
+  part: Element | null,
+  edges: EdgeMap,
+  theme?: ThemeContext,
+): void {
+  if (!part) return;
+  const tcStyle = directChild(part, "a:tcStyle");
+  if (tcStyle) {
+    const fill = directChild(tcStyle, "a:fill");
+    const color = fill ? resolveColor(fill, theme) : undefined;
+    if (color) acc.fill = color;
+    const bdr = directChild(tcStyle, "a:tcBdr");
+    // An empty a:tcBdr (band parts routinely carry one) overrides nothing.
+    if (bdr) {
+      for (const [side, tag] of Object.entries(edges) as [keyof CellBorders, string][]) {
+        const edge = directChild(bdr, tag);
+        if (edge) acc.borders[side] = lineFrom(directChild(edge, "a:ln"), theme);
+      }
+    }
+  }
+  const tx = directChild(part, "a:tcTxStyle");
+  if (tx) {
+    const text: TextStyle = { ...acc.text };
+    const b = tx.getAttribute("b");
+    if (b != null) text.bold = b === "on" || b === "1";
+    const i = tx.getAttribute("i");
+    if (i != null) text.italic = i === "on" || i === "1";
+    const clr = firstClrChild(tx);
+    const color = clr ? resolveClrEl(clr, theme) : undefined;
+    if (color) text.color = color;
+    acc.text = text;
+  }
+}
+
+/**
+ * Resolve the table style for one cell at (row, col). Parts apply in increasing
+ * precedence: whole table, then column/row banding, then the emphasised first
+ * and last column/row — each only when a:tblPr turned that flag on.
+ */
+function cellStyleFor(
+  style: Element | undefined,
+  flags: TableFlags,
+  row: number,
+  col: number,
+  rowCount: number,
+  colCount: number,
+  theme?: ThemeContext,
+): CellStyle {
+  const acc: CellStyle = { borders: {} };
+  if (!style) return acc;
+  const firstR = flags.firstRow && row === 0;
+  const lastR = flags.lastRow && row === rowCount - 1;
+  const firstC = flags.firstCol && col === 0;
+  const lastC = flags.lastCol && col === colCount - 1;
+  // Interior edges come from insideH/insideV; the table's outer edges from the
+  // matching outer edge of whichever part is being applied.
+  const edges: EdgeMap = {
+    l: col === 0 ? "a:left" : "a:insideV",
+    r: col === colCount - 1 ? "a:right" : "a:insideV",
+    t: row === 0 ? "a:top" : "a:insideH",
+    b: row === rowCount - 1 ? "a:bottom" : "a:insideH",
+  };
+  const part = (tag: string) => directChild(style, tag);
+  applyTablePart(acc, part("a:wholeTbl"), edges, theme);
+  if (flags.bandCol && !firstC && !lastC) {
+    const band = (col - (flags.firstCol ? 1 : 0)) % 2 === 0 ? "a:band1V" : "a:band2V";
+    applyTablePart(acc, part(band), edges, theme);
+  }
+  if (flags.bandRow && !firstR && !lastR) {
+    const band = (row - (flags.firstRow ? 1 : 0)) % 2 === 0 ? "a:band1H" : "a:band2H";
+    applyTablePart(acc, part(band), edges, theme);
+  }
+  if (firstC) applyTablePart(acc, part("a:firstCol"), edges, theme);
+  if (lastC) applyTablePart(acc, part("a:lastCol"), edges, theme);
+  if (firstR) applyTablePart(acc, part("a:firstRow"), edges, theme);
+  if (lastR) applyTablePart(acc, part("a:lastRow"), edges, theme);
+  return acc;
+}
+
+/** a:tcPr's own a:lnL/R/T/B (+ diagonals), layered over the table style's. */
+function cellBorders(tcPr: Element | null, base: CellBorders, theme?: ThemeContext): CellBorders {
+  const out: CellBorders = { ...base };
+  if (tcPr) {
+    const sides: [keyof CellBorders, string][] = [
+      ["l", "a:lnL"], ["r", "a:lnR"], ["t", "a:lnT"], ["b", "a:lnB"],
+      ["tlToBr", "a:lnTlToBr"], ["blToTr", "a:lnBlToTr"],
+    ];
+    for (const [side, tag] of sides) {
+      const ln = directChild(tcPr, tag);
+      if (ln) out[side] = lineFrom(ln, theme);
+    }
+  }
+  for (const k of Object.keys(out) as (keyof CellBorders)[]) {
+    if (!out[k]) delete out[k];
+  }
+  return out;
+}
+
+function parseTableCell(tc: Element, chain: StyleChain, style: CellStyle): TableCell {
   const tcPr = firstChildTag(tc, "a:tcPr");
   const anchorAttr = tcPr?.getAttribute("anchor");
-  return {
-    paragraphs: paragraphsOf(tc, theme),
-    fill: resolveColor(tcPr, theme),
+  const margin = (attr: string, fallback: number): number => {
+    const raw = tcPr?.getAttribute(attr);
+    const n = raw == null || raw === "" ? NaN : Number(raw);
+    return Number.isFinite(n) ? emuToPx(n) : fallback;
+  };
+  const borders = cellBorders(tcPr, style.borders, chain.theme);
+  const cell: TableCell = {
+    paragraphs: paragraphsOf(tc, style.text ? { ...chain, base: style.text } : chain),
+    fill: resolveColor(tcPr, chain.theme) ?? style.fill,
     gridSpan: Number(tc.getAttribute("gridSpan")) || 1,
     rowSpan: Number(tc.getAttribute("rowSpan")) || 1,
     hMerge: tc.getAttribute("hMerge") === "1",
     vMerge: tc.getAttribute("vMerge") === "1",
     anchor: anchorAttr === "ctr" ? "center" : anchorAttr === "b" ? "bottom" : "top",
+    margins: {
+      l: margin("marL", DEFAULT_CELL_MARGINS.l),
+      t: margin("marT", DEFAULT_CELL_MARGINS.t),
+      r: margin("marR", DEFAULT_CELL_MARGINS.r),
+      b: margin("marB", DEFAULT_CELL_MARGINS.b),
+    },
   };
+  if (Object.keys(borders).length) cell.borders = borders;
+  return cell;
 }
 
-function parseGraphicFrame(
-  frame: Element,
-  theme?: ThemeContext,
-  ctx: Ctx = IDENTITY,
-): Shape | null {
+function parseGraphicFrame(frame: Element, ctx: Ctx, opts: WalkOpts): Shape | null {
   const tbl = firstChildTag(frame, "a:tbl");
   if (!tbl) {
     // Charts / SmartArt / OLE aren't rendered, but a labelled placeholder box at
@@ -1072,12 +1408,35 @@ function parseGraphicFrame(
     ? Array.from(grid.getElementsByTagName("a:gridCol")).map((c) =>
         emuToPx(Number(c.getAttribute("w") ?? 0)))
     : [];
-  const rows: TableRow[] = Array.from(tbl.getElementsByTagName("a:tr")).map((tr) => ({
-    height: tr.getAttribute("h") ? emuToPx(Number(tr.getAttribute("h"))) : null,
-    cells: Array.from(tr.children)
-      .filter((c) => c.tagName === "a:tc")
-      .map((tc) => parseTableCell(tc, theme)),
-  }));
+  // Table text takes no master txStyles; only the theme (for schemeClr runs).
+  const cellChain: StyleChain = { sources: [], theme: opts.theme };
+  const tblPr = directChild(tbl, "a:tblPr");
+  const flag = (a: string) => tblPr?.getAttribute(a) === "1";
+  const flags: TableFlags = {
+    firstRow: flag("firstRow"),
+    lastRow: flag("lastRow"),
+    firstCol: flag("firstCol"),
+    lastCol: flag("lastCol"),
+    bandRow: flag("bandRow"),
+    bandCol: flag("bandCol"),
+  };
+  const styleId = tblPr
+    ? (firstChildTag(tblPr, "a:tableStyleId")?.textContent ?? "").trim()
+    : "";
+  const tblStyle = styleId ? opts.tableStyles?.get(styleId) : undefined;
+  const trs = Array.from(tbl.getElementsByTagName("a:tr"));
+  const rows: TableRow[] = trs.map((tr, ri) => {
+    const tcs = Array.from(tr.children).filter((c) => c.tagName === "a:tc");
+    return {
+      height: tr.getAttribute("h") ? emuToPx(Number(tr.getAttribute("h"))) : null,
+      cells: tcs.map((tc, ci) =>
+        parseTableCell(
+          tc,
+          cellChain,
+          cellStyleFor(tblStyle, flags, ri, ci, trs.length, tcs.length, opts.theme),
+        )),
+    };
+  });
   return {
     kind: "table",
     ...applyCtx(ctx, frameXfrm(frame)),
@@ -1088,30 +1447,21 @@ function parseGraphicFrame(
   };
 }
 
-export function parseSlide(
-  slideXml: string,
-  theme?: ThemeContext,
-  inherit?: InheritContext,
-): ParsedSlide {
-  const doc = parseXml(slideXml);
-  const tree =
-    doc.getElementsByTagName("p:spTree")[0] ?? doc.documentElement;
+/** Walk one part's spTree in authored order, composing group transforms. */
+function walkTree(tree: Element, opts: WalkOpts): Shape[] {
   const shapes: Shape[] = [];
-  // Walk direct children in authored order so z-order is preserved. Group
-  // shapes (p:grpSp) carry an a:xfrm that maps their child coordinate space into
-  // slide space; we compose that onto the running ctx so nested groups stack.
   const walk = (parent: Element, ctx: Ctx) => {
     for (const el of Array.from(parent.children)) {
       if (el.tagName === "p:sp" || el.tagName === "p:cxnSp") {
         // Connectors (p:cxnSp) carry the same spPr/prstGeom as shapes; the preset
         // path table turns straight/bent connectors into drawable lines.
-        const s = parseSp(el, theme, ctx, inherit);
+        const s = parseSp(el, ctx, opts);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:pic") {
-        const s = parsePic(el, ctx);
+        const s = parsePic(el, ctx, opts);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:graphicFrame") {
-        const s = parseGraphicFrame(el, theme, ctx);
+        const s = parseGraphicFrame(el, ctx, opts);
         if (s) shapes.push(s);
       } else if (el.tagName === "p:grpSp") {
         walk(el, groupCtx(el, ctx));
@@ -1119,6 +1469,89 @@ export function parseSlide(
     }
   };
   walk(tree, IDENTITY);
+  return shapes;
+}
+
+function spTreeOf(doc: Document): Element {
+  return doc.getElementsByTagName("p:spTree")[0] ?? doc.documentElement;
+}
+
+// A deck's slides share a handful of layouts and one or two masters, but
+// parseSlide is called per slide, so without this every slide would re-parse the
+// same template XML. Bounded because the cache outlives a single deck.
+const TEMPLATE_CACHE_MAX = 24;
+const templateDocs = new Map<string, Document>();
+
+function parseTemplate(xml: string): Document {
+  const hit = templateDocs.get(xml);
+  if (hit) return hit;
+  const doc = parseXml(xml);
+  if (templateDocs.size >= TEMPLATE_CACHE_MAX) {
+    templateDocs.delete(templateDocs.keys().next().value as string);
+  }
+  templateDocs.set(xml, doc);
+  return doc;
+}
+
+/** Every placeholder the slide itself supplies, so templates don't redraw them. */
+function slidePlaceholderKeys(tree: Element): Set<string> {
+  const keys = new Set<string>();
+  for (const sp of Array.from(tree.getElementsByTagName("p:sp"))) {
+    const ph = placeholderEl(sp);
+    if (!ph) continue;
+    const idx = ph.getAttribute("idx");
+    keys.add(phKey(ph.getAttribute("type"), idx != null ? Number(idx) : null));
+  }
+  return keys;
+}
+
+/**
+ * p:sld@show="0" — a slide hidden from the show. PowerPoint skips these when
+ * presenting and when exporting to PDF, so the previewer must not number or
+ * render them either.
+ */
+export function isHiddenSlide(slideXml: string | undefined): boolean {
+  if (!slideXml) return false;
+  // Cheap prefilter: the attribute only ever appears on the root p:sld element.
+  if (!slideXml.includes("show=")) return false;
+  return parseXml(slideXml).documentElement.getAttribute("show") === "0";
+}
+
+export function parseSlide(
+  slideXml: string,
+  theme?: ThemeContext,
+  inherit?: InheritContext,
+): ParsedSlide {
+  const doc = parseXml(slideXml);
+  const tree = spTreeOf(doc);
+  const slidePhKeys = slidePlaceholderKeys(tree);
+  const tableStyles = inherit?.tableStyles;
+
+  // A slide's showMasterSp="0" hides everything the layout contributes; the
+  // layout's own flag then gates the master's shapes beneath it.
+  const showLayout = doc.documentElement.getAttribute("showMasterSp") !== "0";
+  const shapes: Shape[] = [];
+  if (showLayout && (inherit?.layoutXml || inherit?.masterXml)) {
+    const layoutDoc = inherit.layoutXml ? parseTemplate(inherit.layoutXml) : null;
+    const showMaster =
+      !layoutDoc || layoutDoc.documentElement.getAttribute("showMasterSp") !== "0";
+    if (showMaster && inherit.masterXml) {
+      shapes.push(
+        ...walkTree(spTreeOf(parseTemplate(inherit.masterXml)), {
+          theme, inherit, source: "master", slidePhKeys, tableStyles,
+        }),
+      );
+    }
+    if (layoutDoc) {
+      shapes.push(
+        ...walkTree(spTreeOf(layoutDoc), {
+          theme, inherit, source: "layout", slidePhKeys, tableStyles,
+        }),
+      );
+    }
+  }
+  shapes.push(...walkTree(tree, { theme, inherit, source: "slide", tableStyles }));
+
   const bg = doc.getElementsByTagName("p:bg")[0];
   const background = bg ? backgroundFromEl(bg, theme) : undefined;
   return background ? { shapes, background } : { shapes };

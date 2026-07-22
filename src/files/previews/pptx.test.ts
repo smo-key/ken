@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  cssFontStack,
   emuToPx,
+  isHiddenSlide,
   parseBackground,
+  parseDefaultTextStyle,
   parseMasterTextStyles,
   parsePlaceholders,
   parseRels,
   parseSlide,
   parseSlideSize,
+  parseTableStyles,
   parseTheme,
   resolveColor,
   resolveGradient,
@@ -80,10 +84,11 @@ describe("resolveColor", () => {
   });
 
   it("applies shade (darken) to a scheme color", () => {
-    // accent1 4472C4 → each channel * 0.5 → 22 39 62
+    // a:shade scales LINEAR rgb, so accent1 4472C4 at 50% is 2F528F — the value
+    // PowerPoint itself produces, not the 223962 an sRGB multiply would give.
     expect(resolveColor(colorEl(
       `<a:solidFill><a:schemeClr val="accent1"><a:shade val="50000"/></a:schemeClr></a:solidFill>`), t))
-      .toBe("#223962");
+      .toBe("#2F528F");
   });
 
   it("applies lumMod+lumOff (light tint) in document order", () => {
@@ -97,11 +102,11 @@ describe("resolveColor", () => {
   });
 
   it("applies tint (lighten toward white) to a scheme color", () => {
-    // accent1 4472C4, tint 40000 → ch*0.4 + 255*0.6:
-    // R 68*0.4+153=180.2→B4, G 114*0.4+153=198.6→C7, B 196*0.4+153=231.4→E7
+    // Likewise linear: 40% of accent1 mixed with 60% white is CFD5EA. Mixing in
+    // sRGB would give the far more saturated B4C7E7.
     expect(resolveColor(colorEl(
       `<a:solidFill><a:schemeClr val="accent1"><a:tint val="40000"/></a:schemeClr></a:solidFill>`), t))
-      .toBe("#B4C7E7");
+      .toBe("#CFD5EA");
   });
 
   it("emits rgba when alpha is present", () => {
@@ -625,7 +630,6 @@ describe("placeholder inheritance", () => {
 
   it("inherits a default text size from the master text styles by family", () => {
     const styles = parseMasterTextStyles(MASTER_TXSTYLES);
-    expect(styles).toEqual({ title: 44, body: 28, other: 18 });
     const xml = slide(
       `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
       `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
@@ -738,5 +742,940 @@ describe("parseSlide — the repo fixture deck", () => {
     const [shape] = parseSlide(xml).shapes;
     expect(shape.x).toBeNull();
     expect(shape.paragraphs[0].runs[0].text).toBe("Migration kickoff deck");
+  });
+});
+
+// --- Theme fonts, the text-style chain, metrics, and template shapes ---------
+
+const THEME_FONTS =
+  `<?xml version="1.0"?><a:theme ${A}><a:themeElements>` +
+  `<a:clrScheme name="Office">` +
+  `<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>` +
+  `<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>` +
+  `<a:accent1><a:srgbClr val="4472C4"/></a:accent1>` +
+  `</a:clrScheme>` +
+  `<a:fontScheme name="Office">` +
+  `<a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>` +
+  `<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface="Meiryo"/><a:cs typeface=""/></a:minorFont>` +
+  `</a:fontScheme></a:themeElements></a:theme>`;
+
+describe("theme fonts", () => {
+  it("reads the major/minor latin + ea faces off a:fontScheme", () => {
+    const t = parseTheme(THEME_FONTS, MASTER1);
+    expect(t.fonts["mj-lt"]).toBe("Aptos Display");
+    expect(t.fonts["mn-lt"]).toBe("Calibri");
+    expect(t.fonts["mn-ea"]).toBe("Meiryo");
+    // An empty typeface="" is "no override" and must not become a real family.
+    expect(t.fonts["mn-cs"]).toBeUndefined();
+  });
+
+  it("resolves +mn-lt / +mj-lt run references through the scheme", () => {
+    const t = parseTheme(THEME_FONTS, MASTER1);
+    const xml = slide(
+      `<p:sp><p:txBody><a:p>` +
+      `<a:r><a:rPr><a:latin typeface="+mn-lt"/></a:rPr><a:t>minor</a:t></a:r>` +
+      `<a:r><a:rPr><a:latin typeface="+mj-lt"/></a:rPr><a:t>major</a:t></a:r>` +
+      `<a:r><a:rPr><a:latin typeface="Consolas"/></a:rPr><a:t>literal</a:t></a:r>` +
+      `</a:p></p:txBody></p:sp>`);
+    const runs = parseSlide(xml, t).shapes[0].paragraphs[0].runs;
+    expect(runs[0].font).toBe("Calibri");
+    expect(runs[1].font).toBe("Aptos Display");
+    expect(runs[2].font).toBe("Consolas");
+  });
+
+  it("drops an unresolvable +xx-yy reference rather than emitting it verbatim", () => {
+    const xml = slide(
+      `<p:sp><p:txBody><a:p><a:r><a:rPr><a:latin typeface="+mn-lt"/></a:rPr>` +
+      `<a:t>x</a:t></a:r></a:p></p:txBody></p:sp>`);
+    expect(parseSlide(xml).shapes[0].paragraphs[0].runs[0].font).toBeUndefined();
+  });
+
+  it("builds a CSS stack with substitutes for fonts macOS lacks", () => {
+    expect(cssFontStack("Calibri")).toBe(
+      "'Calibri', Carlito, 'Helvetica Neue', Helvetica, Arial, sans-serif",
+    );
+    expect(cssFontStack("Cambria")).toContain("Georgia");
+    // Unknown families still get a generic tail, chosen by a serif-ish name.
+    expect(cssFontStack("Acme Grotesk")).toBe("'Acme Grotesk', Helvetica, Arial, sans-serif");
+    expect(cssFontStack("Acme Old Roman")).toBe("'Acme Old Roman', Georgia, serif");
+    expect(cssFontStack(undefined)).toBeUndefined();
+  });
+});
+
+const MASTER_CHAIN =
+  `<?xml version="1.0"?><p:sldMaster ${P} ${A}>` +
+  `<p:clrMap bg1="lt1" tx1="dk1" accent1="accent1"/>` +
+  `<p:cSld><p:spTree>` +
+  `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9144000" cy="914400"/></a:xfrm></p:spPr>` +
+  `<p:txBody><a:bodyPr lIns="0" rIns="0" anchor="ctr"/><a:lstStyle/>` +
+  `<a:p><a:r><a:t>CLICK TO EDIT MASTER TITLE STYLE</a:t></a:r></a:p></p:txBody></p:sp>` +
+  `<p:sp><p:nvSpPr><p:cNvPr id="9" name="Bar"/><p:nvPr/></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="0" y="6000000"/><a:ext cx="9144000" cy="200000"/></a:xfrm>` +
+  `<a:prstGeom prst="rect"/><a:solidFill><a:srgbClr val="C00000"/></a:solidFill></p:spPr></p:sp>` +
+  `</p:spTree></p:cSld>` +
+  `<p:txStyles>` +
+  `<p:titleStyle><a:lvl1pPr algn="ctr"><a:spcBef><a:spcPct val="0"/></a:spcBef><a:buNone/>` +
+  `<a:defRPr sz="3200" b="1"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill>` +
+  `<a:latin typeface="+mj-lt"/></a:defRPr></a:lvl1pPr></p:titleStyle>` +
+  `<p:bodyStyle>` +
+  `<a:lvl1pPr marL="342900" indent="-342900" algn="l">` +
+  `<a:lnSpc><a:spcPct val="90000"/></a:lnSpc>` +
+  `<a:spcBef><a:spcPct val="20000"/></a:spcBef>` +
+  `<a:buChar char="•"/>` +
+  `<a:defRPr sz="1600"><a:solidFill><a:srgbClr val="333333"/></a:solidFill>` +
+  `<a:latin typeface="+mn-lt"/></a:defRPr></a:lvl1pPr>` +
+  `<a:lvl2pPr marL="742950" indent="-285750"><a:spcAft><a:spcPts val="600"/></a:spcAft>` +
+  `<a:buChar char="–"/><a:defRPr sz="1400"/></a:lvl2pPr>` +
+  `</p:bodyStyle>` +
+  `<p:otherStyle><a:lvl1pPr><a:defRPr sz="1200"/></a:lvl1pPr></p:otherStyle>` +
+  `</p:txStyles></p:sldMaster>`;
+
+const LAYOUT_CHAIN =
+  `<?xml version="1.0"?><p:sldLayout ${P} ${A} ${R}><p:cSld><p:spTree>` +
+  `<p:pic><p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
+  `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9144000" cy="6858000"/></a:xfrm></p:spPr></p:pic>` +
+  `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="457200" y="3200400"/><a:ext cx="8229600" cy="1143000"/></a:xfrm></p:spPr>` +
+  `<p:txBody><a:bodyPr anchor="t"><a:normAutofit fontScale="50000" lnSpcReduction="20000"/></a:bodyPr>` +
+  `<a:lstStyle><a:lvl1pPr><a:defRPr sz="2400" i="1">` +
+  `<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>` +
+  `<a:latin typeface="Arial"/></a:defRPr></a:lvl1pPr></a:lstStyle>` +
+  `<a:p><a:r><a:t>CLICK TO EDIT MASTER TITLE STYLE</a:t></a:r></a:p></p:txBody></p:sp>` +
+  `<p:sp><p:nvSpPr><p:nvPr><p:ph type="subTitle" idx="1"/></p:nvPr></p:nvSpPr>` +
+  `<p:spPr><a:xfrm><a:off x="457200" y="4572000"/><a:ext cx="8229600" cy="914400"/></a:xfrm></p:spPr>` +
+  `<p:txBody><a:bodyPr/><a:lstStyle/>` +
+  `<a:p><a:r><a:t>Click to edit Master subtitle style</a:t></a:r></a:p></p:txBody></p:sp>` +
+  `</p:spTree></p:cSld></p:sldLayout>`;
+
+/** The full slide→layout→master→theme context the component threads in. */
+function chainInherit(opts: { layoutXml?: string; masterXml?: string } = {}) {
+  const layoutXml = opts.layoutXml ?? LAYOUT_CHAIN;
+  const masterXml = opts.masterXml ?? MASTER_CHAIN;
+  return {
+    layout: parsePlaceholders(layoutXml),
+    master: parsePlaceholders(masterXml),
+    textStyles: parseMasterTextStyles(masterXml),
+    layoutXml,
+    masterXml,
+  };
+}
+
+const CHAIN_THEME = parseTheme(THEME_FONTS, MASTER_CHAIN);
+
+/** The slide's own title placeholder, with whatever rPr/pPr the test needs. */
+function titleSlide(inner: string): string {
+  return slide(
+    `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+    `<p:txBody><a:bodyPr/><a:lstStyle/>${inner}</p:txBody></p:sp>`);
+}
+
+describe("text style inheritance chain", () => {
+  it("gives a bare run the master txStyles size, colour, weight and theme font", () => {
+    const xml = titleSlide(`<a:p><a:r><a:t>Title</a:t></a:r></a:p>`);
+    const [s] = parseSlide(xml, CHAIN_THEME, {
+      master: parsePlaceholders(MASTER_CHAIN),
+      textStyles: parseMasterTextStyles(MASTER_CHAIN),
+    }).shapes;
+    const run = s.paragraphs[0].runs[0];
+    expect(run.sizePt).toBe(32);
+    expect(run.bold).toBe(true);
+    expect(run.color).toBe("#000000"); // tx1 → dk1 → windowText
+    expect(run.font).toBe("Aptos Display"); // +mj-lt
+    expect(s.paragraphs[0].align).toBe("center"); // titleStyle algn="ctr"
+  });
+
+  it("lets the layout placeholder's lstStyle override the master txStyles", () => {
+    const xml = titleSlide(`<a:p><a:r><a:t>Title</a:t></a:r></a:p>`);
+    const s = parseSlide(xml, CHAIN_THEME, chainInherit()).shapes.at(-1)!;
+    const run = s.paragraphs[0].runs[0];
+    // layout sz 2400, but the layout's normAutofit fontScale halves it
+    expect(run.sizePt).toBe(12);
+    expect(run.italic).toBe(true);
+    expect(run.color).toBe("#FFFFFF");
+    expect(run.font).toBe("Arial");
+    expect(run.bold).toBe(true); // still inherited from the master
+  });
+
+  it("lets the shape's own lstStyle beat the layout's", () => {
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/>` +
+      `<a:lstStyle><a:lvl1pPr><a:defRPr sz="9600"><a:solidFill>` +
+      `<a:srgbClr val="00FF00"/></a:solidFill></a:defRPr></a:lvl1pPr></a:lstStyle>` +
+      `<a:p><a:r><a:t>Title</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const run = parseSlide(xml, CHAIN_THEME, chainInherit()).shapes.at(-1)!
+      .paragraphs[0].runs[0];
+    expect(run.sizePt).toBe(48); // 96pt halved by the inherited normAutofit
+    expect(run.color).toBe("#00FF00");
+  });
+
+  it("lets a paragraph's a:pPr/a:defRPr beat the lstStyles, and a run's rPr beat all", () => {
+    const xml = titleSlide(
+      `<a:p><a:pPr algn="r"><a:defRPr sz="2000"><a:solidFill>` +
+      `<a:srgbClr val="112233"/></a:solidFill></a:defRPr></a:pPr>` +
+      `<a:r><a:t>inherits pPr</a:t></a:r>` +
+      `<a:r><a:rPr sz="4000"><a:solidFill><a:srgbClr val="AABBCC"/></a:solidFill></a:rPr>` +
+      `<a:t>own rPr</a:t></a:r></a:p>`);
+    const para = parseSlide(xml, CHAIN_THEME, chainInherit()).shapes.at(-1)!.paragraphs[0];
+    expect(para.align).toBe("right");
+    expect(para.runs[0].sizePt).toBe(10); // 20pt × 0.5 autofit
+    expect(para.runs[0].color).toBe("#112233");
+    expect(para.runs[1].sizePt).toBe(20); // 40pt × 0.5 autofit
+    expect(para.runs[1].color).toBe("#AABBCC");
+  });
+
+  it("treats b/i/u as tri-state so an explicit 0 clears an inherited true", () => {
+    const xml = titleSlide(
+      `<a:p><a:r><a:rPr b="0" i="0"/><a:t>plain</a:t></a:r></a:p>`);
+    const run = parseSlide(xml, CHAIN_THEME, chainInherit()).shapes.at(-1)!
+      .paragraphs[0].runs[0];
+    expect(run.bold).toBeUndefined();
+    expect(run.italic).toBeUndefined();
+  });
+
+  it("picks the master level style matching the paragraph's lvl", () => {
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/><a:lstStyle/>` +
+      `<a:p><a:r><a:t>one</a:t></a:r></a:p>` +
+      `<a:p><a:pPr lvl="1"/><a:r><a:t>two</a:t></a:r></a:p>` +
+      `</p:txBody></p:sp>`);
+    const [p1, p2] = parseSlide(xml, CHAIN_THEME, {
+      textStyles: parseMasterTextStyles(MASTER_CHAIN),
+    }).shapes[0].paragraphs;
+    expect(p1.runs[0].sizePt).toBe(16);
+    expect(p1.marginLeftPx).toBeCloseTo(342900 / 9525, 4);
+    expect(p2.runs[0].sizePt).toBe(14);
+    expect(p2.marginLeftPx).toBeCloseTo(742950 / 9525, 4);
+    expect(p2.indentPx).toBeCloseTo(-285750 / 9525, 4);
+  });
+
+  it("uses presentation.xml's defaultTextStyle for a plain (non-placeholder) text box", () => {
+    const pres =
+      `<?xml version="1.0"?><p:presentation ${P} ${A}><p:defaultTextStyle>` +
+      `<a:lvl1pPr algn="just"><a:defRPr sz="1100"/></a:lvl1pPr>` +
+      `</p:defaultTextStyle></p:presentation>`;
+    const xml = slide(
+      `<p:sp><p:nvSpPr><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/><a:p><a:r><a:t>loose</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [para] = parseSlide(xml, CHAIN_THEME, {
+      textStyles: parseMasterTextStyles(MASTER_CHAIN),
+      defaultTextStyle: parseDefaultTextStyle(pres),
+    }).shapes[0].paragraphs;
+    expect(para.runs[0].sizePt).toBe(11);
+    expect(para.align).toBe("justify");
+  });
+
+  it("resolves a:buNone / a:buChar through the chain rather than guessing by level", () => {
+    const bulleted = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/><a:p><a:r><a:t>b</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const suppressed = slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/><a:p><a:pPr marL="0" indent="0"><a:buNone/></a:pPr>` +
+      `<a:r><a:t>b</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const inherit = { textStyles: parseMasterTextStyles(MASTER_CHAIN) };
+    expect(parseSlide(bulleted, CHAIN_THEME, inherit).shapes[0].paragraphs[0].bullet).toBe(true);
+    expect(parseSlide(suppressed, CHAIN_THEME, inherit).shapes[0].paragraphs[0].bullet).toBe(false);
+    // The title family declares buNone, so a level-0 title is never bulleted.
+    expect(parseSlide(titleSlide(`<a:p><a:r><a:t>T</a:t></a:r></a:p>`), CHAIN_THEME, inherit)
+      .shapes[0].paragraphs[0].bullet).toBe(false);
+  });
+});
+
+describe("paragraph and body metrics", () => {
+  const bodySlide = (inner: string) =>
+    slide(
+      `<p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+      `<p:txBody><a:bodyPr/><a:lstStyle/>${inner}</p:txBody></p:sp>`);
+  const inherit = { textStyles: parseMasterTextStyles(MASTER_CHAIN) };
+
+  it("turns a:lnSpc spcPct into a unitless line-height so mixed run sizes work", () => {
+    // bodyStyle lvl1 lnSpc 90% → 0.9 × single (1.2)
+    const [p] = parseSlide(bodySlide(`<a:p><a:r><a:t>x</a:t></a:r></a:p>`), CHAIN_THEME, inherit)
+      .shapes[0].paragraphs;
+    expect(p.lineHeight).toBeCloseTo(1.08, 5);
+    expect(p.lineHeightPx).toBeUndefined();
+  });
+
+  it("turns a:lnSpc spcPts into an exact px line box", () => {
+    const [p] = parseSlide(
+      bodySlide(`<a:p><a:pPr><a:lnSpc><a:spcPts val="3000"/></a:lnSpc></a:pPr>` +
+        `<a:r><a:t>x</a:t></a:r></a:p>`), CHAIN_THEME, inherit).shapes[0].paragraphs;
+    expect(p.lineHeightPx).toBeCloseTo(40, 5); // 30pt → 40px
+    expect(p.lineHeight).toBeUndefined();
+  });
+
+  it("resolves spcBef percentages against the paragraph's own size, spcAft points directly", () => {
+    const [one, two] = parseSlide(
+      bodySlide(
+        `<a:p><a:r><a:t>one</a:t></a:r></a:p>` +
+        `<a:p><a:pPr lvl="1"/><a:r><a:t>two</a:t></a:r></a:p>`),
+      CHAIN_THEME, inherit).shapes[0].paragraphs;
+    // lvl1: spcBef 20% of 16pt (=21.333px) → 4.267px
+    expect(one.spaceBeforePx).toBeCloseTo(0.2 * (16 * 96) / 72, 4);
+    expect(one.spaceAfterPx).toBeUndefined();
+    // lvl2: spcAft 6pt → 8px; spcBef is not defined at lvl2, so it does not leak
+    expect(two.spaceAfterPx).toBeCloseTo(8, 5);
+    expect(two.spaceBeforePx).toBeUndefined();
+  });
+
+  it("defaults a:bodyPr insets to the spec values and honours explicit ones", () => {
+    const plain = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody><a:bodyPr/><a:p><a:r><a:t>x</a:t></a:r></a:p></p:txBody></p:sp>`);
+    expect(parseSlide(plain).shapes[0].insets).toEqual({
+      l: 91440 / 9525, t: 45720 / 9525, r: 91440 / 9525, b: 45720 / 9525,
+    });
+    const custom = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody><a:bodyPr lIns="0" tIns="0" rIns="0" bIns="0"/>` +
+      `<a:p><a:r><a:t>x</a:t></a:r></a:p></p:txBody></p:sp>`);
+    expect(parseSlide(custom).shapes[0].insets).toEqual({ l: 0, t: 0, r: 0, b: 0 });
+  });
+
+  it("inherits insets from the master placeholder when the slide shape omits them", () => {
+    const [s] = parseSlide(
+      titleSlide(`<a:p><a:r><a:t>T</a:t></a:r></a:p>`),
+      CHAIN_THEME,
+      { master: parsePlaceholders(MASTER_CHAIN) },
+    ).shapes;
+    expect(s.insets!.l).toBe(0); // master bodyPr lIns="0"
+    expect(s.insets!.r).toBe(0);
+    expect(s.insets!.t).toBeCloseTo(45720 / 9525, 5); // unset → spec default
+    expect(s.anchor).toBe("center");
+  });
+
+  it("applies a:normAutofit fontScale to sizes and lnSpcReduction to line spacing", () => {
+    const xml = slide(
+      `<p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody><a:bodyPr><a:normAutofit fontScale="62500" lnSpcReduction="10000"/></a:bodyPr>` +
+      `<a:p><a:r><a:rPr sz="3200"/><a:t>shrunk</a:t></a:r></a:p></p:txBody></p:sp>`);
+    const [p] = parseSlide(xml).shapes[0].paragraphs;
+    expect(p.runs[0].sizePt).toBe(20); // 32 × 0.625
+    expect(p.lineHeight).toBeCloseTo(0.9 * 1.2, 5); // (100% − 10%) × single
+  });
+
+  it("keeps empty paragraphs (with their endParaRPr size) for vertical rhythm", () => {
+    const xml = bodySlide(
+      `<a:p><a:r><a:t>one</a:t></a:r></a:p>` +
+      `<a:p><a:endParaRPr sz="2800"/></a:p>` +
+      `<a:p><a:r><a:t>two</a:t></a:r></a:p>`);
+    const paras = parseSlide(xml, CHAIN_THEME, inherit).shapes[0].paragraphs;
+    expect(paras).toHaveLength(3);
+    expect(paras[1].runs).toHaveLength(0);
+    expect(paras[1].sizePt).toBe(28);
+  });
+
+  it("still drops a shape whose every paragraph is blank and that paints nothing", () => {
+    const xml = bodySlide(`<a:p><a:endParaRPr sz="1800"/></a:p><a:p><a:r><a:t>   </a:t></a:r></a:p>`);
+    expect(parseSlide(xml, CHAIN_THEME, inherit).shapes).toHaveLength(0);
+  });
+});
+
+describe("layout and master shapes", () => {
+  const titleXml = titleSlide(`<a:p><a:r><a:t>Technology Spend</a:t></a:r></a:p>`);
+
+  it("draws master shapes, then layout shapes, then the slide's own", () => {
+    const shapes = parseSlide(titleXml, CHAIN_THEME, chainInherit()).shapes;
+    expect(shapes.map((s) => s.source)).toEqual(["master", "layout", undefined]);
+    expect(shapes[0].fill).toBe("#C00000"); // the master's decorative bar
+    expect(shapes[1].kind).toBe("image");
+    expect(shapes[1].embedId).toBe("rId2"); // resolved against the LAYOUT's rels
+    expect(shapes[2].paragraphs[0].runs[0].text).toBe("Technology Spend");
+  });
+
+  it("never renders a layout/master placeholder's prompt text", () => {
+    const shapes = parseSlide(titleXml, CHAIN_THEME, chainInherit()).shapes;
+    const text = shapes.flatMap((s) => s.paragraphs.flatMap((p) => p.runs.map((r) => r.text)));
+    expect(text.join(" ")).not.toMatch(/CLICK TO EDIT|Click to edit/);
+  });
+
+  it("skips the layout placeholder the slide fills itself", () => {
+    // The layout's title placeholder must not become a second, empty shape.
+    const shapes = parseSlide(titleXml, CHAIN_THEME, chainInherit()).shapes;
+    expect(shapes.filter((s) => s.isTitle)).toHaveLength(1);
+    expect(shapes.filter((s) => s.isTitle)[0].source).toBeUndefined();
+  });
+
+  it("honours showMasterSp=0 on the slide (hides layout + master) and on the layout", () => {
+    const hidden = titleXml.replace("<p:sld ", `<p:sld showMasterSp="0" `);
+    expect(parseSlide(hidden, CHAIN_THEME, chainInherit()).shapes.map((s) => s.source))
+      .toEqual([undefined]);
+    const quietLayout = LAYOUT_CHAIN.replace("<p:sldLayout ", `<p:sldLayout showMasterSp="0" `);
+    expect(
+      parseSlide(titleXml, CHAIN_THEME, chainInherit({ layoutXml: quietLayout }))
+        .shapes.map((s) => s.source),
+    ).toEqual(["layout", undefined]);
+  });
+
+  it("marks a:stretch pictures so the view fills the frame instead of letterboxing", () => {
+    const pic = parseSlide(titleXml, CHAIN_THEME, chainInherit()).shapes[1];
+    expect(pic.stretch).toBe(true);
+    expect(pic.w).toBeCloseTo(9144000 / 9525, 4);
+  });
+});
+
+// --- p:style theme references (a:fillRef / a:lnRef / a:effectRef / a:fontRef) ---
+
+const THEME_FMT = `<?xml version="1.0"?><a:theme ${A}><a:themeElements>` +
+  `<a:clrScheme name="X">` +
+  `<a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>` +
+  `<a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>` +
+  `<a:accent1><a:srgbClr val="0057B8"/></a:accent1>` +
+  `<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>` +
+  `</a:clrScheme>` +
+  `<a:fontScheme name="X"><a:majorFont><a:latin typeface="Georgia"/></a:majorFont>` +
+  `<a:minorFont><a:latin typeface="Verdana"/></a:minorFont></a:fontScheme>` +
+  `<a:fmtScheme name="X">` +
+  `<a:fillStyleLst>` +
+  `<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>` +
+  `<a:gradFill><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs>` +
+  `<a:gs pos="100000"><a:schemeClr val="lt1"/></a:gs></a:gsLst><a:lin ang="0"/></a:gradFill>` +
+  `</a:fillStyleLst>` +
+  `<a:lnStyleLst>` +
+  `<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>` +
+  `<a:ln w="38100"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>` +
+  `</a:lnStyleLst>` +
+  `<a:effectStyleLst>` +
+  `<a:effectStyle><a:effectLst/></a:effectStyle>` +
+  `<a:effectStyle><a:effectLst><a:outerShdw blurRad="38100" dist="19050" dir="0">` +
+  `<a:schemeClr val="phClr"/></a:outerShdw></a:effectLst></a:effectStyle>` +
+  `</a:effectStyleLst>` +
+  `</a:fmtScheme></a:themeElements></a:theme>`;
+
+const FMT_THEME = parseTheme(THEME_FMT, undefined);
+
+/** A styled autoshape: `spPr` inner XML plus a p:style with the given refs. */
+function styledShape(spPrInner: string, style: string, txBody = "<a:p/>"): string {
+  return slide(
+    `<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>` +
+    `<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>${spPrInner}</p:spPr>` +
+    `<p:style>${style}</p:style>` +
+    `<p:txBody><a:bodyPr/><a:lstStyle/>${txBody}</p:txBody></p:sp>`);
+}
+
+const FILL_REF_1 = `<a:fillRef idx="1"><a:schemeClr val="accent1"/></a:fillRef>`;
+
+describe("p:style theme references", () => {
+  it("fills a shape that has no spPr fill from fillRef + the ref's own phClr", () => {
+    const [s] = parseSlide(styledShape("", FILL_REF_1), FMT_THEME).shapes;
+    expect(s.fill).toBe("#0057B8");
+  });
+
+  it("substitutes phClr inside a gradient fillRef too", () => {
+    const [s] = parseSlide(
+      styledShape("", `<a:fillRef idx="2"><a:schemeClr val="accent2"/></a:fillRef>`),
+      FMT_THEME,
+    ).shapes;
+    expect(s.fill).toBeUndefined();
+    expect(s.gradient).toContain("#ED7D31");
+  });
+
+  it("applies the ref colour's own transforms before substituting phClr", () => {
+    const [s] = parseSlide(
+      styledShape(
+        "",
+        `<a:fillRef idx="1"><a:schemeClr val="accent1"><a:tint val="40000"/></a:schemeClr></a:fillRef>`,
+      ),
+      FMT_THEME,
+    ).shapes;
+    expect(s.fill).toBe("#CBD1E6");
+  });
+
+  it("treats idx=0 as an explicit 'no fill / no line'", () => {
+    const [s] = parseSlide(
+      styledShape(
+        "",
+        `<a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef>` +
+        `<a:lnRef idx="0"><a:schemeClr val="accent1"/></a:lnRef>` +
+        `<a:fontRef idx="minor"><a:schemeClr val="dk1"/></a:fontRef>`,
+      ),
+      FMT_THEME,
+      undefined,
+    ).shapes;
+    expect(s).toBeUndefined(); // nothing to draw at all
+  });
+
+  it("lets spPr's own solidFill and a:ln noFill beat the p:style refs", () => {
+    const [s] = parseSlide(
+      styledShape(
+        `<a:solidFill><a:srgbClr val="FFB0AF"/></a:solidFill><a:ln w="12700"><a:noFill/></a:ln>`,
+        `${FILL_REF_1}<a:lnRef idx="2"><a:schemeClr val="dk1"/></a:lnRef>`,
+      ),
+      FMT_THEME,
+    ).shapes;
+    expect(s.fill).toBe("#FFB0AF");
+    expect(s.line).toBeUndefined();
+  });
+
+  it("lets an explicit spPr a:noFill suppress the fillRef", () => {
+    const [s] = parseSlide(
+      styledShape(`<a:noFill/><a:ln w="12700"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln>`,
+        FILL_REF_1),
+      FMT_THEME,
+    ).shapes;
+    expect(s.fill).toBeUndefined();
+    expect(s.line?.color).toBe("#112233");
+  });
+
+  it("resolves lnRef width and phClr into the outline", () => {
+    const [s] = parseSlide(
+      styledShape("", `<a:lnRef idx="2"><a:schemeClr val="accent2"/></a:lnRef>`),
+      FMT_THEME,
+    ).shapes;
+    expect(s.line?.color).toBe("#ED7D31");
+    expect(s.line?.width).toBeCloseTo(38100 / 9525, 4);
+  });
+
+  it("resolves effectRef into a shadow", () => {
+    const [s] = parseSlide(
+      styledShape("", `${FILL_REF_1}<a:effectRef idx="2"><a:schemeClr val="dk1"/></a:effectRef>`),
+      FMT_THEME,
+    ).shapes;
+    expect(s.shadow).toBe("2px 0px 4px #000000");
+  });
+
+  it("gives text the fontRef's colour and theme family", () => {
+    const [s] = parseSlide(
+      styledShape(
+        "",
+        `${FILL_REF_1}<a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef>`,
+        `<a:p><a:r><a:t>Hi</a:t></a:r></a:p>`,
+      ),
+      FMT_THEME,
+    ).shapes;
+    expect(s.paragraphs[0].runs[0].color).toBe("#FFFFFF");
+    expect(s.paragraphs[0].runs[0].font).toBe("Verdana");
+  });
+
+  it("still lets a run's own rPr beat the fontRef", () => {
+    const [s] = parseSlide(
+      styledShape(
+        "",
+        `${FILL_REF_1}<a:fontRef idx="major"><a:schemeClr val="lt1"/></a:fontRef>`,
+        `<a:p><a:r><a:rPr lang="en"><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:rPr>` +
+        `<a:t>Hi</a:t></a:r></a:p>`,
+      ),
+      FMT_THEME,
+    ).shapes;
+    expect(s.paragraphs[0].runs[0].color).toBe("#123456");
+    expect(s.paragraphs[0].runs[0].font).toBe("Georgia"); // +mj-lt
+  });
+});
+
+// --- Bullets ------------------------------------------------------------------
+
+/** A plain (non-placeholder) text box whose paragraphs the test supplies. */
+function textBox(paras: string): string {
+  return slide(
+    `<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="4572000" cy="2286000"/></a:xfrm></p:spPr>` +
+    `<p:txBody><a:bodyPr/><a:lstStyle/>${paras}</p:txBody></p:sp>`);
+}
+
+const T = parseTheme(THEME1, MASTER1);
+
+describe("bullets", () => {
+  it("carries a:buChar's glyph, font, colour and buSzPct through", () => {
+    const [s] = parseSlide(
+      textBox(
+        `<a:p><a:pPr marL="342900" indent="-342900">` +
+        `<a:buClr><a:srgbClr val="FF0000"/></a:buClr><a:buSzPct val="75000"/>` +
+        `<a:buFont typeface="Wingdings"/><a:buChar char="§"/></a:pPr>` +
+        `<a:r><a:rPr sz="2000"/><a:t>Item</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    const p = s.paragraphs[0];
+    expect(p.bullet).toBe(true);
+    expect(p.bulletText).toBe("§");
+    expect(p.bulletFont).toBe("Wingdings");
+    expect(p.bulletColor).toBe("#FF0000");
+    expect(p.bulletSizePx).toBeCloseTo((20 * 96 / 72) * 0.75, 4);
+    expect(p.marginLeftPx).toBeCloseTo(342900 / 9525, 4);
+    expect(p.indentPx).toBeCloseTo(-342900 / 9525, 4);
+  });
+
+  it("numbers a:buAutoNum runs per level and honours startAt", () => {
+    const [s] = parseSlide(
+      textBox(
+        `<a:p><a:pPr><a:buAutoNum type="arabicPeriod" startAt="3"/></a:pPr>` +
+        `<a:r><a:t>one</a:t></a:r></a:p>` +
+        `<a:p><a:pPr><a:buAutoNum type="arabicPeriod"/></a:pPr><a:r><a:t>two</a:t></a:r></a:p>` +
+        `<a:p><a:pPr lvl="1"><a:buAutoNum type="alphaLcParenR"/></a:pPr>` +
+        `<a:r><a:t>sub</a:t></a:r></a:p>` +
+        `<a:p><a:pPr lvl="1"><a:buAutoNum type="alphaLcParenR"/></a:pPr>` +
+        `<a:r><a:t>sub2</a:t></a:r></a:p>` +
+        `<a:p><a:pPr><a:buAutoNum type="arabicPeriod"/></a:pPr><a:r><a:t>three</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs.map((p) => p.bulletText)).toEqual(["3.", "4.", "a)", "b)", "5."]);
+  });
+
+  it("restarts a level's numbering after a non-numbered paragraph breaks the run", () => {
+    const [s] = parseSlide(
+      textBox(
+        `<a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>a</a:t></a:r></a:p>` +
+        `<a:p><a:pPr><a:buNone/></a:pPr><a:r><a:t>gap</a:t></a:r></a:p>` +
+        `<a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>b</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs.map((p) => p.bulletText)).toEqual(["I.", undefined, "I."]);
+    expect(s.paragraphs[1].bullet).toBe(false);
+  });
+
+  it("keeps an explicit marL/indent of 0 instead of dropping it as falsy", () => {
+    const [s] = parseSlide(
+      textBox(`<a:p><a:pPr marL="0" indent="0"><a:buChar char="•"/></a:pPr>` +
+        `<a:r><a:t>x</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs[0].marginLeftPx).toBe(0);
+    expect(s.paragraphs[0].indentPx).toBe(0);
+  });
+});
+
+// --- Images: a:srcRect cropping and a:tile -------------------------------------
+
+function picture(blipFillInner: string): string {
+  return slide(
+    `<p:pic><p:nvPicPr><p:cNvPr id="1" name="p"/></p:nvPicPr>` +
+    `<p:blipFill><a:blip ${R} r:embed="rId9"/>${blipFillInner}</p:blipFill>` +
+    `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>` +
+    `</p:pic>`);
+}
+
+describe("picture fills", () => {
+  it("reads a:srcRect as a per-edge fraction of the source", () => {
+    const [s] = parseSlide(picture(`<a:srcRect l="10000" t="0" r="25000" b="5000"/><a:stretch/>`)).shapes;
+    expect(s.crop).toEqual({ l: 0.1, t: 0, r: 0.25, b: 0.05 });
+    expect(s.stretch).toBe(true);
+  });
+
+  it("ignores the ubiquitous empty a:srcRect", () => {
+    const [s] = parseSlide(picture(`<a:srcRect/><a:stretch/>`)).shapes;
+    expect(s.crop).toBeUndefined();
+  });
+
+  it("ignores a crop that would leave nothing of an axis", () => {
+    const [s] = parseSlide(picture(`<a:srcRect l="60000" r="60000"/><a:stretch/>`)).shapes;
+    expect(s.crop).toBeUndefined();
+  });
+
+  it("distinguishes a:tile from a:stretch", () => {
+    const [s] = parseSlide(picture(`<a:tile tx="0" ty="0" sx="100000" sy="100000"/>`)).shapes;
+    expect(s.tile).toBe(true);
+    expect(s.stretch).toBeUndefined();
+  });
+});
+
+// --- roundRect corner radius and vertical text --------------------------------
+
+function autoShape(prst: string, geomInner: string, bodyPr = "<a:bodyPr/>"): string {
+  return slide(
+    `<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>` +
+    `<a:prstGeom prst="${prst}">${geomInner}</a:prstGeom>` +
+    `<a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></p:spPr>` +
+    `<p:txBody>${bodyPr}<a:lstStyle/><a:p><a:r><a:t>t</a:t></a:r></a:p></p:txBody></p:sp>`);
+}
+
+describe("roundRect geometry and vertical text", () => {
+  it("takes the corner radius from a:avLst's adj guide", () => {
+    const [s] = parseSlide(autoShape("roundRect", `<a:avLst><a:gd name="adj" fmla="val 25000"/></a:avLst>`)).shapes;
+    expect(s.geom).toBe("roundRect");
+    expect(s.cornerRadius).toBe(0.25);
+  });
+
+  it("falls back to the preset's own 1/6 default when avLst is empty", () => {
+    const [s] = parseSlide(autoShape("roundRect", `<a:avLst/>`)).shapes;
+    expect(s.cornerRadius).toBeCloseTo(0.16667, 5);
+  });
+
+  it("clamps the adj guide to half the shorter side", () => {
+    const [s] = parseSlide(autoShape("roundRect", `<a:avLst><a:gd name="adj" fmla="val 90000"/></a:avLst>`)).shapes;
+    expect(s.cornerRadius).toBe(0.5);
+  });
+
+  it("reads a:bodyPr vert, and leaves horz shapes unmarked", () => {
+    const [v] = parseSlide(autoShape("rect", `<a:avLst/>`, `<a:bodyPr vert="vert270"/>`)).shapes;
+    expect(v.vert).toBe("vert270");
+    const [e] = parseSlide(autoShape("rect", `<a:avLst/>`, `<a:bodyPr vert="eaVert"/>`)).shapes;
+    expect(e.vert).toBe("vert");
+    const [h] = parseSlide(autoShape("rect", `<a:avLst/>`, `<a:bodyPr vert="horz"/>`)).shapes;
+    expect(h.vert).toBeUndefined();
+  });
+});
+
+// --- Run highlighting ----------------------------------------------------------
+
+describe("a:highlight", () => {
+  it("carries a run's highlight colour onto the run", () => {
+    const [s] = parseSlide(
+      textBox(`<a:p><a:r><a:rPr lang="en"><a:highlight><a:srgbClr val="FFFF00"/></a:highlight>` +
+        `</a:rPr><a:t>lit</a:t></a:r><a:r><a:t>plain</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs[0].runs[0].highlight).toBe("#FFFF00");
+    expect(s.paragraphs[0].runs[1].highlight).toBeUndefined();
+  });
+});
+
+// --- Tables: borders, margins and table styles ---------------------------------
+
+const TABLE_STYLES = `<?xml version="1.0"?><a:tblStyleLst ${A} def="{S1}">` +
+  `<a:tblStyle styleId="{S1}" styleName="Test">` +
+  `<a:wholeTbl><a:tcStyle><a:tcBdr>` +
+  `<a:insideH><a:ln w="12700"><a:solidFill><a:srgbClr val="AAAAAA"/></a:solidFill></a:ln></a:insideH>` +
+  `<a:insideV><a:ln w="12700"><a:solidFill><a:srgbClr val="AAAAAA"/></a:solidFill></a:ln></a:insideV>` +
+  `<a:left><a:ln w="25400"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></a:left>` +
+  `</a:tcBdr><a:fill><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill></a:fill></a:tcStyle></a:wholeTbl>` +
+  `<a:band1H><a:tcStyle><a:tcBdr/>` +
+  `<a:fill><a:solidFill><a:srgbClr val="DDDDDD"/></a:solidFill></a:fill></a:tcStyle></a:band1H>` +
+  `<a:firstRow><a:tcTxStyle b="on"><a:srgbClr val="FFFFFF"/></a:tcTxStyle><a:tcStyle><a:tcBdr/>` +
+  `<a:fill><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:fill></a:tcStyle></a:firstRow>` +
+  `</a:tblStyle></a:tblStyleLst>`;
+
+function tableSlide(tblPr: string, rows: string): string {
+  return slide(
+    `<p:graphicFrame><p:xfrm><a:off x="0" y="0"/><a:ext cx="2743200" cy="914400"/></p:xfrm>` +
+    `<a:graphic><a:graphicData><a:tbl>${tblPr}` +
+    `<a:tblGrid><a:gridCol w="1371600"/><a:gridCol w="1371600"/></a:tblGrid>` +
+    `${rows}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>`);
+}
+
+/** One row of `n` cells, each carrying the given a:tcPr inner XML. */
+function tableRow(tcPr: string, n = 2): string {
+  let out = "<a:tr h=\"457200\">";
+  for (let i = 0; i < n; i++) {
+    out += `<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>c${i}</a:t></a:r></a:p></a:txBody>` +
+      `<a:tcPr>${tcPr}</a:tcPr></a:tc>`;
+  }
+  return `${out}</a:tr>`;
+}
+
+describe("table cells", () => {
+  it("reads a:lnL/R/T/B (and diagonals) instead of inventing a grid", () => {
+    const { shapes } = parseSlide(
+      tableSlide("", tableRow(
+        `<a:lnT w="12700"><a:solidFill><a:srgbClr val="112233"/></a:solidFill>` +
+        `<a:prstDash val="dash"/></a:lnT>` +
+        `<a:lnTlToBr w="12700"><a:solidFill><a:srgbClr val="445566"/></a:solidFill></a:lnTlToBr>`)),
+      T,
+    );
+    const cell = shapes[0].table!.rows[0].cells[0];
+    expect(cell.borders?.t).toEqual({ color: "#112233", width: 12700 / 9525, dash: "dash" });
+    expect(cell.borders?.tlToBr?.color).toBe("#445566");
+    expect(cell.borders?.l).toBeUndefined();
+    expect(cell.borders?.b).toBeUndefined();
+  });
+
+  it("drops an a:lnL that is explicitly a:noFill", () => {
+    const { shapes } = parseSlide(tableSlide("", tableRow(`<a:lnL w="12700"><a:noFill/></a:lnL>`)), T);
+    expect(shapes[0].table!.rows[0].cells[0].borders).toBeUndefined();
+  });
+
+  it("reads a:tcPr cell margins, defaulting each side per the spec", () => {
+    const { shapes } = parseSlide(
+      tableSlide("", `<a:tr h="457200"><a:tc><a:txBody><a:bodyPr/><a:p/></a:txBody>` +
+        `<a:tcPr marL="0" marR="0" marT="91440"/></a:tc></a:tr>`),
+      T,
+    );
+    const m = shapes[0].table!.rows[0].cells[0].margins!;
+    expect(m.l).toBe(0);
+    expect(m.r).toBe(0);
+    expect(m.t).toBeCloseTo(91440 / 9525, 4);
+    expect(m.b).toBeCloseTo(45720 / 9525, 4); // unset → OOXML default
+  });
+
+  it("applies a table style's fills, banding, header text and edge/inside borders", () => {
+    const tableStyles = parseTableStyles(TABLE_STYLES);
+    const { shapes } = parseSlide(
+      tableSlide(
+        `<a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{S1}</a:tableStyleId></a:tblPr>`,
+        tableRow("") + tableRow("") + tableRow(""),
+      ),
+      T,
+      { tableStyles },
+    );
+    const rows = shapes[0].table!.rows;
+    expect(rows[0].cells[0].fill).toBe("#112233"); // firstRow beats wholeTbl
+    expect(rows[0].cells[0].paragraphs[0].runs[0].color).toBe("#FFFFFF");
+    expect(rows[0].cells[0].paragraphs[0].runs[0].bold).toBe(true);
+    expect(rows[1].cells[0].fill).toBe("#DDDDDD"); // band1H
+    expect(rows[2].cells[0].fill).toBe("#EEEEEE"); // band2H → wholeTbl
+    // outer edge from a:left, interior edge from a:insideV
+    expect(rows[1].cells[0].borders?.l?.width).toBeCloseTo(25400 / 9525, 4);
+    expect(rows[1].cells[1].borders?.l?.color).toBe("#AAAAAA");
+  });
+
+  it("lets a cell's own a:tcPr fill and borders beat the table style", () => {
+    const tableStyles = parseTableStyles(TABLE_STYLES);
+    const { shapes } = parseSlide(
+      tableSlide(
+        `<a:tblPr><a:tableStyleId>{S1}</a:tableStyleId></a:tblPr>`,
+        tableRow(`<a:lnL w="12700"><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></a:lnL>` +
+          `<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>`),
+      ),
+      T,
+      { tableStyles },
+    );
+    const cell = shapes[0].table!.rows[0].cells[0];
+    expect(cell.fill).toBe("#FF0000");
+    expect(cell.borders?.l?.color).toBe("#00FF00");
+  });
+
+  it("leaves a table alone when its styleId isn't in tableStyles.xml", () => {
+    const { shapes } = parseSlide(
+      tableSlide(`<a:tblPr firstRow="1"><a:tableStyleId>{MISSING}</a:tableStyleId></a:tblPr>`, tableRow("")),
+      T,
+      { tableStyles: parseTableStyles(TABLE_STYLES) },
+    );
+    const cell = shapes[0].table!.rows[0].cells[0];
+    expect(cell.fill).toBeUndefined();
+    expect(cell.borders).toBeUndefined();
+  });
+});
+
+describe("cssFontStack — style-suffix families", () => {
+  it("emits the authored face, then its base family, then substitutes", () => {
+    const stack = cssFontStack("ATT Aleck Sans Medium");
+    expect(stack).toBe(
+      "'ATT Aleck Sans Medium', 'ATT Aleck Sans', Helvetica, Arial, sans-serif",
+    );
+    // The full name comes first so an installed face still wins.
+    expect(stack!.indexOf("Medium")).toBeLessThan(stack!.indexOf("'ATT Aleck Sans'"));
+  });
+
+  it("never synthesizes a font-weight for the suffix", () => {
+    expect(cssFontStack("Foo Sans SemiBold")).not.toMatch(/weight/i);
+  });
+
+  it("strips repeated style words", () => {
+    expect(cssFontStack("Foo Sans SemiBold Italic")).toBe(
+      "'Foo Sans SemiBold Italic', 'Foo Sans', Helvetica, Arial, sans-serif",
+    );
+  });
+
+  it("finds a substitute through the stripped base family", () => {
+    // "Calibri Light" has its own entry; "Aptos Light" only matches via "Aptos".
+    expect(cssFontStack("Aptos Light")).toBe(
+      "'Aptos Light', 'Aptos', 'Helvetica Neue', Helvetica, Arial, sans-serif",
+    );
+  });
+
+  it("leaves a family without a style suffix alone", () => {
+    expect(cssFontStack("Arial")).toBe(
+      "'Arial', Arimo, Helvetica, 'Helvetica Neue', sans-serif",
+    );
+  });
+
+  // Carlito and Arimo are bundled (src/app.css), so these two stacks always have
+  // a metric-compatible face to land on even where the authored font is absent.
+  it("falls back to the bundled metric clones for Calibri, Arial and Times", () => {
+    expect(cssFontStack("Calibri")).toContain("Carlito");
+    expect(cssFontStack("Calibri Light")).toContain("Carlito");
+    expect(cssFontStack("Arial")).toContain("Arimo");
+    expect(cssFontStack("Times New Roman")).toContain("Tinos");
+  });
+});
+
+describe("a:rPr spc (character spacing)", () => {
+  it("turns hundredths of a point into px of letter-spacing", () => {
+    const [s] = parseSlide(
+      textBox(`<a:p><a:r><a:rPr sz="3200" spc="-60"/><a:t>Tight</a:t></a:r></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs[0].runs[0].letterSpacingPx).toBeCloseTo(-0.6 * (96 / 72), 5);
+  });
+
+  it("inherits tracking from the master's txStyles and is cleared by spc=0", () => {
+    const titled = (inner: string) =>
+      slide(
+        `<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/>` +
+        `<p:txBody><a:bodyPr/><a:lstStyle/>${inner}</p:txBody></p:sp>`);
+    const master =
+      `<?xml version="1.0"?><p:sldMaster ${P} ${A}><p:txStyles><p:titleStyle>` +
+      `<a:lvl1pPr><a:defRPr sz="3200" spc="-60"/></a:lvl1pPr>` +
+      `</p:titleStyle></p:txStyles></p:sldMaster>`;
+    const inherit = { textStyles: parseMasterTextStyles(master) };
+    const [inherited] = parseSlide(
+      titled(`<a:p><a:r><a:t>x</a:t></a:r></a:p>`), T, inherit).shapes;
+    expect(inherited.paragraphs[0].runs[0].letterSpacingPx).toBeCloseTo(-0.8, 5);
+    const [cleared] = parseSlide(
+      titled(`<a:p><a:r><a:rPr spc="0"/><a:t>x</a:t></a:r></a:p>`), T, inherit).shapes;
+    expect(cleared.paragraphs[0].runs[0].letterSpacingPx).toBeUndefined();
+  });
+});
+
+describe("a:normAutofit shrink-to-fit", () => {
+  const withBodyPr = (bodyPr: string) =>
+    slide(
+      `<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>` +
+      `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="4572000" cy="914400"/></a:xfrm></p:spPr>` +
+      `<p:txBody>${bodyPr}<a:lstStyle/><a:p><a:r><a:rPr sz="1800"/>` +
+      `<a:t>Text</a:t></a:r></a:p></p:txBody></p:sp>`);
+
+  it("flags a shape whose bodyPr carries a:normAutofit", () => {
+    const [s] = parseSlide(
+      withBodyPr(`<a:bodyPr><a:normAutofit fontScale="70000"/></a:bodyPr>`), T).shapes;
+    expect(s.shrinkToFit).toBe(true);
+    expect(s.paragraphs[0].runs[0].sizePt).toBeCloseTo(18 * 0.7, 5);
+  });
+
+  it("flags a bare a:normAutofit, which stores no scale but is still shrink mode", () => {
+    const [s] = parseSlide(withBodyPr(`<a:bodyPr><a:normAutofit/></a:bodyPr>`), T).shapes;
+    expect(s.shrinkToFit).toBe(true);
+  });
+
+  it("leaves a plain or spAutoFit body unflagged so it overflows like PowerPoint", () => {
+    expect(parseSlide(withBodyPr(`<a:bodyPr/>`), T).shapes[0].shrinkToFit).toBeUndefined();
+    expect(
+      parseSlide(withBodyPr(`<a:bodyPr><a:spAutoFit/></a:bodyPr>`), T).shapes[0].shrinkToFit,
+    ).toBeUndefined();
+  });
+});
+
+describe("isHiddenSlide", () => {
+  it("detects p:sld show=\"0\"", () => {
+    const hidden =
+      `<?xml version="1.0"?><p:sld ${A} ${P} ${R} show="0">` +
+      `<p:cSld><p:spTree/></p:cSld></p:sld>`;
+    expect(isHiddenSlide(hidden)).toBe(true);
+  });
+
+  it("treats a slide with no show attribute, show=\"1\", or no XML as visible", () => {
+    expect(isHiddenSlide(slide(""))).toBe(false);
+    expect(
+      isHiddenSlide(
+        `<?xml version="1.0"?><p:sld ${A} ${P} ${R} show="1"><p:cSld><p:spTree/></p:cSld></p:sld>`,
+      ),
+    ).toBe(false);
+    expect(isHiddenSlide(undefined)).toBe(false);
+  });
+
+  it("ignores a show= attribute that isn't on the root element", () => {
+    expect(
+      isHiddenSlide(slide(`<p:sp><p:nvSpPr><p:cNvPr name="show=0"/></p:nvSpPr></p:sp>`)),
+    ).toBe(false);
+  });
+});
+
+describe("bullets on empty paragraphs", () => {
+  it("drops the bullet from a paragraph with no runs, keeping its line box", () => {
+    const [s] = parseSlide(
+      textBox(
+        `<a:p><a:pPr marL="342900" indent="-342900"><a:buChar char="•"/></a:pPr>` +
+        `<a:r><a:t>Item</a:t></a:r></a:p>` +
+        `<a:p><a:pPr marL="342900" indent="-342900"><a:buChar char="•"/></a:pPr>` +
+        `<a:endParaRPr sz="1600"/></a:p>`),
+      T,
+    ).shapes;
+    expect(s.paragraphs[0].bullet).toBe(true);
+    // An out-of-flow bullet marker would collapse the empty line to zero height.
+    expect(s.paragraphs[1].bullet).toBe(false);
+    expect(s.paragraphs[1].sizePt).toBe(16);
   });
 });
