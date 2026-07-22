@@ -6,9 +6,7 @@ name: CI
 
 on:
   push:
-    # ci-macos-arm is temporary, to exercise build-macos before merge —
-    # drop it when the branch merges.
-    branches: [main, ci-macos-arm]
+    branches: [main]
   pull_request:
     branches: [main]
 
