@@ -39,7 +39,12 @@ ureq = { version = "2", default-features = false, features = ["tls", "native-cer
 # builds it from source (needs cmake + a C/C++ toolchain), so it is gated
 # behind a default feature: everything else in ken-core still builds if the
 # native toolchain is unavailable (`--no-default-features`).
-whisper-rs = { version = "0.16", optional = true }
+# `metal` here is load-bearing beyond whisper itself: whisper-rs and
+# llama-cpp-2 each bundle a ggml, and the linker resolves the shared ggml
+# symbols from whisper's copy. Without this feature that copy is CPU-only,
+# which silently strips the Metal backend from llama.cpp too (all layers
+# land on CPU despite n_gpu_layers).
+whisper-rs = { version = "0.16", features = ["metal"], optional = true }
 # Embedded on-device LLM (llama.cpp) for instant quick answers and Map entity
 # extraction. Bundles llama.cpp and builds it from source with Metal GPU
 # offload (needs cmake + a C/C++ toolchain), so it is gated behind a default
