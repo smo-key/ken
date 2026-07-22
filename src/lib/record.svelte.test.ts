@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelProgress, ModelStatus, RecordStateEvent } from "./api";
+import type { ModelProgress, ModelStatus, RecordStateEvent, TranscriptProgress } from "./api";
 
 // Captured event listeners registered by the store's `init()`.
 const listeners: {
@@ -7,6 +7,7 @@ const listeners: {
   transcribing?: () => void;
   saved?: (ev: { relPath: string }) => void;
   modelProgress?: (ev: ModelProgress) => void;
+  transcriptProgress?: (ev: TranscriptProgress) => void;
 } = {};
 
 // A resolved, installed transcription-model status by default; individual tests
@@ -44,6 +45,9 @@ vi.mock("./api", () => ({
     }),
     onRecordTranscribing: vi.fn(async (cb: () => void) => {
       listeners.transcribing = cb;
+    }),
+    onTranscriptProgress: vi.fn(async (cb: (ev: TranscriptProgress) => void) => {
+      listeners.transcriptProgress = cb;
     }),
     onRecordSaved: vi.fn(async (cb: (ev: { relPath: string }) => void) => {
       listeners.saved = cb;
@@ -116,6 +120,23 @@ describe("record store — transcribing", () => {
     now = 30000;
     vi.advanceTimersByTime(5000);
     expect(record.elapsedMs).toBe(6000); // clock still frozen at true duration
+  });
+
+  it("tracks percent from Recordings/ progress and resets on saved", () => {
+    listeners.transcribing?.();
+    expect(record.transcribing).toBe(true);
+    expect(record.transcribePct).toBeNull(); // null until the first sample
+
+    listeners.transcriptProgress?.({ relPath: "Recordings/take.md", phase: "transcribing", pct: 42 });
+    expect(record.transcribePct).toBe(42);
+
+    // A concurrent video transcription must not drive this bar.
+    listeners.transcriptProgress?.({ relPath: "Videos/clip.md", phase: "transcribing", pct: 99 });
+    expect(record.transcribePct).toBe(42);
+
+    listeners.saved?.({ relPath: "Recordings/take.md" });
+    expect(record.transcribing).toBe(false);
+    expect(record.transcribePct).toBeNull();
   });
 });
 
