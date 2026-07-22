@@ -8,7 +8,7 @@ PNPM := pnpm
 VITE_PORT := 1420
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev build test check clean require-pnpm
+.PHONY: help setup mcp-sidecar dev build test check clean require-pnpm
 
 help: ## Show available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[1m%-8s\033[0m %s\n", $$1, $$2}'
@@ -19,11 +19,16 @@ setup: ## Install pnpm, frontend deps, and Rust deps
 	$(PNPM) install
 	cargo fetch
 
-dev: require-pnpm ## Run the Tauri dev server (app window + hot reload)
+mcp-sidecar: ## Build ken-mcp and stage it for Tauri bundling (externalBin)
+	cargo build --release -p ken-mcp
+	mkdir -p src-tauri/binaries
+	cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$$(rustc -vV | sed -n 's/^host: //p')"
+
+dev: require-pnpm mcp-sidecar ## Run the Tauri dev server (app window + hot reload)
 	@lsof -ti :$(VITE_PORT) | xargs kill -9 2>/dev/null || true
 	$(PNPM) tauri dev
 
-build: require-pnpm ## Produce a release bundle
+build: require-pnpm mcp-sidecar ## Produce a release bundle
 	$(PNPM) tauri build
 
 test: require-pnpm ## Run Rust and frontend tests

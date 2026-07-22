@@ -4,3 +4,6 @@ dist/
 .claude/worktrees/
 *.log
 .DS_Store
+harness/decks/
+harness/out/
+src-tauri/binaries/

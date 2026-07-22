@@ -69,6 +69,18 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
+      - name: Build ken-mcp
+        shell: bash
+        run: |
+          cargo build --release -p ken-mcp
+          mkdir -p src-tauri/binaries
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
+          else
+            cp target/release/ken-mcp "src-tauri/binaries/ken-mcp-$triple"
+          fi
+
       - name: Build app bundles and create draft release
         id: tauri
         uses: tauri-apps/tauri-action@v0
@@ -82,9 +94,6 @@ jobs:
           releaseBody: "See the assets below. Install with: curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh"
           releaseDraft: true
           prerelease: false
-
-      - name: Build ken-mcp
-        run: cargo build --release -p ken-mcp
 
       - name: Upload install.sh assets (ken-mcp binary, app bundle)
         shell: bash

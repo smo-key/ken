@@ -4809,6 +4809,52 @@ fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> 
     Ok(options)
 }
 
+/// Copy the bundled ken-mcp sidecar over `dest` when the bytes differ, so
+/// `~/.local/bin/ken-mcp` (installed by install.sh) stays in sync across
+/// auto-updates. Returns whether a copy happened.
+fn refresh_ken_mcp_from(bundled: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
+    let new_bytes = std::fs::read(bundled)?;
+    if let Ok(old_bytes) = std::fs::read(dest) {
+        if old_bytes == new_bytes {
+            return Ok(false);
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write to a temp name then rename, so a running ken-mcp keeps its
+    // old inode and the swap is atomic.
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, &new_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, dest)?;
+    Ok(true)
+}
+
+/// Locate the bundled sidecar (next to the app executable) and refresh the
+/// user's copy. Release builds only; failures are logged, never fatal.
+fn refresh_ken_mcp() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dest = std::path::PathBuf::from(home).join(".local/bin/ken-mcp");
+    let bundled = match std::env::current_exe() {
+        Ok(exe) => exe.parent().map(|d| d.join("ken-mcp")),
+        Err(_) => None,
+    };
+    let Some(bundled) = bundled.filter(|p| p.exists()) else { return };
+    match refresh_ken_mcp_from(&bundled, &dest) {
+        Ok(true) => eprintln!("ken-mcp refreshed at {}", dest.display()),
+        Ok(false) => {}
+        Err(err) => eprintln!("warning: could not refresh ken-mcp: {err}"),
+    }
+}
+
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
@@ -4830,6 +4876,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
+        .setup(|_app| {
+            std::thread::spawn(refresh_ken_mcp);
+            Ok(())
+        })
         // Focus = "the user is back" — the moment to fetch teammates'
         // work and to check whether today's digest is due.
         .on_window_event(|window, event| {
@@ -5018,5 +5068,36 @@ mod tests {
 
         assert!(!project.root.join("Meetings").exists());
         assert!(db.get_file(child).unwrap().is_none(), "child row should be dropped with the folder");
+    }
+}
+
+#[cfg(test)]
+mod ken_mcp_refresh_tests {
+    use super::refresh_ken_mcp_from;
+
+    #[test]
+    fn copies_when_dest_missing_or_stale_and_skips_when_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = dir.path().join("bundled-ken-mcp");
+        let dest = dir.path().join("bin").join("ken-mcp");
+        std::fs::write(&bundled, b"v2 binary").unwrap();
+
+        // Missing dest -> copied (and parent dir created).
+        assert!(refresh_ken_mcp_from(&bundled, &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"v2 binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "must be executable");
+        }
+
+        // Same bytes -> no copy.
+        assert!(!refresh_ken_mcp_from(&bundled, &dest).unwrap());
+
+        // Stale dest -> copied.
+        std::fs::write(&dest, b"v1 binary").unwrap();
+        assert!(refresh_ken_mcp_from(&bundled, &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"v2 binary");
     }
 }
