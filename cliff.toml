@@ -1,0 +1,43 @@
+# git-cliff configuration — generates CHANGELOG.md and release notes from the
+# conventional-commit history. See https://git-cliff.org/docs/configuration
+[changelog]
+# Rendered once at the top of CHANGELOG.md.
+header = "# Changelog\n\n"
+# Per-release body template (Tera). Groups commits by their type heading.
+body = """
+{% if version %}## {{ version | trim_start_matches(pat="v") }}{% else %}## Unreleased{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+# Parse commits as conventional commits (feat:, fix:, …).
+conventional_commits = true
+# Keep non-conventional commits, filed under "Other" via the catch-all below.
+filter_unmatched = false
+# Only tags shaped like v1.2.3 delimit releases.
+tag_pattern = "v[0-9]*"
+# Newest release first.
+sort_commits = "newest"
+
+# Commit type -> changelog section. First matching rule wins; the trailing
+# catch-all files anything unmatched under "Other".
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^ci", group = "CI" },
+  { message = "^build", group = "Build" },
+  { message = "^test", group = "Testing" },
+  { message = "^chore", group = "Chores" },
+  { message = ".*", group = "Other" },
+]
+# Breaking changes get their own protected section regardless of type.
+protect_breaking_commits = true

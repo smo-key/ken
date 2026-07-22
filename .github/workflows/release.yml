@@ -1,6 +1,14 @@
-# Release pipeline: push a v* tag -> draft GitHub Release with platform
-# bundles (via tauri-action) plus explicitly named assets that install.sh
-# downloads. Asset-name contract with install.sh:
+# Release pipeline: a version bump on main drives everything. When
+# package.json's version is higher than the latest v* tag, the `gate` job syncs
+# the manifests (tauri.conf.json, Cargo.toml, Cargo.lock), regenerates
+# CHANGELOG.md, commits `chore(release): v<version> [skip ci]`, and tags
+# v<version>. `create-release` opens ONE draft GitHub Release; a REQUIRED
+# four-target build matrix produces + uploads signed installers to it; and the
+# release is published only once every leg has uploaded. The gate creates the
+# tag, so there is no longer a `v*` tag push trigger.
+#
+# Asset-name contract with install.sh (produced by the "Upload install.sh
+# assets" step):
 #   Ken-<target-triple>.app.tar.gz   (macOS app bundle, tarred)
 #   Ken-<target-triple>.AppImage     (Linux)
 #   ken-mcp-<target-triple>[.exe]    (all platforms)
@@ -8,33 +16,236 @@
 # and latest.json (endpoint in tauri.conf.json). Requires repo secrets
 # TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 # (generated with: pnpm tauri signer generate).
+#
+# Manual workflow_dispatch inputs:
+#   bundle_test   — build the Windows installer end-to-end and upload it as a
+#                   workflow artifact. No tag, no Release. Use this to prove the
+#                   packaging BEFORE a version bump, since `gate` pushes the tag
+#                   before any build runs and a packaging failure would otherwise
+#                   burn the version number.
+#   force_publish — force a release build without a version bump (uses the
+#                   current package.json version). NOTE: this only works for a
+#                   version whose tag does NOT yet exist; otherwise it overrides
+#                   the gate's idempotency decision and then fails at `git tag
+#                   -a`. Prefer `bundle_test` for testing a build.
 name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Force a release build even without a version bump (uses the current package.json version)"
+        type: boolean
+        default: false
+      bundle_test:
+        description: "Build the Windows installer end-to-end and upload it as a workflow artifact (no tag, no Release)"
+        type: boolean
+        default: false
 
+# Needs write access to push the sync commit + tag and create/update the Release.
 permissions:
   contents: write
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # gate: decide whether to release; if so, sync version, changelog, commit, tag.
+  # ---------------------------------------------------------------------------
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # sync-version.sh runs `cargo update --workspace --offline` (a plain
+      # dependency-graph update — no build, no system deps), so a toolchain is
+      # all the gate needs from Rust.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Skip-ci guard. GitHub Actions does NOT honor [skip ci] natively on push,
+      # so we guard here: the version-sync commit (which carries [skip ci]) must
+      # NOT start another release. We deliberately match ONLY [skip ci], not the
+      # `chore(release):` subject — a hand-authored `chore(release): …` commit
+      # (without [skip ci]) is allowed to drive a release. Loop safety for the
+      # gate's own sync commit still holds via two independent layers: it carries
+      # [skip ci] (caught here), and release-gate.sh refuses to re-release once
+      # tag v<version> exists (idempotency backstop).
+      - name: Skip-ci guard
+        id: skipci
+        run: |
+          MSG="$(git log -1 --pretty=%B)"
+          echo "head commit subject: $(git log -1 --pretty=%s)"
+          if printf '%s' "$MSG" | grep -qE '\[skip ci\]'; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "Head commit carries [skip ci]; will not release."
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      # Compute should_release from the version vs the latest tag (idempotent).
+      # The force_publish dispatch input overrides a "no bump" decision but still
+      # respects the tag-already-exists guard inside release-gate.sh.
+      - name: Gate decision
+        id: decide
+        run: |
+          if [ "${{ steps.skipci.outputs.skip }}" = "true" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "should_release=false" >>"$GITHUB_OUTPUT"
+            echo "Skip-ci guard tripped; not releasing."
+            exit 0
+          fi
+          bash scripts/release-gate.sh
+          # release-gate.sh has already written should_release/version/tag to
+          # $GITHUB_OUTPUT. Re-read them so we can apply the force override.
+          SR="$(grep -E '^should_release=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_publish }}" = "true" ] && [ "$SR" != "true" ]; then
+            echo "force_publish set: overriding should_release=true"
+            echo "should_release=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync version into manifests
+        if: steps.decide.outputs.should_release == 'true'
+        run: bash scripts/sync-version.sh "${{ steps.decide.outputs.version }}"
+
+      # Install the pinned git-cliff and regenerate the FULL changelog plus the
+      # since-last-tag release notes (saved for the Release body).
+      - name: Install git-cliff
+        if: steps.decide.outputs.should_release == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Generate changelog + release notes
+        if: steps.decide.outputs.should_release == 'true'
+        run: |
+          # Full changelog (committed alongside the sync commit).
+          git-cliff --tag "${{ steps.decide.outputs.tag }}" -o CHANGELOG.md
+          # Release body: just the commits since the previous tag, header stripped.
+          git-cliff --unreleased --tag "${{ steps.decide.outputs.tag }}" --strip header -o RELEASE_NOTES.md
+          echo "----- RELEASE_NOTES.md -----"
+          cat RELEASE_NOTES.md
+
+      - name: Commit sync + tag
+        if: steps.decide.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Ken's versions live in the workspace root Cargo.toml + root Cargo.lock.
+          git add src-tauri/tauri.conf.json Cargo.toml Cargo.lock CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit (already in sync)."
+          else
+            git commit -m "chore(release): ${TAG} [skip ci]"
+          fi
+          git push origin HEAD:main
+          # Annotated tag on the (possibly just-committed) release commit.
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      - name: Upload release notes artifact
+        if: steps.decide.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+
+  # ---------------------------------------------------------------------------
+  # create-release: make ONE draft Release up front so the parallel matrix jobs
+  # upload to a known release id instead of racing to create it.
+  # ---------------------------------------------------------------------------
+  create-release:
+    needs: gate
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Create draft release
+        id: create
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            let body = '';
+            try { body = fs.readFileSync('RELEASE_NOTES.md', 'utf8'); } catch (e) {}
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: process.env.TAG,
+              name: process.env.TAG,
+              body,
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # ---------------------------------------------------------------------------
+  # build: native build matrix; uploads to the draft release created above.
+  # ---------------------------------------------------------------------------
   build:
+    needs: [gate, create-release]
+    if: needs.gate.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           # Each runner builds natively for its own architecture,
           # so no cross-compilation targets are needed.
-          - os: macos-14 # aarch64-apple-darwin
+          #
+          # macos-15 (NOT macos-14): screencapturekit's apple-metal Swift bridge
+          # needs the macOS 15 SDK to compile.
+          - os: macos-15 # aarch64-apple-darwin
           # macos-13 (the old Intel image) was retired by GitHub;
           # macos-15-intel is the current x86_64 macOS runner.
           - os: macos-15-intel # x86_64-apple-darwin
           - os: ubuntu-22.04 # x86_64-unknown-linux-gnu
           - os: windows-latest # x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    # ALL FOUR targets are required — no leg is continue-on-error. `fail-fast:
+    # false` still lets every other target finish and upload, so one failure
+    # never hides another, but any failed leg blocks publish-release (the draft
+    # stays a draft rather than publishing with a platform's installer missing).
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+
+      # Fail fast with a clear message rather than a cryptic `tauri build` error:
+      # the updater is enabled (bundle.createUpdaterArtifacts + a committed
+      # pubkey), so Tauri requires the private key to emit/sign update artifacts.
+      - name: Verify updater signing key present
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. In-app updates are enabled, so a release build cannot sign updater artifacts without it. Run 'pnpm tauri signer generate' and add the private key as the TAURI_SIGNING_PRIVATE_KEY repo secret (see README)."
+            exit 1
+          fi
 
       - name: Install Tauri system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -130,7 +341,7 @@ jobs:
           $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
           Copy-Item target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
 
-      - name: Build app bundles and create draft release
+      - name: Build app bundles and upload to draft release
         id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -138,17 +349,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Ken ${{ github.ref_name }}"
-          releaseBody: "See the assets below. Install with: curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh"
-          releaseDraft: true
-          prerelease: false
+          # Upload this native target's installers + updater artifacts to the
+          # single draft Release created by create-release. Using releaseId (not
+          # tagName) avoids the parallel-create race.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
 
       - name: Upload install.sh assets (ken-mcp binary, app bundle)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
         run: |
           set -euo pipefail
           triple=$(rustc -vV | sed -n 's/^host: //p')
@@ -185,3 +395,129 @@ jobs:
               upload target/release/ken-mcp.exe "ken-mcp-$triple.exe"
               ;;
           esac
+
+  # ---------------------------------------------------------------------------
+  # publish-release: flip the draft to published once the build matrix finishes.
+  # Every target is required, so `build` succeeds — and this job runs — only when
+  # all four built and uploaded. If ANY leg fails (Windows included), `build`
+  # fails, this job is skipped, and the release stays a draft rather than being
+  # published with a platform's installer missing.
+  # ---------------------------------------------------------------------------
+  publish-release:
+    needs: [gate, create-release, build]
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish (undraft) the release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+              draft: false,
+            });
+
+  # ---------------------------------------------------------------------------
+  # bundle-test: build the REAL Windows installer end-to-end (sidecar, quality
+  # gate, NSIS/MSI packaging) and upload it as a workflow ARTIFACT — no version
+  # bump, no tag, no GitHub Release.
+  #
+  # Why this exists: `gate` pushes the release tag BEFORE any build runs.
+  # Discovering a Windows packaging failure during a real release therefore burns
+  # the version number and leaves a stuck draft that release-gate.sh's idempotency
+  # guard refuses to retry. This proves the packaging first, and produces a
+  # downloadable installer for the manual on-Windows validation that no CI job can
+  # perform.
+  #
+  # `force_publish` cannot serve this purpose: it forces should_release=true for a
+  # version whose tag already exists, and the `git tag -a` step then fails.
+  # ---------------------------------------------------------------------------
+  bundle-test:
+    if: github.event_name == 'workflow_dispatch' && inputs.bundle_test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ggml's Vulkan backend compiles its shaders at build time with glslc,
+      # which ships in the LunarG SDK (same install recipe as llama.cpp's CI).
+      - name: Install Vulkan SDK (Windows)
+        shell: pwsh
+        env:
+          VULKAN_VERSION: "1.4.309.0"
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+
+      # The SDK installer's default components ship no SPIRV-Headers CMake
+      # config, but ggml's Vulkan backend hard-requires it
+      # (find_package(SPIRV-Headers CONFIG REQUIRED)). Install the headers
+      # ourselves, pinned to the tag matching the SDK version above.
+      - name: Install SPIRV-Headers (Windows)
+        shell: pwsh
+        env:
+          VULKAN_VERSION: "1.4.309.0"
+        run: |
+          git clone --depth 1 --branch "vulkan-sdk-$env:VULKAN_VERSION" https://github.com/KhronosGroup/SPIRV-Headers.git "$env:RUNNER_TEMP\spirv-headers"
+          cmake -S "$env:RUNNER_TEMP\spirv-headers" -B "$env:RUNNER_TEMP\spirv-headers\build" -DCMAKE_INSTALL_PREFIX="C:\SPIRV-Headers"
+          cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\SPIRV-Headers"
+
+      # ggml's vulkan-shaders-gen ExternalProject breaks under the VS 2026
+      # generator (MSBuild runs its install rule before the build finishes);
+      # build with Ninja instead. Ninja needs cl.exe on PATH, hence
+      # msvc-dev-cmd. cmake-rs picks the generator up from CMAKE_GENERATOR.
+      - name: Set up MSVC dev environment (Windows)
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Select Ninja cmake generator (Windows)
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      # pwsh, not bash: under Git Bash /usr/bin/link (coreutils) shadows the
+      # MSVC linker that the msvc-dev-cmd environment puts on PATH.
+      - name: Build ken-mcp sidecar (Windows)
+        shell: pwsh
+        run: |
+          cargo build --release -p ken-mcp
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          Copy-Item target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
+
+      # Updater artifacts stay ENABLED so this exercises the same signing path a
+      # real release takes, rather than a subtly easier one.
+      - name: Build the Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ken-windows-x64
+          path: |
+            target/release/bundle/nsis/*
+            target/release/bundle/msi/*
+          if-no-files-found: error
