@@ -67,6 +67,21 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
+      # The SDK installer's default components ship no SPIRV-Headers CMake
+      # config, but ggml's Vulkan backend hard-requires it
+      # (find_package(SPIRV-Headers CONFIG REQUIRED)). Install the headers
+      # ourselves, pinned to the tag matching the SDK version above.
+      - name: Install SPIRV-Headers (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: "1.4.309.0"
+        run: |
+          git clone --depth 1 --branch "vulkan-sdk-$env:VULKAN_VERSION" https://github.com/KhronosGroup/SPIRV-Headers.git "$env:RUNNER_TEMP\spirv-headers"
+          cmake -S "$env:RUNNER_TEMP\spirv-headers" -B "$env:RUNNER_TEMP\spirv-headers\build" -DCMAKE_INSTALL_PREFIX="C:\SPIRV-Headers"
+          cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\SPIRV-Headers"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 11
