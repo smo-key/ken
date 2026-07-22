@@ -5012,17 +5012,14 @@ mod tests {
 
     #[test]
     fn local_quick_answer_prompt_grounds_and_uses_chatml() {
-        let hits = vec![SearchHit {
-            rel_path: "People.md".into(),
-            kind: "note".into(),
-            status: String::new(),
-            snippet: "Priya owns <mark>billing</mark>".into(),
-            rank: 0.0,
-        }];
-        let p = local_quick_answer_prompt("who owns billing?", &hits);
+        // The caller now hands each source in as `(rel_path, excerpt_text)` with
+        // marks already stripped (the excerpt/snippet fallback does that upstream),
+        // so the fixture supplies clean text directly.
+        let sources = vec![("People.md".to_string(), "Priya owns billing".to_string())];
+        let p = local_quick_answer_prompt("who owns billing?", &sources);
         assert!(p.contains("<|im_start|>system"));
         assert!(p.contains("who owns billing?"));
-        assert!(p.contains("People.md: Priya owns billing")); // marks stripped
+        assert!(p.contains("People.md: Priya owns billing"));
         assert!(p.contains("<|im_start|>assistant"));
     }
 
