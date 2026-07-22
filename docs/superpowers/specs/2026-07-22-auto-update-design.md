@@ -48,9 +48,10 @@ where the updater work touches them.
   - `restart()`: calls `relaunch()` from plugin-process. Only ever invoked by
     the user clicking the chip.
   - Exposes `state`, `version` (target version), `progress` (0–1 or null).
-- Dev override: skip checks entirely in dev (`import.meta.env.DEV`) unless
-  `KEN_UPDATE_URL` is set, which replaces the endpoint for end-to-end testing
-  against a local server.
+- Dev builds skip checks entirely (`import.meta.env.DEV`). For end-to-end
+  testing, temporarily point `plugins.updater.endpoints` at a local server
+  serving a hand-made `latest.json` (the JS `check()` API has no runtime
+  endpoint override).
 
 ### 3. Title-bar chip (`src/shell/TitleBar.svelte`)
 
