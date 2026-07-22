@@ -586,7 +586,7 @@ fn background_hydrate_worker(
                 continue;
             };
 
-            match cloud::hydrate_with_deadline(&abs, BG_HYDRATE_DEADLINE) {
+            match hydrate_emitting(&app, &rel, &abs, BG_HYDRATE_DEADLINE) {
                 Ok(()) => {
                     backoff.remove(&rel);
                     // Re-index off the global lock, on a private handle: a
@@ -832,6 +832,39 @@ fn is_cloud_only(state: State<SharedState>, rel_path: String) -> CmdResult<bool>
     Ok(cloud::is_placeholder(&resolve_path(&state, &rel_path)?))
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HydrationProgress {
+    rel_path: String,
+    downloaded: u64,
+    total: u64,
+}
+
+/// Hydrate a placeholder while streaming `hydration-progress` events, throttled
+/// exactly like model downloads. The terminal `(total, total)` sample always
+/// goes out so the UI can treat 100% as "the bytes are here".
+fn hydrate_emitting(
+    app: &AppHandle,
+    rel_path: &str,
+    abs: &Path,
+    deadline: Duration,
+) -> ken_core::Result<()> {
+    let mut throttle = model::ProgressThrottle::new();
+    let start = Instant::now();
+    let app = app.clone();
+    let rel = rel_path.to_string();
+    cloud::hydrate_with_progress(abs, deadline, move |downloaded, total| {
+        let now_ms = start.elapsed().as_millis() as u64;
+        let done = total > 0 && downloaded >= total;
+        if done || throttle.should_emit(downloaded, total, now_ms) {
+            let _ = app.emit(
+                "hydration-progress",
+                HydrationProgress { rel_path: rel.clone(), downloaded, total },
+            );
+        }
+    })
+}
+
 /// Download a cloud placeholder's bytes, then index its content. The download
 /// blocks for as long as the provider takes (minutes, for a big file — see
 /// `cloud::hydrate`), so it runs on a blocking thread with no lock held; the
@@ -844,10 +877,14 @@ async fn hydrate_file(
 ) -> CmdResult<()> {
     let abs = resolve_path(&state, &rel_path)?;
     let path = abs.clone();
-    tauri::async_runtime::spawn_blocking(move || ken_core::cloud::hydrate(&path))
-        .await
-        .map_err(err)?
-        .map_err(err)?;
+    let progress_app = app.clone();
+    let progress_rel = rel_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        hydrate_emitting(&progress_app, &progress_rel, &path, cloud::DEFAULT_DEADLINE)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
 
     // Snapshot everything the re-index and its notifications need, then drop
     // the global lock immediately.
