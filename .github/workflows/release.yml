@@ -19,10 +19,12 @@
 #
 # Manual workflow_dispatch inputs:
 #   bundle_test   — build the Windows installer end-to-end and upload it as a
-#                   workflow artifact. No tag, no Release. Use this to prove the
-#                   packaging BEFORE a version bump, since `gate` pushes the tag
-#                   before any build runs and a packaging failure would otherwise
-#                   burn the version number.
+#                   workflow artifact. NEVER creates a tag or Release regardless
+#                   of the version/tag state — the gate short-circuits to
+#                   should_release=false for a bundle_test dispatch. Use this to
+#                   prove the packaging BEFORE a version bump, since `gate`
+#                   pushes the tag before any build runs and a packaging failure
+#                   would otherwise burn the version number.
 #   force_publish — force a release build without a version bump (uses the
 #                   current package.json version). NOTE: this only works for a
 #                   version whose tag does NOT yet exist; otherwise it overrides
@@ -40,7 +42,7 @@ on:
         type: boolean
         default: false
       bundle_test:
-        description: "Build the Windows installer end-to-end and upload it as a workflow artifact (no tag, no Release)"
+        description: "Build the Windows installer end-to-end and upload it as a workflow artifact. Never creates a tag or Release, regardless of version state."
         type: boolean
         default: false
 
@@ -101,6 +103,15 @@ jobs:
       - name: Gate decision
         id: decide
         run: |
+          # bundle_test is a packaging dry-run: never a release, regardless of
+          # version/tag state. Without this early-out, dispatching bundle_test on
+          # an untagged HEAD (post-bump or bootstrap) would make release-gate.sh
+          # return should_release=true and fire a real tag/draft/publish.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bundle_test }}" = "true" ]; then
+            echo "should_release=false" >>"$GITHUB_OUTPUT"
+            echo "bundle_test dispatch: packaging test only, never a release."
+            exit 0
+          fi
           if [ "${{ steps.skipci.outputs.skip }}" = "true" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "should_release=false" >>"$GITHUB_OUTPUT"
             echo "Skip-ci guard tripped; not releasing."
@@ -432,6 +443,13 @@ jobs:
   # guard refuses to retry. This proves the packaging first, and produces a
   # downloadable installer for the manual on-Windows validation that no CI job can
   # perform.
+  #
+  # A bundle_test dispatch NEVER creates a tag or Release regardless of the
+  # version/tag state: the gate's "Gate decision" step short-circuits to
+  # should_release=false for bundle_test, so `create-release`/`build`/
+  # `publish-release` are all skipped and only this job runs. (Without that guard,
+  # dispatching bundle_test on an untagged HEAD — post-bump or bootstrap — would
+  # make release-gate.sh return should_release=true and fire a real release.)
   #
   # `force_publish` cannot serve this purpose: it forces should_release=true for a
   # version whose tag already exists, and the `git tag -a` step then fails.
