@@ -106,6 +106,18 @@ jobs:
           cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
           Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\SPIRV-Headers"
 
+      # ggml's vulkan-shaders-gen ExternalProject breaks under the VS 2026
+      # generator (MSBuild runs its install rule before the build finishes);
+      # build with Ninja instead. Ninja needs cl.exe on PATH, hence
+      # msvc-dev-cmd. cmake-rs picks the generator up from CMAKE_GENERATOR.
+      - name: Set up MSVC dev environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Select Ninja cmake generator (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 11

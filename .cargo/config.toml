@@ -1,0 +1,10 @@
+# whisper-rs and llama-cpp-2 each bundle a ggml; ken links both and relies on
+# the linker picking the first definition of the shared ggml symbols (see the
+# backend comment in crates/ken-core/Cargo.toml). Apple's ld64 does pick-first
+# by default; ELF lld and MSVC link.exe treat duplicates as errors, so those
+# targets opt into the same behavior explicitly.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
