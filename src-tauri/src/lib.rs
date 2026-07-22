@@ -154,8 +154,31 @@ struct SyncStateEvent {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeData {
-    files: Vec<FileRow>,
+    files: Vec<FileRowDto>,
     folders: Vec<FolderInfo>,
+}
+
+/// A `FileRow` plus the one thing the DB can't know on its own: whether the
+/// background hydration worker would pull this file down. The selection rule
+/// lives solely in `ken_core::bg_hydrate::wants_background_index`; we evaluate
+/// it here, at the serialization boundary, because that's where the live
+/// `Project` (needed for exclusions) is in hand. Flattened so the frontend sees
+/// the same shape as before with one added `backgroundEligible` field.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileRowDto {
+    #[serde(flatten)]
+    row: FileRow,
+    background_eligible: bool,
+}
+
+impl FileRowDto {
+    fn new(row: FileRow, project: &Project) -> FileRowDto {
+        let excluded = project.is_excluded(&row.rel_path);
+        let background_eligible =
+            ken_core::bg_hydrate::wants_background_index(&row, excluded);
+        FileRowDto { row, background_eligible }
+    }
 }
 
 #[derive(Serialize)]
@@ -765,6 +788,10 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         }
     }
     folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let files = files
+        .into_iter()
+        .map(|row| FileRowDto::new(row, &active.project))
+        .collect();
     Ok(TreeData { files, folders })
 }
 
@@ -942,7 +969,7 @@ fn save_file(
 }
 
 #[tauri::command]
-fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRow>> {
+fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRowDto>> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
     let mut row = active.db.get_file(&rel_path).map_err(err)?;
@@ -957,7 +984,7 @@ fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<Fi
             r.kind = ken_core::extract::FileKind::from_path(&abs).as_str().to_string();
         }
     }
-    Ok(row)
+    Ok(row.map(|r| FileRowDto::new(r, &active.project)))
 }
 
 #[tauri::command]

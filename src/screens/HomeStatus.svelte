@@ -7,7 +7,9 @@
   import { cloudPresentation, fileStats, syncPresentation } from "./homeStatus";
 
   const stats = $derived(fileStats(app.files));
-  const cloud = $derived(cloudPresentation(stats.cloudOnly, app.backgroundIndex));
+  const cloud = $derived(
+    cloudPresentation(stats.cloudEligible, stats.cloudSkipped, app.backgroundIndex),
+  );
   const sync = $derived(syncPresentation(app.syncState, app.syncDetail));
 </script>
 
@@ -27,12 +29,12 @@
         <span class="num">{stats.searchable}</span>
         <span class="lbl">searchable</span>
       </div>
-      {#if cloud.show}
-        <div class="tile" class:indexing={cloud.active}>
-          <span class="num">{cloud.count}</span>
-          <span class="lbl">{cloud.label}</span>
+      {#each cloud as tile}
+        <div class="tile" class:indexing={tile.active}>
+          <span class="num">{tile.count}</span>
+          <span class="lbl">{tile.label}</span>
         </div>
-      {/if}
+      {/each}
       {#if stats.unreadable > 0}
         <div class="tile">
           <span class="num">{stats.unreadable}</span>

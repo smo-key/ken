@@ -24,6 +24,10 @@ export interface FileRow {
   mtime: number;
   status: "indexed" | "metadata_only" | "failed" | "cloud_only";
   error: string | null;
+  /** Whether the background hydration worker would download & index this file
+   *  (see Rust `wants_background_index`). Only meaningful for `cloud_only`
+   *  rows — false for everything already local or otherwise ineligible. */
+  backgroundEligible: boolean;
 }
 
 export interface SearchHit {
