@@ -1,9 +1,20 @@
 # Changelog
 
+## 0.1.2
+
+### Bug Fixes
+
+- Skip C++ static destructors on quit to avoid ggml Metal abort
+- Correct Windows binary name and ken-mcp location
+
+### Chores
+
+- Bump version to 0.1.2
 ## 0.1.1
 
 ### Chores
 
+- V0.1.1 [skip ci]
 - Bump version to 0.1.1
 
 ### Features
