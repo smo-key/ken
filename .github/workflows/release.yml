@@ -7,10 +7,11 @@
 # release is published only once every leg has uploaded. The gate creates the
 # tag, so there is no longer a `v*` tag push trigger.
 #
-# Asset-name contract with install.sh (produced by the "Upload install.sh
-# assets" step):
+# Asset-name contract with install.sh / install.ps1 (produced by the "Upload
+# install.sh assets" step):
 #   Ken-<target-triple>.app.tar.gz   (macOS app bundle, tarred)
 #   Ken-<target-triple>.AppImage     (Linux)
+#   Ken-<target-triple>-setup.exe    (Windows NSIS installer, stable name)
 #   ken-mcp-<target-triple>[.exe]    (all platforms)
 # Auto-update contract: tauri-action also uploads signed updater artifacts
 # and latest.json (endpoint in tauri.conf.json). Requires repo secrets
@@ -412,6 +413,11 @@ jobs:
               upload target/release/ken-mcp "ken-mcp-$triple"
               ;;
             Windows)
+              # tauri-action uploads the NSIS installer under its versioned
+              # name; re-upload it under a stable name so install.ps1 can fetch
+              # it from releases/latest/download without querying the API.
+              setup=$(find target/release/bundle/nsis -name '*-setup.exe' -type f | head -n 1)
+              upload "$setup" "Ken-$triple-setup.exe"
               upload target/release/ken-mcp.exe "ken-mcp-$triple.exe"
               ;;
           esac

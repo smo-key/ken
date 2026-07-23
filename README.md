@@ -17,12 +17,19 @@ On macOS or Linux, paste this into a terminal:
 curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh
 ```
 
-It figures out your machine, installs the Ken app and the `ken-mcp`
-helper, and tells you about anything else it needs. If no packaged
-release exists yet it offers to build Ken from source.
+On Windows, paste this into a PowerShell or Command Prompt window:
 
-Prefer not to use a terminal (or on Windows)? Download an installer from
-the [releases page](https://github.com/smo-key/ken/releases/latest).
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/smo-key/ken/main/install.ps1 | iex"
+```
+
+Either way it figures out your machine, installs the Ken app and the
+`ken-mcp` helper, and tells you about anything else it needs. If no
+packaged release exists yet, the macOS/Linux script offers to build Ken
+from source.
+
+Prefer not to use a terminal? Download an installer from the
+[releases page](https://github.com/smo-key/ken/releases/latest).
 
 **AI features need Claude Code.** Ken's AI features — ingests, chat, deep
 research — run through the Claude Code CLI with your own Claude account.
@@ -42,7 +49,7 @@ previews) works without it.
 - **Chat drawer** — talk to your project's knowledge: friendly chat by
   default, the real Claude terminal one keystroke away, same session in
   both. Pins, status badges, and live views into running ingests.
-- **Install & release** — one-line installer (`install.sh`), tag-driven
+- **Install & release** — one-line installers (`install.sh`, `install.ps1`), tag-driven
   release pipeline publishing macOS/Linux/Windows bundles plus `ken-mcp`
   binaries to GitHub Releases, and CI on every push and PR.
 

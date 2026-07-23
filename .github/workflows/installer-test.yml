@@ -1,0 +1,46 @@
+# Installer smoke test: run the README's one-line install commands, verbatim,
+# on fresh macOS and Windows runners against the latest published release, then
+# verify the app and the ken-mcp helper actually landed. Dispatch by hand after
+# a release publishes (it needs published assets at releases/latest/download).
+name: Installer test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      # No checkout: like a real user, the script comes from raw.githubusercontent.
+      - name: Run the one-line installer
+        run: curl -fsSL https://raw.githubusercontent.com/smo-key/ken/main/install.sh | sh
+
+      - name: Verify install
+        run: |
+          set -euo pipefail
+          test -d /Applications/Ken.app || { echo "::error::Ken.app missing"; exit 1; }
+          test -x "$HOME/.local/bin/ken-mcp" || { echo "::error::ken-mcp missing"; exit 1; }
+          echo "Ken.app and ken-mcp installed OK"
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Run the one-line installer
+        shell: cmd
+        run: powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/smo-key/ken/main/install.ps1 | iex"
+
+      - name: Verify install
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mcp = Join-Path $env:LOCALAPPDATA 'Ken\bin\ken-mcp.exe'
+          if (-not (Test-Path $mcp)) { Write-Error 'ken-mcp.exe missing'; exit 1 }
+          # Tauri NSIS per-user install location
+          $app = Join-Path $env:LOCALAPPDATA 'Ken\Ken.exe'
+          if (-not (Test-Path $app)) {
+            # fall back: search for Ken.exe under LOCALAPPDATA and Program Files
+            $found = Get-ChildItem -Path $env:LOCALAPPDATA, ${env:ProgramFiles} -Filter 'Ken.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $found) { Write-Error 'Ken.exe missing'; exit 1 }
+            $app = $found.FullName
+          }
+          Write-Host "Ken at $app and ken-mcp installed OK"
