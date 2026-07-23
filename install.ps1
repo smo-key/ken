@@ -58,13 +58,14 @@ if ($arch -ne 'AMD64') {
 }
 $Target = 'x86_64-pc-windows-msvc'
 
-# Where the ken-mcp helper goes. KEN_INSTALL_PREFIX reroutes it (and skips
-# the app setup program) so the script can be tested without touching the
-# real system.
+# Where the ken-mcp helper goes. Deliberately NOT under %LOCALAPPDATA%\Ken —
+# that's the app's own NSIS install dir, and an app uninstall/update could
+# remove it. KEN_INSTALL_PREFIX reroutes it (and skips the app setup program)
+# so the script can be tested without touching the real system.
 if ($env:KEN_INSTALL_PREFIX) {
     $BinDir = Join-Path $env:KEN_INSTALL_PREFIX 'bin'
 } else {
-    $BinDir = Join-Path $env:LOCALAPPDATA 'Ken\bin'
+    $BinDir = Join-Path $env:LOCALAPPDATA 'Programs\ken-mcp'
 }
 
 Write-Host 'Installing Ken for Windows (x64).'

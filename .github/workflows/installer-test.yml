@@ -33,14 +33,10 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $mcp = Join-Path $env:LOCALAPPDATA 'Ken\bin\ken-mcp.exe'
+          $mcp = Join-Path $env:LOCALAPPDATA 'Programs\ken-mcp\ken-mcp.exe'
           if (-not (Test-Path $mcp)) { Write-Error 'ken-mcp.exe missing'; exit 1 }
-          # Tauri NSIS per-user install location
-          $app = Join-Path $env:LOCALAPPDATA 'Ken\Ken.exe'
-          if (-not (Test-Path $app)) {
-            # fall back: search for Ken.exe under LOCALAPPDATA and Program Files
-            $found = Get-ChildItem -Path $env:LOCALAPPDATA, ${env:ProgramFiles} -Filter 'Ken.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $found) { Write-Error 'Ken.exe missing'; exit 1 }
-            $app = $found.FullName
-          }
-          Write-Host "Ken at $app and ken-mcp installed OK"
+          # The app's main binary is ken-app.exe (Tauri mainBinaryName), not
+          # Ken.exe. Per-user NSIS installs land under LOCALAPPDATA.
+          $found = Get-ChildItem -Path $env:LOCALAPPDATA -Filter 'ken-app.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $found) { Write-Error 'ken-app.exe missing'; exit 1 }
+          Write-Host "Ken at $($found.FullName) and ken-mcp installed OK"
