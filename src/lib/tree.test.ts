@@ -9,6 +9,7 @@ const file = (relPath: string): FileRow => ({
   mtime: 0,
   status: "indexed",
   error: null,
+  backgroundEligible: false,
 });
 
 describe("buildTree", () => {

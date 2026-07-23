@@ -35,6 +35,7 @@
     mtime: Math.floor(Date.now() / 1000),
     status: "indexed",
     error: null,
+    backgroundEligible: false,
   });
 
   const folderLabel = $derived(folder === "" ? "Project root" : folder);

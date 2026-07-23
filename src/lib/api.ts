@@ -24,6 +24,10 @@ export interface FileRow {
   mtime: number;
   status: "indexed" | "metadata_only" | "failed" | "cloud_only";
   error: string | null;
+  /** Whether the background hydration worker would download & index this file
+   *  (see Rust `wants_background_index`). Only meaningful for `cloud_only`
+   *  rows — false for everything already local or otherwise ineligible. */
+  backgroundEligible: boolean;
 }
 
 export interface SearchHit {
@@ -407,6 +411,21 @@ export interface ModelDownloadError {
   message: string;
 }
 
+/** Payload of the `transcript-progress` event. */
+export interface TranscriptProgress {
+  relPath: string;
+  phase: "extracting" | "transcribing";
+  /** 0–100; present only while transcribing. */
+  pct: number | null;
+}
+
+/** Payload of the `hydration-progress` event. */
+export interface HydrationProgress {
+  relPath: string;
+  downloaded: number;
+  total: number;
+}
+
 // ---- Record (on-device meeting recorder) ----
 
 export type RecordPhase = "idle" | "recording" | "paused" | "stopped";
@@ -708,6 +727,14 @@ export const api = {
     fn: (ev: ModelDownloadError) => void,
   ): Promise<UnlistenFn> =>
     listen<ModelDownloadError>("model-download-error", (e) => fn(e.payload)),
+  onTranscriptProgress: (
+    fn: (ev: TranscriptProgress) => void,
+  ): Promise<UnlistenFn> =>
+    listen<TranscriptProgress>("transcript-progress", (e) => fn(e.payload)),
+  onHydrationProgress: (
+    fn: (ev: HydrationProgress) => void,
+  ): Promise<UnlistenFn> =>
+    listen<HydrationProgress>("hydration-progress", (e) => fn(e.payload)),
 
   // ---- Record ----
   recordInputDevices: () => invoke<AudioDevice[]>("record_input_devices"),

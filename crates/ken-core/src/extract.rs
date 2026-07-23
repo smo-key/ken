@@ -14,7 +14,7 @@ use crate::{Error, Result};
 
 /// Files larger than this get a metadata-only entry rather than content
 /// extraction (protects the index and the UI from pathological inputs).
-pub const MAX_EXTRACT_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {

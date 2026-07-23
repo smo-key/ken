@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// How long we're willing to wait for a provider to materialize one file.
 /// Multi-hundred-megabyte decks on a slow link genuinely take minutes.
-const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Gap between polls. Long enough not to hammer the File Provider, short
 /// enough that a file landing early is noticed almost immediately.
@@ -148,14 +148,66 @@ pub fn hydrate(path: &Path) -> crate::Result<()> {
 /// not the download: the provider carries on, so a later call usually returns
 /// straight away.
 pub fn hydrate_with_deadline(path: &Path, deadline: Duration) -> crate::Result<()> {
+    hydrate_with_progress(path, deadline, |_, _| {})
+}
+
+/// [`hydrate_with_deadline`] that also reports download progress. The provider
+/// owns the transfer, so bytes can't be counted as they're read — instead each
+/// poll tick samples how much of the file is *allocated* on disk against its
+/// logical size (macOS reports a dataless file's full `len()` up front). The
+/// terminal `(total, total)` sample fires once the bytes have fully landed.
+pub fn hydrate_with_progress(
+    path: &Path,
+    deadline: Duration,
+    mut on_progress: impl FnMut(u64, u64),
+) -> crate::Result<()> {
     let started = Instant::now();
     poll_until_hydrated(
         path,
         deadline,
-        || probe(path),
+        || {
+            let attempt = probe(path);
+            match &attempt {
+                Attempt::Downloading => {
+                    if let Some((got, total)) = hydration_sample(path) {
+                        on_progress(got, total);
+                    }
+                }
+                Attempt::Ready => {
+                    if let Ok(m) = std::fs::metadata(path) {
+                        on_progress(m.len(), m.len());
+                    }
+                }
+                Attempt::Fatal(_) => {}
+            }
+            attempt
+        },
         || started.elapsed(),
         std::thread::sleep,
     )
+}
+
+/// One (allocated, logical) size sample for a file mid-hydration, or `None`
+/// when it can't be read or has no known size. Allocation is block-granular,
+/// so it's clamped to the logical size to never overshoot 100%.
+fn hydration_sample(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let total = meta.len();
+    if total == 0 {
+        return None;
+    }
+    Some((allocated_bytes(&meta).min(total), total))
+}
+
+#[cfg(unix)]
+fn allocated_bytes(meta: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(_meta: &Metadata) -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -309,5 +361,34 @@ mod tests {
             classify(std::io::Error::from(std::io::ErrorKind::NotFound)),
             Attempt::Fatal(_)
         ));
+    }
+
+    #[test]
+    fn hydration_sample_reports_allocated_vs_logical_and_skips_missing_files() {
+        // A real file we just wrote is fully allocated: the sample must be
+        // (total, total)-ish — allocated is block-rounded, so we clamp to len.
+        let dir = std::env::temp_dir().join(format!("ken-hydration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sample.bin");
+        std::fs::write(&f, vec![7u8; 10_000]).unwrap();
+        let (got, total) = hydration_sample(&f).expect("sample for an existing file");
+        assert_eq!(total, 10_000);
+        assert_eq!(got, 10_000, "allocated bytes are clamped to the logical size");
+        assert!(hydration_sample(&dir.join("missing.bin")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hydrate_with_progress_emits_a_final_full_sample_for_a_local_file() {
+        // A plain local file hydrates on the first probe; the callback still gets
+        // the terminal (total, total) so UIs can treat 100% as "done".
+        let dir = std::env::temp_dir().join(format!("ken-hydrate-prog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("local.txt");
+        std::fs::write(&f, b"already here").unwrap();
+        let mut samples: Vec<(u64, u64)> = Vec::new();
+        hydrate_with_progress(&f, Duration::from_secs(1), |d, t| samples.push((d, t))).unwrap();
+        assert_eq!(samples.last().copied(), Some((12, 12)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

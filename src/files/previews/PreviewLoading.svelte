@@ -1,8 +1,17 @@
 <script lang="ts">
   // The one loading/downloading state every file view shares: a single spinner
   // centered in its container, one primary line, and an optional quieter second
-  // line. Kept presentational so previews stop each rolling their own markup.
-  let { label, detail }: { label: string; detail?: string } = $props();
+  // line. `progress` swaps in a real bar once the work's extent is known.
+  import ProgressBar from "../../lib/ProgressBar.svelte";
+  let {
+    label,
+    detail,
+    progress = null,
+  }: {
+    label: string;
+    detail?: string;
+    progress?: { pct: number | null; note?: string } | null;
+  } = $props();
 </script>
 
 <!-- role=status + aria-live so the message is announced while the file resolves,
@@ -12,6 +21,11 @@
   <p class="label">{label}</p>
   {#if detail}
     <p class="detail">{detail}</p>
+  {/if}
+  {#if progress}
+    <div class="pb">
+      <ProgressBar pct={progress.pct} label={progress.note} />
+    </div>
   {/if}
 </div>
 
@@ -57,5 +71,8 @@
     font-size: 12px;
     color: var(--ink-tertiary);
     line-height: 1.55;
+  }
+  .pb {
+    width: min(260px, 100%);
   }
 </style>

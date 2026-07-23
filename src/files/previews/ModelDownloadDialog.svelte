@@ -2,6 +2,7 @@
   import { onDestroy } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { api, type ModelStatus } from "../../lib/api";
+  import ProgressBar from "../../lib/ProgressBar.svelte";
 
   let {
     status,
@@ -102,12 +103,10 @@
   </div>
 
   {#if phase === "downloading"}
-    <div class="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
-      <div class="fill" style:width={`${pct}%`}></div>
-    </div>
-    <p class="status">
-      {pct >= 100 ? "Installing…" : `Downloading… ${pct}%`}
-    </p>
+    <ProgressBar
+      {pct}
+      label={pct >= 100 ? "Installing…" : `Downloading… ${pct}%`}
+    />
   {:else if phase === "error" && message}
     <p class="status error">{message}</p>
   {/if}
@@ -169,18 +168,6 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--healthy-text);
-  }
-  .bar {
-    height: 6px;
-    border-radius: 4px;
-    background: var(--sunken);
-    overflow: hidden;
-  }
-  .fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 4px;
-    transition: width 0.2s ease;
   }
   .status {
     margin: 0;

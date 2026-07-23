@@ -154,8 +154,31 @@ struct SyncStateEvent {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeData {
-    files: Vec<FileRow>,
+    files: Vec<FileRowDto>,
     folders: Vec<FolderInfo>,
+}
+
+/// A `FileRow` plus the one thing the DB can't know on its own: whether the
+/// background hydration worker would pull this file down. The selection rule
+/// lives solely in `ken_core::bg_hydrate::wants_background_index`; we evaluate
+/// it here, at the serialization boundary, because that's where the live
+/// `Project` (needed for exclusions) is in hand. Flattened so the frontend sees
+/// the same shape as before with one added `backgroundEligible` field.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileRowDto {
+    #[serde(flatten)]
+    row: FileRow,
+    background_eligible: bool,
+}
+
+impl FileRowDto {
+    fn new(row: FileRow, project: &Project) -> FileRowDto {
+        let excluded = project.is_excluded(&row.rel_path);
+        let background_eligible =
+            ken_core::bg_hydrate::wants_background_index(&row, excluded);
+        FileRowDto { row, background_eligible }
+    }
 }
 
 #[derive(Serialize)]
@@ -586,7 +609,7 @@ fn background_hydrate_worker(
                 continue;
             };
 
-            match cloud::hydrate_with_deadline(&abs, BG_HYDRATE_DEADLINE) {
+            match hydrate_emitting(&app, &rel, &abs, BG_HYDRATE_DEADLINE) {
                 Ok(()) => {
                     backoff.remove(&rel);
                     // Re-index off the global lock, on a private handle: a
@@ -765,6 +788,10 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         }
     }
     folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let files = files
+        .into_iter()
+        .map(|row| FileRowDto::new(row, &active.project))
+        .collect();
     Ok(TreeData { files, folders })
 }
 
@@ -832,6 +859,39 @@ fn is_cloud_only(state: State<SharedState>, rel_path: String) -> CmdResult<bool>
     Ok(cloud::is_placeholder(&resolve_path(&state, &rel_path)?))
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HydrationProgress {
+    rel_path: String,
+    downloaded: u64,
+    total: u64,
+}
+
+/// Hydrate a placeholder while streaming `hydration-progress` events, throttled
+/// exactly like model downloads. The terminal `(total, total)` sample always
+/// goes out so the UI can treat 100% as "the bytes are here".
+fn hydrate_emitting(
+    app: &AppHandle,
+    rel_path: &str,
+    abs: &Path,
+    deadline: Duration,
+) -> ken_core::Result<()> {
+    let mut throttle = model::ProgressThrottle::new();
+    let start = Instant::now();
+    let app = app.clone();
+    let rel = rel_path.to_string();
+    cloud::hydrate_with_progress(abs, deadline, move |downloaded, total| {
+        let now_ms = start.elapsed().as_millis() as u64;
+        let done = total > 0 && downloaded >= total;
+        if done || throttle.should_emit(downloaded, total, now_ms) {
+            let _ = app.emit(
+                "hydration-progress",
+                HydrationProgress { rel_path: rel.clone(), downloaded, total },
+            );
+        }
+    })
+}
+
 /// Download a cloud placeholder's bytes, then index its content. The download
 /// blocks for as long as the provider takes (minutes, for a big file — see
 /// `cloud::hydrate`), so it runs on a blocking thread with no lock held; the
@@ -844,10 +904,14 @@ async fn hydrate_file(
 ) -> CmdResult<()> {
     let abs = resolve_path(&state, &rel_path)?;
     let path = abs.clone();
-    tauri::async_runtime::spawn_blocking(move || ken_core::cloud::hydrate(&path))
-        .await
-        .map_err(err)?
-        .map_err(err)?;
+    let progress_app = app.clone();
+    let progress_rel = rel_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        hydrate_emitting(&progress_app, &progress_rel, &path, cloud::DEFAULT_DEADLINE)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
 
     // Snapshot everything the re-index and its notifications need, then drop
     // the global lock immediately.
@@ -942,7 +1006,7 @@ fn save_file(
 }
 
 #[tauri::command]
-fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRow>> {
+fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRowDto>> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
     let mut row = active.db.get_file(&rel_path).map_err(err)?;
@@ -957,7 +1021,7 @@ fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<Fi
             r.kind = ken_core::extract::FileKind::from_path(&abs).as_str().to_string();
         }
     }
-    Ok(row)
+    Ok(row.map(|r| FileRowDto::new(r, &active.project)))
 }
 
 #[tauri::command]
@@ -1583,15 +1647,42 @@ fn finish_recording(
             if !model.is_file() {
                 return Err("Download a transcription model in Settings to make transcripts.".into());
             }
+            let channel_count =
+                mic_moved.is_some() as usize + sys_moved.is_some() as usize;
+            // One continuous bar across sequential channels: Me fills the first
+            // half, Them the second (or the whole bar when only one exists).
+            let scaled_sink = |idx: usize| -> transcript::ProgressFn {
+                let app = app.clone();
+                let rel = md_rel.clone();
+                let last = std::sync::atomic::AtomicI32::new(-1);
+                std::sync::Arc::new(move |phase| {
+                    if let transcript::TranscriptPhase::Transcribing(p) = phase {
+                        let overall = transcript::scale_channel_pct(idx, channel_count, p);
+                        if last.swap(overall as i32, Ordering::Relaxed) == overall as i32 {
+                            return;
+                        }
+                        emit_transcript_phase(
+                            &app,
+                            &rel,
+                            transcript::TranscriptPhase::Transcribing(overall),
+                        );
+                    }
+                })
+            };
             let mut me_cues = Vec::new();
             let mut them_cues = Vec::new();
+            let mut idx = 0usize;
             if let Some((p, _)) = &mic_moved {
                 let samples = record::read_wav_f32(p).map_err(err)?;
-                me_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+                me_cues = transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
+                    .map_err(err)?;
+                idx += 1;
             }
             if let Some((p, _)) = &sys_moved {
                 let samples = record::read_wav_f32(p).map_err(err)?;
-                them_cues = transcript::transcribe(&model, &samples).map_err(err)?;
+                them_cues =
+                    transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
+                        .map_err(err)?;
             }
             let channels: Vec<record::LabeledChannel> = if single {
                 vec![record::LabeledChannel {
@@ -2235,6 +2326,41 @@ fn media_src(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     Ok(to_asset_url(&abs))
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptProgress {
+    rel_path: String,
+    /// "extracting" | "transcribing"
+    phase: String,
+    /// 0–100; present only while transcribing.
+    pct: Option<u8>,
+}
+
+fn emit_transcript_phase(app: &AppHandle, rel: &str, phase: transcript::TranscriptPhase) {
+    let (phase, pct) = match phase {
+        transcript::TranscriptPhase::Extracting => ("extracting", None),
+        transcript::TranscriptPhase::Transcribing(p) => ("transcribing", Some(p)),
+    };
+    let _ = app.emit(
+        "transcript-progress",
+        TranscriptProgress { rel_path: rel.to_string(), phase: phase.into(), pct },
+    );
+}
+
+/// A `ProgressFn` that forwards to `transcript-progress`, dropping repeated
+/// percents (Whisper's callback re-fires the same value between segments).
+fn transcript_progress_sink(app: AppHandle, rel: String) -> transcript::ProgressFn {
+    let last = std::sync::atomic::AtomicI32::new(-1);
+    std::sync::Arc::new(move |phase| {
+        if let transcript::TranscriptPhase::Transcribing(p) = phase {
+            if last.swap(p as i32, Ordering::Relaxed) == p as i32 {
+                return;
+            }
+        }
+        emit_transcript_phase(&app, &rel, phase);
+    })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscriptDto {
@@ -2384,8 +2510,10 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
     }
     let app = app.clone();
     std::thread::spawn(move || {
-        let result =
-            transcript::generate_and_cache(&job.ffmpeg, &job.model, &job.root, &job.rel_path);
+        let on_progress = transcript_progress_sink(app.clone(), job.rel_path.clone());
+        let result = transcript::generate_and_cache_with_progress(
+            &job.ffmpeg, &job.model, &job.root, &job.rel_path, on_progress,
+        );
         match result {
             Ok(_) => {
                 // Re-index the video so the fresh transcript is searchable.
