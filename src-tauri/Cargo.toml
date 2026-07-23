@@ -30,5 +30,10 @@ hound = "3.5"
 # Bin, freedesktop Trash) instead of unlinking them permanently.
 trash = "5"
 
+# Immediate exit without running C++ static destructors: ggml's Metal device
+# destructor aborts on quit while a model is still resident (see run()).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

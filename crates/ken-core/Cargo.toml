@@ -122,3 +122,5 @@ objc2-vision = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = "3"
+# examples/llm_exit_repro.rs exercises the quit-time ggml Metal teardown abort.
+libc = "0.2"

@@ -5130,8 +5130,26 @@ pub fn run() {
             record_stop,
             record_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Ken");
+        .build(tauri::generate_context!())
+        .expect("error while running Ken")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // ggml (statically linked via llama-cpp-2 / whisper-rs) frees
+                // its Metal device in a C++ static destructor, which
+                // GGML_ASSERTs that no residency sets remain. Our LLM engine
+                // lives in a process-lifetime static and is never dropped, so
+                // letting exit() run those destructors aborts with SIGABRT on
+                // every quit. Tauri has finished its own cleanup by this
+                // event; skip atexit handlers entirely.
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    unsafe { libc::_exit(0) };
+                }
+            }
+        });
 }
 
 #[cfg(test)]
