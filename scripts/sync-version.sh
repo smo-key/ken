@@ -40,7 +40,10 @@ fi
 echo "synced Cargo.toml [workspace.package] -> ${version}"
 
 # --- Cargo.lock ----------------------------------------------------------------
-# Refresh the workspace members' versions in the lockfile. --offline keeps this a
-# pure dependency-graph update (no registry fetch, no build).
-cargo update --workspace --offline
+# Refresh the workspace members' versions in the lockfile. --workspace only
+# re-locks the workspace members themselves, leaving every dependency pin
+# untouched — but cargo still needs the registry index to re-resolve, so this
+# must NOT pass --offline (a fresh CI runner has no cached index and offline
+# resolution fails with "no matching package named ... found").
+cargo update --workspace
 echo "synced Cargo.lock (workspace members) -> ${version}"

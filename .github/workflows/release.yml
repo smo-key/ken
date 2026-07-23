@@ -71,9 +71,9 @@ jobs:
         with:
           node-version: 24
 
-      # sync-version.sh runs `cargo update --workspace --offline` (a plain
-      # dependency-graph update — no build, no system deps), so a toolchain is
-      # all the gate needs from Rust.
+      # sync-version.sh runs `cargo update --workspace` (a plain dependency-graph
+      # re-lock of the workspace members — no build, no system deps), so a
+      # toolchain is all the gate needs from Rust.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
