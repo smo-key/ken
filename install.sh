@@ -16,9 +16,13 @@
 #   - if there is no packaged release yet, builds Ken from source
 #   - checks whether Claude Code is installed (Ken's AI features use it)
 #
+# On macOS, Ken installs to /Applications when that's writable, and falls
+# back to ~/Applications otherwise - so no administrator account is needed.
+#
 # Environment overrides (mainly for testing):
 #   KEN_INSTALL_PREFIX  install under <prefix>/Applications and <prefix>/bin
-#                       instead of /Applications and ~/.local/bin
+#                       instead of /Applications (or ~/Applications) and
+#                       ~/.local/bin
 #   KEN_DOWNLOAD_BASE   fetch release assets from this base URL instead of
 #                       https://github.com/smo-key/ken/releases/latest/download
 
@@ -88,6 +92,15 @@ if [ -n "${KEN_INSTALL_PREFIX:-}" ]; then
 else
     APP_DIR="/Applications"
     BIN_DIR="$HOME/.local/bin"
+    # /Applications usually needs an administrator to write to. If it's not
+    # writable, install to the user's own Applications folder instead so we
+    # never have to ask for an admin password.
+    if [ "$OS_NAME" = "macOS" ] && [ ! -w "$APP_DIR" ]; then
+        APP_DIR="$HOME/Applications"
+        mkdir -p "$APP_DIR"
+        say "Note: /Applications needs an administrator, so Ken will go into"
+        say "your own Applications folder ($APP_DIR) instead."
+    fi
 fi
 
 say "Installing Ken for $OS_NAME ($CPU_NAME)."
@@ -133,7 +146,8 @@ install_macos_app() { # install_macos_app <path-to-Ken.app>
     mkdir -p "$APP_DIR"
     if [ ! -w "$APP_DIR" ]; then
         fail "you don't have permission to write to $APP_DIR." \
-            "Try running this again from an administrator account."
+            "Set KEN_INSTALL_PREFIX to a folder you can write to and run this" \
+            "again, or let us know at $REPO_URL/issues"
     fi
     rm -rf "$APP_DIR/Ken.app"
     mv "$1" "$APP_DIR/Ken.app"

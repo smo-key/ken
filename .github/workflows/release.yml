@@ -552,5 +552,4 @@ jobs:
           name: ken-windows-x64
           path: |
             target/release/bundle/nsis/*
-            target/release/bundle/msi/*
           if-no-files-found: error
