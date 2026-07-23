@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+### Chores
+
+- Bump version to 0.1.1
+
+### Features
+
+- One-line Windows installer + smoke-test workflow
 ## 0.1.0
 
 ### Bug Fixes
@@ -48,6 +57,7 @@
 
 ### Chores
 
+- V0.1.0 [skip ci]
 - Regenerate tauri ACL schemas for updater/process plugins
 - Screencapturekit compile-probe (macos)
 
