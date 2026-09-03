@@ -4,15 +4,60 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Once, OnceLock};
 
-use rusqlite::{params, Connection};
+use regex::Regex;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::knowledge_model;
+use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 13;
+
+/// Install the statically-linked sqlite-vec (`vec0`) extension into SQLite's
+/// process-global auto-extension list exactly once. sqlite-vec is compiled into
+/// this binary (no runtime `.dll`/`.so` load); `sqlite3_auto_extension` runs its
+/// init hook on every connection opened *after* this call, so it must precede
+/// the first `Connection::open`. Idempotent via `Once`; safe to call from every
+/// constructor. Whether `vec0` is actually usable on a given connection is a
+/// separate question answered by [`load_vec_extension`] (a `vec_version()`
+/// probe), so a registration that silently no-ops still degrades gracefully.
+fn register_vec_extension() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` is the extension's C entry point; it is
+        // transmuted to the `sqlite3_auto_extension` callback signature exactly
+        // as sqlite-vec's own rusqlite example does. Runs once per process.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
+/// Probe whether the `vec0` KNN virtual table is available on `conn` by running
+/// `vec_version()`, and log the version once per process. Registration is done
+/// up front in the constructors ([`register_vec_extension`]); this only reports
+/// usability. It never errors — a failed probe returns `false` so the caller
+/// degrades to FTS5-only search rather than breaking the whole index. Logging
+/// the version once at startup (task 1.9) makes a future extension/on-disk
+/// format mismatch visible immediately instead of as a silent KNN failure.
+fn load_vec_extension(conn: &Connection) -> bool {
+    match conn.query_row("SELECT vec_version()", [], |r| r.get::<_, String>(0)) {
+        Ok(version) => {
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| {
+                eprintln!("[ken-core] sqlite-vec {version} registered (vec0 KNN available)");
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
 
 /// How many times an errored extraction is automatically re-queued before it is
 /// left `error` for good. Bounds retries so a persistently/deterministically
@@ -27,6 +72,12 @@ pub const MAX_OCR_ATTEMPTS: i64 = 3;
 
 pub struct Db {
     conn: Connection,
+    /// Whether the sqlite-vec (`vec0`) extension is usable on this connection,
+    /// cached from a `vec_version()` probe at open time (see
+    /// [`load_vec_extension`]). Drives graceful degradation: when `false`, KNN
+    /// paths (`ensure_vec_chunks`, semantic search) no-op and callers fall back
+    /// to FTS5-only search instead of erroring.
+    vec_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -104,14 +155,20 @@ impl Db {
     /// build it first).
     pub fn open_read_only(base: &Path, project_id: Uuid) -> Result<Db> {
         let path = db_path(base, project_id);
+        register_vec_extension();
         let conn = Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        Ok(Db { conn })
+        let vec_available = load_vec_extension(&conn);
+        Ok(Db {
+            conn,
+            vec_available,
+        })
     }
 
     pub fn open_at(path: &Path) -> Result<Db> {
+        register_vec_extension();
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -122,16 +179,25 @@ impl Db {
         // would waste a whole re-generation on retry, and a scanner write could
         // simply be lost. Waiting briefly instead makes contention invisible.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let db = Db { conn };
+        let vec_available = load_vec_extension(&conn);
+        let db = Db {
+            conn,
+            vec_available,
+        };
         db.migrate()?;
         Ok(db)
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Db> {
+        register_vec_extension();
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Db { conn };
+        let vec_available = load_vec_extension(&conn);
+        let db = Db {
+            conn,
+            vec_available,
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -388,11 +454,409 @@ impl Db {
                 "#,
             )?;
         }
+        if version < 12 {
+            // semantic-index (Phase 0): relational chunk store feeding hybrid
+            // (FTS5 keyword + vec0 KNN) search. `chunks` holds one row per
+            // embeddable text window produced by the chunker; `token_est` is the
+            // chars/4 estimate and `content_hash` (xxHash) drives incremental
+            // re-embedding. `tier` mirrors `kenignore::Tier` (0=Full, 1=SearchOnly;
+            // `Ignore`-tier files never produce chunk rows at all — see
+            // kenignore.rs and design D3) and is set by the caller's classify
+            // pass in `upsert_chunks`, not computed here.
+            //
+            // The companion `vec_chunks` vec0 virtual table is deliberately NOT
+            // created here: its schema must bake in the embedding dimension
+            // (unknown until an embedder is chosen) and the sqlite-vec extension
+            // may be unavailable. It is built lazily by `ensure_vec_chunks(dim)`,
+            // so this migration always succeeds even when vec init fails.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id           INTEGER PRIMARY KEY,
+                    path         TEXT NOT NULL,
+                    seq          INTEGER NOT NULL,
+                    text         TEXT NOT NULL,
+                    token_est    INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    tier         INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(path, seq)
+                );
+                CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
+                "#,
+            )?;
+            // Chunk-level keyword index (task 1.6/1.7). This is deliberately a
+            // *standalone* FTS5 table — not `content='contents'` external-content
+            // like `search` above — for two reasons: (1) `search` is file-grain
+            // and this is chunk-grain, and (2) task 1.10 (Condition A) feeds this
+            // table augmented text (path tokens + filename stem + symbol names
+            // prepended) that differs from the pristine `chunks.text` kept for
+            // embeddings, so it can't just mirror `chunks` via triggers the way
+            // `search` mirrors `contents`. Rows are written explicitly by
+            // `upsert_chunks`/`delete_chunks` with `rowid` pinned to `chunks.id`
+            // so a chunk-id join is a plain rowid lookup. No `content=` option is
+            // set, so FTS5 stores the text itself and plain INSERT/DELETE by
+            // rowid work like a normal table (no external-content 'delete'
+            // command dance needed).
+            self.conn.execute_batch(
+                r#"
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text);
+                "#,
+            )?;
+        }
+        if version < 13 {
+            // ken-home-workspace: a chat remembers the scope it was opened
+            // with, so "all projects" survives a restart and switching the
+            // Home picker later cannot silently re-scope an existing
+            // conversation.
+            //
+            // NULL means "this project only" — the pre-feature behavior and
+            // the value every existing row gets, so upgrading changes no
+            // chat's meaning. `"all"` is every workspace member; any other
+            // value names a group.
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE chats ADD COLUMN scope TEXT;
+                "#,
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Whether the sqlite-vec (`vec0`) KNN extension is usable on this handle.
+    /// Callers gate semantic (vector) search on this and fall back to FTS5-only
+    /// when it is `false`.
+    pub fn vec_available(&self) -> bool {
+        self.vec_available
+    }
+
+    /// Lazily create the `vec_chunks` KNN virtual table for `dim`-dimensional
+    /// embeddings. The `vec0` table bakes the embedding dimension into its
+    /// schema, which isn't known until an embedder is chosen, so it is created
+    /// on demand rather than in the fixed migration. Idempotent — `IF NOT
+    /// EXISTS` makes repeat calls cheap no-ops. Returns `Ok(false)` without
+    /// touching the DB when the extension is unavailable, so callers degrade to
+    /// FTS5-only rather than erroring.
+    pub fn ensure_vec_chunks(&self, dim: usize) -> Result<bool> {
+        if !self.vec_available {
+            return Ok(false);
+        }
+        self.conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\
+                 chunk_id INTEGER PRIMARY KEY, \
+                 embedding FLOAT[{dim}]\
+             );"
+        ))?;
+        Ok(true)
+    }
+
+    fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The embedding model id the semantic index was built with (`meta`
+    /// `embed_model`), or `None` before the first build. Paired with
+    /// [`Db::embed_dim`] so a later model/dimension change can be detected and
+    /// force a rebuild.
+    pub fn embed_model(&self) -> Result<Option<String>> {
+        self.meta_get("embed_model")
+    }
+
+    pub fn set_embed_model(&self, model_id: &str) -> Result<()> {
+        self.meta_set("embed_model", model_id)
+    }
+
+    /// The embedding dimension the semantic index was built with (`meta`
+    /// `embed_dim`), or `None` before the first build.
+    pub fn embed_dim(&self) -> Result<Option<usize>> {
+        Ok(self.meta_get("embed_dim")?.and_then(|v| v.parse().ok()))
+    }
+
+    pub fn set_embed_dim(&self, dim: usize) -> Result<()> {
+        self.meta_set("embed_dim", &dim.to_string())
+    }
+
+    /// Unix epoch (seconds) the semantic index last finished building (`meta`
+    /// `semantic_built_at`), or `None` if never built.
+    pub fn semantic_built_at(&self) -> Result<Option<i64>> {
+        Ok(self
+            .meta_get("semantic_built_at")?
+            .and_then(|v| v.parse().ok()))
+    }
+
+    pub fn set_semantic_built_at(&self, epoch_secs: i64) -> Result<()> {
+        self.meta_set("semantic_built_at", &epoch_secs.to_string())
+    }
+
+    /// Diff-based upsert of `path`'s chunks against the `chunks` table (and
+    /// the parallel `chunks_fts` keyword index): each incoming chunk is
+    /// compared against the existing row at the same `seq` by
+    /// `content_hash`. Unchanged chunks are left untouched entirely
+    /// (including their `vec_chunks` embedding, if any); new or
+    /// text-changed chunks are written and their stale embedding (if any)
+    /// is dropped so `semantic_search` can't return an outdated vector
+    /// before the background backfill re-embeds them; seqs that existed
+    /// before but aren't present in `chunks` anymore (file shrank or was
+    /// re-chunked) are deleted from all three tables.
+    ///
+    /// Returns the `(chunk_id, content_hash)` pairs that were newly
+    /// inserted or changed — the caller's embedding backfill only needs to
+    /// process these, not the whole file.
+    pub fn upsert_chunks(
+        &mut self,
+        path: &str,
+        chunks: &[crate::chunker::Chunk],
+        tier: crate::kenignore::Tier,
+    ) -> Result<Vec<(i64, String)>> {
+        let tx = self.conn.transaction()?;
+        let vec_exists = table_exists(&tx, "vec_chunks")?;
+        let tier = tier as i64;
+
+        let mut existing: std::collections::HashMap<i64, (i64, String)> = {
+            let mut stmt = tx.prepare("SELECT seq, id, content_hash FROM chunks WHERE path = ?1")?;
+            let rows = stmt.query_map(params![path], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    (r.get::<_, i64>(1)?, r.get::<_, String>(2)?),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+
+        let mut changed = Vec::new();
+        for chunk in chunks {
+            let seq = chunk.seq as i64;
+            let unchanged = matches!(existing.get(&seq), Some((_, hash)) if hash == &chunk.content_hash);
+            if !unchanged {
+                tx.execute(
+                    r#"INSERT INTO chunks (path, seq, text, token_est, content_hash, tier)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                       ON CONFLICT(path, seq) DO UPDATE SET
+                         text = ?3, token_est = ?4, content_hash = ?5, tier = ?6"#,
+                    params![path, seq, chunk.text, chunk.token_est as i64, chunk.content_hash, tier],
+                )?;
+                let id: i64 = tx.query_row(
+                    "SELECT id FROM chunks WHERE path = ?1 AND seq = ?2",
+                    params![path, seq],
+                    |r| r.get(0),
+                )?;
+                // chunks_fts row: delete-then-reinsert rather than UPDATE since
+                // FTS5 doesn't support partial-column UPDATE semantics the way
+                // a normal table does. Indexed text is path/filename/symbol-
+                // augmented (task 1.10, S7b Condition A) — `chunks.text`
+                // above stays the plain chunk text used for embeddings.
+                tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
+                tx.execute(
+                    "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                    params![id, fts_index_text(path, &chunk.text)],
+                )?;
+                if vec_exists {
+                    tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+                }
+                changed.push((id, chunk.content_hash.clone()));
+            }
+            existing.remove(&seq);
+        }
+
+        // Anything left in `existing` is a seq the new chunk set no longer
+        // produces — the file shrank or was re-chunked differently.
+        for (id, _hash) in existing.into_values() {
+            tx.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
+            if vec_exists {
+                tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Remove every chunk (and its `chunks_fts`/`vec_chunks` rows) for
+    /// `path`. Mirrors [`Db::remove_file`]'s multi-table cleanup breadth;
+    /// called when a file is removed or re-classified to the `Ignore` tier.
+    pub fn delete_chunks(&mut self, path: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE path = ?1")?;
+            let rows = stmt.query_map(params![path], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let vec_exists = table_exists(&tx, "vec_chunks")?;
+        for id in &ids {
+            tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
+            if vec_exists {
+                tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+            }
+        }
+        tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Write embedding vectors for already-persisted chunk ids into
+    /// `vec_chunks`, replacing any prior vector for the same id
+    /// (delete-then-insert, since vec0 doesn't support `ON CONFLICT`
+    /// upserts). Callers must have already sized the table via
+    /// `ensure_vec_chunks(dim)` — this never creates it, since the
+    /// embedding dimension is baked into the table's schema at creation
+    /// time and this function has no way to know the caller's chosen `dim`
+    /// on its own. No-ops when `vec_available()` is false, `vec_chunks`
+    /// doesn't exist yet, or the two slices are mismatched/empty, so
+    /// callers can invoke this unconditionally and rely on FTS-only
+    /// degradation rather than checking availability themselves first.
+    pub fn store_embeddings(&mut self, ids: &[i64], vecs: &[Vec<f32>]) -> Result<()> {
+        if !self.vec_available || ids.len() != vecs.len() || ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        if !table_exists(&tx, "vec_chunks")? {
+            return Ok(());
+        }
+        for (id, vec) in ids.iter().zip(vecs.iter()) {
+            let blob = f32_slice_to_blob(vec);
+            tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+            tx.execute(
+                "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+                params![id, blob],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// KNN vector search over `vec_chunks`, joined back to `chunks` for the
+    /// owning path/text. Returns up to `k` `(chunk_id, path, text,
+    /// distance)` tuples ordered nearest-first. Returns an empty `Vec`
+    /// (never errors) when `vec_available()` is false, `vec_chunks` doesn't
+    /// exist yet, or `k` is 0, so callers can treat this as "no semantic
+    /// hits" and fall back to FTS-only results rather than branching on
+    /// availability themselves.
+    pub fn semantic_search(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<(i64, String, String, f64)>> {
+        if !self.vec_available || k == 0 {
+            return Ok(Vec::new());
+        }
+        if !table_exists(&self.conn, "vec_chunks")? {
+            return Ok(Vec::new());
+        }
+        let blob = f32_slice_to_blob(query_vec);
+        let mut stmt = self.conn.prepare(
+            r#"SELECT c.id, c.path, c.text, v.distance
+               FROM vec_chunks v
+               JOIN chunks c ON c.id = v.chunk_id
+               WHERE v.embedding MATCH ?1 AND v.k = ?2
+               ORDER BY v.distance"#,
+        )?;
+        let rows = stmt.query_map(params![blob, k as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Chunk-level FTS5 search over `chunks_fts`, joined back to `chunks`
+    /// for the owning path/text — the chunk-grain counterpart to
+    /// `semantic_search`, added for task 1.8 so hybrid search (this crate's
+    /// tests today; the src-tauri `hybrid_search` command, task 2.2,
+    /// eventually) has a ready-made `Vec<FtsHit>` to feed into
+    /// `search::merge_hits` alongside `semantic_search`'s KNN hits. Reuses
+    /// the same tokenize/stopword/prefix-match query building as the
+    /// file-grain `search()` above. Returns up to `k` hits ordered
+    /// best-first (by BM25 rank); returns an empty `Vec` (never errors) for
+    /// an empty/stopword-only query, `k == 0`, or a pre-v12 DB where
+    /// `chunks_fts` doesn't exist yet.
+    pub fn search_chunks_fts(&self, query: &str, k: usize) -> Result<Vec<FtsHit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let tokens = query_tokens(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tokens = significant_token_list(&tokens);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !table_exists(&self.conn, "chunks_fts")? {
+            return Ok(Vec::new());
+        }
+        let fts_query = build_fts_query(&tokens);
+        let mut stmt = self.conn.prepare(
+            r#"SELECT c.id, c.path, c.text
+               FROM chunks_fts f
+               JOIN chunks c ON c.id = f.rowid
+               WHERE f.text MATCH ?1
+               ORDER BY bm25(chunks_fts)
+               LIMIT ?2"#,
+        )?;
+        let rows = stmt.query_map(params![fts_query, k as i64], |r| {
+            Ok(FtsHit {
+                chunk_id: r.get(0)?,
+                path: r.get(1)?,
+                text: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Chunk-tier lookup for a set of chunk ids (kenignore task 2.4): the
+    /// src-tauri `hybrid_search` command uses this to badge each hit with
+    /// its `chunks.tier` (ken-core's `kenignore::Tier` numeric values — `0`
+    /// = Full, `1` = SearchOnly; `Ignore` rows are never stored) without
+    /// recomputing classification itself. Ids not found in `chunks` are
+    /// simply absent from the returned map.
+    pub fn chunk_tiers(&self, chunk_ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
+        let mut out = std::collections::HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, tier FROM chunks WHERE id IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk_ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, tier) = row?;
+            out.insert(id, tier);
+        }
+        Ok(out)
+    }
+
+    /// Total row count in `chunks` (semantic-index task 2.4's ~50k guardrail
+    /// check). A cheap `COUNT(*)`, meant to be called once after each
+    /// build/incremental update — not per search.
+    pub fn chunk_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?)
     }
 
     /// Insert or update a file's index entry. `text` is the extracted
@@ -1152,11 +1616,11 @@ impl Db {
 
     pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived, model)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived, model, scope)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(id) DO UPDATE SET
                  title = ?2, kind = ?3, pinned = ?4, status = ?5,
-                 last_active_at = ?7, archived = ?8, model = ?9"#,
+                 last_active_at = ?7, archived = ?8, model = ?9, scope = ?10"#,
             params![
                 chat.id,
                 chat.title,
@@ -1166,7 +1630,8 @@ impl Db {
                 chat.created_at,
                 chat.last_active_at,
                 chat.archived as i64,
-                chat.model
+                chat.model,
+                chat.scope
             ],
         )?;
         Ok(())
@@ -1183,11 +1648,12 @@ impl Db {
             last_active_at: r.get(6)?,
             archived: r.get::<_, i64>(7)? != 0,
             model: r.get(8)?,
+            scope: r.get(9)?,
         })
     }
 
     const CHAT_COLS: &'static str =
-        "id, title, kind, pinned, status, created_at, last_active_at, archived, model";
+        "id, title, kind, pinned, status, created_at, last_active_at, archived, model, scope";
 
     pub fn get_chat(&self, id: &str) -> Result<Option<ChatRow>> {
         let sql = format!("SELECT {} FROM chats WHERE id = ?1", Self::CHAT_COLS);
@@ -1216,6 +1682,7 @@ impl Db {
         let sql = match field {
             ChatField::Title => "UPDATE chats SET title = ?2 WHERE id = ?1",
             ChatField::Status => "UPDATE chats SET status = ?2 WHERE id = ?1",
+            ChatField::Scope => "UPDATE chats SET scope = ?2 WHERE id = ?1",
         };
         self.conn.execute(sql, params![id, value])?;
         Ok(())
@@ -1998,6 +2465,7 @@ impl Db {
 pub enum ChatField {
     Title,
     Status,
+    Scope,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2022,6 +2490,12 @@ pub struct ChatRow {
     /// Chosen model as a stable tier alias (`haiku`/`sonnet`/`opus`/`fable`),
     /// or None for the CLI's own default. Applied when a session is spawned.
     pub model: Option<String>,
+    /// The projects this chat asks about, bound when it was created
+    /// (schema v13). `None` = this project only, which is what every chat
+    /// created before this column existed means. `Some("all")` = every
+    /// workspace member; any other value names a group. Widens what the
+    /// session may READ; writes stay pinned to the focused project.
+    pub scope: Option<String>,
 }
 
 /// One day's digest. `content` is the raw model output — a paragraph
@@ -2129,6 +2603,29 @@ fn entity_key(kind: &str, name: &str) -> String {
     format!("{kind}\u{1}{name}")
 }
 
+/// Whether a table or virtual table named `name` exists. Used by the
+/// semantic-index chunk CRUD to guard `vec_chunks` access: that table is
+/// created lazily (only once an embedder's dimension is known via
+/// `ensure_vec_chunks`), so code that runs before any embedding has
+/// happened must not assume it's there.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+            params![name],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Serialize an f32 vector into the raw little-endian byte blob `vec0`
+/// expects for both inserting into `vec_chunks.embedding` and binding a KNN
+/// query vector.
+fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
 /// Strip one file's prior contribution to the knowledge model, in the caller's
 /// transaction: delete its events, remove it from every entity's `sources`,
 /// and delete entities left with no sources (their edges cascade via the
@@ -2171,6 +2668,68 @@ fn name_tokens(rel_path: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Relative-path tokens for FTS index augmentation: the *whole* path (every
+/// segment, not just the filename), separators spaced out
+/// ("src/local_llm.rs" → "src local_llm rs" → "src local llm rs" after
+/// separator-splitting). Distinct from `name_tokens`, which only tokenizes
+/// the last path segment.
+fn path_tokens(rel_path: &str) -> String {
+    rel_path
+        .replace(['/', '\\', '-', '_', '.', '—'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn symbol_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Language-agnostic heuristic: an identifier immediately following a
+        // common top-level declaration keyword, at (or near) the start of a
+        // line. Covers Rust/JS/TS/Python/Go/Java/C#/C++-ish surface syntax
+        // well enough for FTS header purposes — this is a recall aid for
+        // search, not a real parser, so false negatives on exotic syntax are
+        // fine and false positives are harmless (they just add a stray token
+        // to the header).
+        Regex::new(
+            r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+|export\s+(?:default\s+)?|public\s+|private\s+|protected\s+|static\s+|async\s+|abstract\s+)*(?:fn|function|def|class|struct|enum|trait|interface|impl|type|const|static|let|var|func|mod|module)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("symbol_regex is a fixed, valid pattern")
+    })
+}
+
+/// Extract top-level-ish declaration names from a chunk's text (regex
+/// heuristic, no per-language parsing — see `symbol_regex`).
+fn extract_symbol_names(text: &str) -> Vec<String> {
+    symbol_regex()
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
+/// Build the text actually indexed into `chunks_fts` for one chunk: relative
+/// path tokens + filename stem + regex-extracted declaration names,
+/// prepended ahead of the chunk's own text (S7b Condition A, semantic-index
+/// task 1.10). This is FTS-only augmentation — `chunks.text` (the embedding
+/// input, and what callers see back via `search_chunks_fts`'s `c.text`
+/// join) is never touched.
+fn fts_index_text(rel_path: &str, chunk_text: &str) -> String {
+    let path_part = path_tokens(rel_path);
+    let name_part = name_tokens(rel_path);
+    let symbols = extract_symbol_names(chunk_text).join(" ");
+    let mut header = String::with_capacity(path_part.len() + name_part.len() + symbols.len() + 3);
+    header.push_str(&path_part);
+    if !name_part.is_empty() {
+        header.push(' ');
+        header.push_str(&name_part);
+    }
+    if !symbols.is_empty() {
+        header.push(' ');
+        header.push_str(&symbols);
+    }
+    format!("{header} {chunk_text}")
 }
 
 fn like_escape(s: &str) -> String {
@@ -2358,6 +2917,346 @@ mod tests {
             sources: Vec::new(),
             connections: Vec::new(),
         }
+    }
+
+    // --- semantic-index task 1.2: v12 schema migration ---
+
+    #[test]
+    fn v11_db_migrates_to_v12() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Seed pre-existing data that must survive the upgrade.
+        db.upsert_file("notes/plan.md", "text", 12, 1000, "indexed", None, "hybrid search plan")
+            .unwrap();
+        // Rewind this connection to a genuine v11 database: drop the v12
+        // artifacts and reset the stored schema_version so migrate() re-runs the
+        // v11 -> v12 step exactly as it would on a real old index.
+        db.conn.execute_batch("DROP TABLE IF EXISTS chunks;").unwrap();
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '11')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        // Version advanced to 12.
+        let version: String = db
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, "12");
+        // Pre-existing file survived the migration.
+        let surviving: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE rel_path='notes/plan.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving, 1, "existing data must survive v11->v12");
+        // chunks table exists and starts empty.
+        let chunks: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 0, "new chunks table starts empty");
+        // The `tier` column exists and defaults to 0 (kenignore 1.4 schema half).
+        db.conn
+            .execute(
+                "INSERT INTO chunks(path, seq, text, token_est, content_hash) \
+                 VALUES ('a.md', 0, 'x', 1, 'h')",
+                [],
+            )
+            .unwrap();
+        let tier: i64 = db
+            .conn
+            .query_row("SELECT tier FROM chunks WHERE path='a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tier, 0, "tier defaults to 0");
+    }
+
+    #[test]
+    fn migration_succeeds_when_vec_unavailable() {
+        // Simulate sqlite-vec failing to register (vec_available = false). The
+        // v12 migration must NOT depend on the extension — `vec_chunks` is built
+        // lazily — so a fresh DB still migrates cleanly and gets the relational
+        // `chunks` table, and the KNN paths degrade to graceful no-ops.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let db = Db {
+            conn,
+            vec_available: false,
+        };
+
+        db.migrate().unwrap();
+
+        let chunks: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 0, "chunks table exists despite vec unavailable");
+        // ensure_vec_chunks is a no-op (returns false) when vec is unavailable.
+        assert!(
+            !db.ensure_vec_chunks(8).unwrap(),
+            "ensure_vec_chunks must no-op when vec is unavailable"
+        );
+    }
+
+    #[test]
+    fn ensure_vec_chunks_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        if !db.vec_available() {
+            // No usable vec0 in this build: the only guarantee is a graceful
+            // no-op. (Statically linked, this branch shouldn't be taken.)
+            assert!(!db.ensure_vec_chunks(8).unwrap());
+            return;
+        }
+        assert!(db.ensure_vec_chunks(8).unwrap(), "first create succeeds");
+        // Repeat calls with the same dim are cheap no-ops, not errors.
+        assert!(db.ensure_vec_chunks(8).unwrap(), "second call is idempotent");
+        assert!(db.ensure_vec_chunks(8).unwrap(), "third call is idempotent");
+        let tables: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='vec_chunks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(tables >= 1, "vec_chunks virtual table exists");
+    }
+
+    // --- semantic-index task 1.6: chunk CRUD ---
+
+    fn chunk(seq: usize, text: &str, hash: &str) -> crate::chunker::Chunk {
+        crate::chunker::Chunk {
+            seq,
+            text: text.to_string(),
+            token_est: text.split_whitespace().count(),
+            content_hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn upsert_chunks_inserts_and_reports_changed() {
+        let mut db = Db::open_in_memory().unwrap();
+        let chunks = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk", "h1")];
+
+        let changed = db
+            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .unwrap();
+        assert_eq!(changed.len(), 2, "both new chunks reported as changed");
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE path='a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // chunks_fts got a mirrored row for each chunk id.
+        let fts_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 2, "chunks_fts mirrors every chunk");
+    }
+
+    // --- task 1.10: FTS index augmentation (path/filename/symbol header) ---
+
+    #[test]
+    fn extract_symbol_names_recognizes_common_declaration_keywords() {
+        let text = "pub fn frobnicate() {}\nclass Widget:\n    def handle(self):\n        pass\nexport function makeThing() {}\n";
+        let names = extract_symbol_names(text);
+        assert!(names.contains(&"frobnicate".to_string()), "{names:?}");
+        assert!(names.contains(&"Widget".to_string()), "{names:?}");
+        assert!(names.contains(&"handle".to_string()), "{names:?}");
+        assert!(names.contains(&"makeThing".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn fts_augmented_header_finds_chunk_by_filename_even_when_body_lacks_the_term() {
+        let mut db = Db::open_in_memory().unwrap();
+        let chunks = vec![chunk(
+            0,
+            "this passage never spells out the module by name",
+            "h0",
+        )];
+        db.upsert_chunks("src/local_llm.rs", &chunks, crate::kenignore::Tier::Full)
+            .unwrap();
+
+        let hits = db.search_chunks_fts("local_llm", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.path == "src/local_llm.rs"),
+            "expected filename-derived tokens to make the chunk findable, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_chunks_leaves_chunks_text_unaugmented_for_embeddings() {
+        let mut db = Db::open_in_memory().unwrap();
+        let plain = "fn frobnicate() { /* body */ }";
+        let chunks = vec![chunk(0, plain, "h0")];
+        db.upsert_chunks("src/util.rs", &chunks, crate::kenignore::Tier::Full)
+            .unwrap();
+
+        let stored: String = db
+            .conn
+            .query_row("SELECT text FROM chunks WHERE path='src/util.rs'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stored, plain,
+            "chunks.text (the embedding input) must stay the plain chunk text, not the FTS-augmented header"
+        );
+    }
+
+    #[test]
+    fn upsert_chunks_is_diff_based() {
+        let mut db = Db::open_in_memory().unwrap();
+        let first = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk", "h1")];
+        let ids1 = db
+            .upsert_chunks("a.md", &first, crate::kenignore::Tier::Full)
+            .unwrap();
+        assert_eq!(ids1.len(), 2);
+        let id_seq0 = ids1[0].0;
+
+        // Re-upsert with seq 0 unchanged (same hash) and seq 1 changed (new hash).
+        let second = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk EDITED", "h1-new")];
+        let changed = db
+            .upsert_chunks("a.md", &second, crate::kenignore::Tier::Full)
+            .unwrap();
+        assert_eq!(changed.len(), 1, "only the changed chunk should be reported");
+
+        // seq 0's row (and its id) must be untouched.
+        let id_after: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM chunks WHERE path='a.md' AND seq=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_after, id_seq0, "unchanged chunk keeps its id");
+
+        let text1: String = db
+            .conn
+            .query_row(
+                "SELECT text FROM chunks WHERE path='a.md' AND seq=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text1, "second chunk EDITED");
+    }
+
+    #[test]
+    fn upsert_chunks_removes_stale_seqs() {
+        let mut db = Db::open_in_memory().unwrap();
+        let first = vec![chunk(0, "a", "h0"), chunk(1, "b", "h1"), chunk(2, "c", "h2")];
+        db.upsert_chunks("a.md", &first, crate::kenignore::Tier::Full)
+            .unwrap();
+
+        // Re-chunk down to a single chunk: seq 1 and 2 must disappear from
+        // `chunks` and their `chunks_fts` mirror rows.
+        let second = vec![chunk(0, "a", "h0")];
+        db.upsert_chunks("a.md", &second, crate::kenignore::Tier::Full)
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE path='a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "stale seqs removed from chunks");
+
+        let fts_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "stale seqs removed from chunks_fts too");
+    }
+
+    #[test]
+    fn delete_chunks_removes_all_tables() {
+        let mut db = Db::open_in_memory().unwrap();
+        let chunks = vec![chunk(0, "a", "h0"), chunk(1, "b", "h1")];
+        let ids = db
+            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .unwrap();
+        if db.vec_available() {
+            db.ensure_vec_chunks(8).unwrap();
+            let vecs: Vec<Vec<f32>> = ids.iter().map(|_| vec![0.1f32; 8]).collect();
+            let just_ids: Vec<i64> = ids.iter().map(|(id, _)| *id).collect();
+            db.store_embeddings(&just_ids, &vecs).unwrap();
+        }
+
+        db.delete_chunks("a.md").unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE path='a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let fts_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0, "chunks_fts cleaned up too");
+        if db.vec_available() {
+            let vec_count: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(vec_count, 0, "vec_chunks cleaned up too");
+        }
+    }
+
+    #[test]
+    fn store_embeddings_and_semantic_search_roundtrip() {
+        let mut db = Db::open_in_memory().unwrap();
+        if !db.vec_available() {
+            // No usable vec0 in this build: store_embeddings/semantic_search
+            // must degrade to graceful no-ops rather than erroring.
+            let changed = db
+                .upsert_chunks("a.md", &[chunk(0, "hello", "h0")], crate::kenignore::Tier::Full)
+                .unwrap();
+            let ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
+            db.store_embeddings(&ids, &[vec![0.1f32; 8]]).unwrap();
+            assert!(db.semantic_search(&[0.1f32; 8], 5).unwrap().is_empty());
+            return;
+        }
+
+        db.ensure_vec_chunks(8).unwrap();
+        let chunks = vec![
+            chunk(0, "the quick brown fox", "h0"),
+            chunk(1, "a totally different sentence", "h1"),
+        ];
+        let changed = db
+            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .unwrap();
+        let ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
+
+        // Chunk 0 gets a vector near the query; chunk 1 gets a far one.
+        let near = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let far = vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        db.store_embeddings(&ids, &[near.clone(), far]).unwrap();
+
+        let results = db.semantic_search(&near, 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, ids[0], "closest vector ranks first");
+        assert_eq!(results[0].1, "a.md");
+        assert_eq!(results[0].2, "the quick brown fox");
+    }
+
+    #[test]
+    fn semantic_search_no_ops_when_vec_chunks_absent() {
+        // ensure_vec_chunks was never called, so vec_chunks doesn't exist yet
+        // even though vec0 itself might be available.
+        let db = Db::open_in_memory().unwrap();
+        let results = db.semantic_search(&[0.1f32; 8], 5).unwrap();
+        assert!(results.is_empty(), "no vec_chunks table means no results, not an error");
     }
 
     #[test]
@@ -3397,6 +4296,51 @@ mod tests {
         assert_eq!(paths(&via_reader), paths(&via_writer));
     }
 
+    /// A chat created before schema v13 must read back as `scope: None`
+    /// (this project only), i.e. the upgrade changes no existing chat's
+    /// meaning — and a v13 chat must round-trip its scope.
+    #[test]
+    fn chat_scope_defaults_to_none_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut db = Db::open(dir.path(), id).unwrap();
+
+        // Simulate a pre-v13 row by writing one with no scope set.
+        let legacy = ChatRow {
+            id: "c-legacy".into(),
+            title: "Old chat".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 1,
+            last_active_at: 1,
+            archived: false,
+            model: None,
+            scope: None,
+        };
+        db.upsert_chat(&legacy).unwrap();
+        assert_eq!(db.get_chat("c-legacy").unwrap().unwrap().scope, None);
+
+        let scoped = ChatRow {
+            id: "c-all".into(),
+            scope: Some("all".into()),
+            ..legacy.clone()
+        };
+        db.upsert_chat(&scoped).unwrap();
+        assert_eq!(
+            db.get_chat("c-all").unwrap().unwrap().scope.as_deref(),
+            Some("all")
+        );
+
+        // And it is settable after the fact (re-scoping an existing chat).
+        db.set_chat_field("c-legacy", ChatField::Scope, "Shattered Realms")
+            .unwrap();
+        assert_eq!(
+            db.get_chat("c-legacy").unwrap().unwrap().scope.as_deref(),
+            Some("Shattered Realms")
+        );
+    }
+
     #[test]
     fn schema_version_recorded() {
         let db = Db::open_in_memory().unwrap();
@@ -3420,6 +4364,7 @@ mod tests {
             last_active_at: 100,
             archived: false,
             model: None,
+            scope: None,
         };
         db.upsert_chat(&chat).unwrap();
         db.upsert_chat(&ChatRow { id: "sess-2".into(), title: "Second".into(), last_active_at: 200, created_at: 200, ..chat.clone() }).unwrap();
@@ -3460,6 +4405,7 @@ mod tests {
             last_active_at: 100,
             archived: false,
             model: None,
+            scope: None,
         })
         .unwrap();
         db.append_chat_message(chat_id, "user", "hello there", 100).unwrap();
@@ -3480,6 +4426,7 @@ mod tests {
             last_active_at: 1,
             archived: false,
             model: None,
+            scope: None,
         };
         db.upsert_chat(&chat).unwrap();
         // A fresh chat carries no model → CLI default.

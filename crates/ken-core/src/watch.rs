@@ -130,16 +130,29 @@ fn is_relevant(event: &notify::Event) -> bool {
 }
 
 /// Ignore events under hidden folders (.git, .ken) — they never affect the
-/// index and .git churn would otherwise trigger constant rescans.
+/// index and .git churn would otherwise trigger constant rescans. The one
+/// exception is `.ken`'s allowlisted subpaths (`.ken/memory/`,
+/// `.ken/tasks/`, per `scan::is_ken_allowlisted_path`): those ARE indexed by
+/// `scan::scan`, so a watcher event under them must stay relevant or an
+/// edit there would never trigger the rescan that would otherwise pick it
+/// up. Everything else dot-prefixed — `.ken/project.json`, `.git`,
+/// `.vscode`, any other dot-dir — stays excluded exactly as before.
 fn relevant_path(roots: &[PathBuf], abs: &std::path::Path) -> bool {
     roots.iter().any(|root| match abs.strip_prefix(root) {
-        Ok(rel) => !rel.components().any(|c| {
-            c.as_os_str().to_str().is_some_and(|s| {
-                s.starts_with('.')
-                    || crate::scan::is_junk_dir_name(s)
-                    || crate::scan::is_office_lock_name(s)
-            })
-        }),
+        Ok(rel) => {
+            let has_excluded_component = rel.components().any(|c| {
+                c.as_os_str().to_str().is_some_and(|s| {
+                    s.starts_with('.')
+                        || crate::scan::is_junk_dir_name(s)
+                        || crate::scan::is_office_lock_name(s)
+                })
+            });
+            if !has_excluded_component {
+                return true;
+            }
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            crate::scan::is_ken_allowlisted_path(&rel_str)
+        }
         Err(_) => false,
     })
 }
@@ -215,6 +228,75 @@ mod tests {
         // Existing exclusions still hold.
         assert!(!relevant_path(&roots, &root.join(".git/index")));
         assert!(!relevant_path(&roots, &root.join("node_modules/pkg/x.js")));
+    }
+
+    #[test]
+    fn ken_memory_and_tasks_are_relevant_but_other_dot_ken_paths_are_not() {
+        let root = PathBuf::from("/proj");
+        let roots = vec![root.clone()];
+        let ken = crate::project::CONFIG_DIR;
+
+        // Allowlisted subpaths, including a nested archive folder.
+        assert!(relevant_path(&roots, &root.join(format!("{ken}/memory/foo.md"))));
+        assert!(relevant_path(&roots, &root.join(format!("{ken}/tasks/bar.md"))));
+        assert!(relevant_path(
+            &roots,
+            &root.join(format!("{ken}/tasks/archive/2026-07/old.md"))
+        ));
+
+        // Everything else under `.ken/` stays irrelevant, same as today.
+        assert!(!relevant_path(&roots, &root.join(format!("{ken}/project.json"))));
+        assert!(!relevant_path(&roots, &root.join(format!("{ken}/index-profile.json"))));
+
+        // Other dot-directories are untouched by the carve-out.
+        assert!(!relevant_path(&roots, &root.join(".vscode/settings.json")));
+    }
+
+    /// The bug class this predicate exists to close: the walker
+    /// (`scan::scan`) and the watcher (`relevant_path`) disagreeing about
+    /// which paths matter. A path the walker indexes but the watcher deems
+    /// irrelevant never gets re-scanned on edit; a path the watcher deems
+    /// relevant but the walker never indexes churns the watcher for
+    /// nothing. Assert the two agree, over a real scanned project, for
+    /// every path in the table below.
+    #[test]
+    fn scan_and_watch_agree_on_ken_paths() {
+        let (dir, _app_dir, project, db_path) = setup();
+        let ken = crate::project::CONFIG_DIR;
+        fs::create_dir_all(dir.path().join(format!("{ken}/memory"))).unwrap();
+        fs::create_dir_all(dir.path().join(format!("{ken}/tasks/archive/2026-07"))).unwrap();
+        fs::write(dir.path().join(format!("{ken}/memory/foo.md")), "a memory").unwrap();
+        fs::write(dir.path().join(format!("{ken}/tasks/bar.md")), "a task").unwrap();
+        fs::write(
+            dir.path().join(format!("{ken}/tasks/archive/2026-07/old.md")),
+            "an archived task",
+        )
+        .unwrap();
+        fs::write(dir.path().join(format!("{ken}/index-profile.json")), "{}").unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let mut db = Db::open_at(&db_path).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let roots = vec![dir.path().to_path_buf()];
+        let table = [
+            format!("{ken}/memory/foo.md"),
+            format!("{ken}/tasks/bar.md"),
+            format!("{ken}/tasks/archive/2026-07/old.md"),
+            format!("{ken}/project.json"),
+            format!("{ken}/index-profile.json"),
+            ".git/HEAD".to_string(),
+            "notes/seed.md".to_string(),
+        ];
+        for rel in &table {
+            let watched = relevant_path(&roots, &dir.path().join(rel));
+            let indexed = db.get_file(rel).unwrap().is_some();
+            assert_eq!(
+                watched, indexed,
+                "{rel}: watcher says relevant={watched}, scanner indexed={indexed} — must agree"
+            );
+        }
     }
 
     #[test]

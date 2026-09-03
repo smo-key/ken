@@ -25,6 +25,90 @@ export function glyphFor(kind: string): GlyphStyle {
   return GLYPHS[kind] ?? GLYPHS.binary;
 }
 
+/** Mirrors `FileKind::from_path` (crates/ken-core/src/extract.rs) so hit
+ *  sources that don't carry a `kind` field (e.g. `hybrid_search`) can still
+ *  pick a glyph. Keep this extension table in lockstep with the Rust match. */
+export function kindForPath(path: string): string {
+  const dot = path.lastIndexOf(".");
+  const ext = dot >= 0 ? path.slice(dot + 1).toLowerCase() : "";
+  switch (ext) {
+    case "md":
+    case "markdown":
+      return "md";
+    case "txt":
+    case "text":
+    case "log":
+    case "vtt":
+      return "txt";
+    case "rs":
+    case "ts":
+    case "js":
+    case "jsx":
+    case "tsx":
+    case "svelte":
+    case "py":
+    case "rb":
+    case "go":
+    case "java":
+    case "c":
+    case "cc":
+    case "cpp":
+    case "h":
+    case "hpp":
+    case "cs":
+    case "swift":
+    case "kt":
+    case "sh":
+    case "bash":
+    case "zsh":
+    case "sql":
+    case "json":
+    case "yaml":
+    case "yml":
+    case "toml":
+    case "ini":
+    case "cfg":
+    case "html":
+    case "htm":
+    case "css":
+    case "scss":
+    case "xml":
+    case "csv":
+      return "code";
+    case "docx":
+      return "docx";
+    case "xlsx":
+    case "xlsm":
+      return "xlsx";
+    case "pptx":
+      return "pptx";
+    case "pdf":
+      return "pdf";
+    case "ipynb":
+      return "ipynb";
+    case "png":
+    case "jpg":
+    case "jpeg":
+    case "gif":
+    case "webp":
+    case "heic":
+    case "bmp":
+    case "tiff":
+    case "tif":
+    case "svg":
+      return "image";
+    case "mp4":
+    case "mov":
+    case "m4v":
+    case "webm":
+    case "mkv":
+    case "avi":
+      return "video";
+    default:
+      return "binary";
+  }
+}
+
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;

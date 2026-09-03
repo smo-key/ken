@@ -2,7 +2,8 @@
 //!
 //! The available models are a small, curated [`catalog`] rather than a runtime
 //! discovery of the upstream repo: each entry carries a [`ModelCategory`]
-//! (Transcription / Language), a [`ModelTier`] (Recommended / Advanced), a
+//! (Transcription / Language / Embedding), a [`ModelTier`] (Recommended /
+//! Advanced), a
 //! Settings blurb, and its download identity ([`ModelSpec`]). The recommended
 //! transcription model doubles as the offline fallback and the model the
 //! transcript feature gates on. A per-category choice is persisted machine-wide
@@ -29,7 +30,7 @@ pub const RECOMMENDED_FILE: &str = transcript::MODEL_FILE;
 /// The recommended model's known size, used only for the offline gate/display
 /// and as the no-`Content-Length` verification floor; real downloads verify
 /// against the server's advertised length. Approximate is fine here.
-pub const RECOMMENDED_BYTES: u64 = 147_951_465;
+pub const RECOMMENDED_BYTES: u64 = 147_964_211;
 
 /// The direct download URL for one model file in the repo.
 pub fn resolve_url(file: &str) -> String {
@@ -56,6 +57,26 @@ pub const LANG_4B_BYTES: u64 = 2_497_281_120;
 pub const LANG_8B_FILE: &str = "Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_URL: &str = "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_BYTES: u64 = 5_027_783_488;
+
+// ---------- Embedding model (semantic search) ----------
+
+/// The semantic-search embedding model: nomic-embed-text v1.5, Q8_0 GGUF
+/// (~140 MB, 768-dim). Small enough that a single curated entry suffices —
+/// no Advanced tier.
+pub const EMBED_FILE: &str = "nomic-embed-text-v1.5.Q8_0.gguf";
+pub const EMBED_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf";
+pub const EMBED_BYTES: u64 = 146_146_432;
+
+fn embedding_spec() -> ModelSpec {
+    ModelSpec {
+        id: EMBED_FILE.to_string(),
+        name: "Nomic Embed v1.5".to_string(),
+        file: EMBED_FILE.to_string(),
+        url: EMBED_URL.to_string(),
+        expected_bytes: EMBED_BYTES,
+        recommended: true,
+    }
+}
 
 fn lang_recommended_spec() -> ModelSpec {
     ModelSpec {
@@ -97,6 +118,7 @@ pub struct ModelSpec {
 pub enum ModelCategory {
     Transcription,
     Language,
+    Embedding,
 }
 
 /// The two tiers offered per category: the safe default and the heavier option.
@@ -166,10 +188,22 @@ fn language_catalog() -> Vec<CatalogEntry> {
     ]
 }
 
-/// Every curated model, in display order (Transcription, then Language).
+/// The single semantic-search embedding model. One entry, Recommended tier —
+/// `selected()` requires every category to have a recommended entry.
+fn embedding_catalog() -> Vec<CatalogEntry> {
+    vec![CatalogEntry {
+        category: ModelCategory::Embedding,
+        tier: ModelTier::Recommended,
+        blurb: "finds notes by meaning, not just keywords",
+        spec: embedding_spec(),
+    }]
+}
+
+/// Every curated model, in display order (Transcription, Language, Embedding).
 pub fn catalog() -> Vec<CatalogEntry> {
     let mut entries = transcription_catalog();
     entries.extend(language_catalog());
+    entries.extend(embedding_catalog());
     entries
 }
 
@@ -274,6 +308,8 @@ pub struct ModelSelection {
     pub transcription: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub embedding: Option<String>,
 }
 
 fn selection_path(base_dir: &Path) -> PathBuf {
@@ -301,6 +337,7 @@ impl ModelSelection {
         match category {
             ModelCategory::Transcription => self.transcription.as_deref(),
             ModelCategory::Language => self.language.as_deref(),
+            ModelCategory::Embedding => self.embedding.as_deref(),
         }
     }
 
@@ -308,6 +345,7 @@ impl ModelSelection {
         match category {
             ModelCategory::Transcription => self.transcription = Some(id.to_string()),
             ModelCategory::Language => self.language = Some(id.to_string()),
+            ModelCategory::Embedding => self.embedding = Some(id.to_string()),
         }
     }
 }
@@ -560,7 +598,7 @@ mod tests {
         let rec = trans.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
         assert_eq!(rec.spec.file, "ggml-base.en.bin");
         assert_eq!(rec.spec.name, "Whisper Base (English)");
-        assert_eq!(rec.spec.expected_bytes, 147_951_465);
+        assert_eq!(rec.spec.expected_bytes, 147_964_211);
         assert!(rec.spec.recommended);
         let adv = trans.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
         assert_eq!(adv.spec.file, "ggml-large-v3-turbo.bin");
@@ -599,6 +637,50 @@ mod tests {
             selected_model_path(dir.path(), ModelCategory::Language),
             None
         );
+    }
+
+    #[test]
+    fn embedding_catalog_has_the_single_nomic_entry() {
+        let embed: Vec<_> = catalog()
+            .into_iter()
+            .filter(|e| e.category == ModelCategory::Embedding)
+            .collect();
+        assert_eq!(embed.len(), 1, "one curated embedding model, no advanced tier");
+        let entry = &embed[0];
+        assert_eq!(entry.tier, ModelTier::Recommended);
+        assert_eq!(entry.spec.file, "nomic-embed-text-v1.5.Q8_0.gguf");
+        assert_eq!(entry.spec.name, "Nomic Embed v1.5");
+        assert_eq!(entry.spec.expected_bytes, 146_146_432);
+        assert!(entry.spec.url.starts_with("https://huggingface.co/nomic-ai/"));
+        assert!(entry.spec.recommended, "selected() requires a recommended entry per category");
+        assert_eq!(entry.blurb, "finds notes by meaning, not just keywords");
+
+        // Fresh base_dir: selected() falls back to the recommended nomic entry;
+        // nothing installed → no loadable path.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            selected(dir.path(), ModelCategory::Embedding).file,
+            entry.spec.file
+        );
+        assert_eq!(selected_model_path(dir.path(), ModelCategory::Embedding), None);
+    }
+
+    #[test]
+    fn model_selection_embedding_field_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        set_selected(base, ModelCategory::Embedding, "nomic-embed-text-v1.5.Q8_0.gguf").unwrap();
+        let loaded = ModelSelection::load(base);
+        assert_eq!(loaded.embedding.as_deref(), Some("nomic-embed-text-v1.5.Q8_0.gguf"));
+        // Older selection.json without the field still parses (serde default).
+        std::fs::write(
+            base.join("models").join("selection.json"),
+            r#"{"transcription":"ggml-base.en.bin"}"#,
+        )
+        .unwrap();
+        let loaded = ModelSelection::load(base);
+        assert_eq!(loaded.transcription.as_deref(), Some("ggml-base.en.bin"));
+        assert_eq!(loaded.embedding, None);
     }
 
     #[test]

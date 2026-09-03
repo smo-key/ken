@@ -10,6 +10,19 @@ thiserror.workspace = true
 anyhow = "1"
 uuid.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
+# Vector search (KNN) via SQLite's vec0 virtual table, statically linked
+# alongside the bundled SQLite/FTS5. Pinned exactly (=0.1.9): this is a 0.1.x
+# crate that bundles the vec0 C amalgamation and builds it through `cc`, so a
+# patch bump can shift both the C sources and the on-disk vec0 format — re-run
+# spikes/S1 on any change. Registered at connection-open via
+# `sqlite3_auto_extension`; a runtime `vec_version()` probe drives graceful
+# degradation to FTS5-only if registration ever fails.
+sqlite-vec = "=0.1.9"
+# Fast, stable, non-cryptographic hash for chunk `content_hash` values (change
+# detection during incremental re-embedding) and for FakeEmbedder's
+# deterministic test vectors. xxHash is stable across runs/platforms, which the
+# chunker's hash-stability test relies on.
+twox-hash = "2"
 notify = "8"
 ignore = "0.4"
 calamine = "0.31"
@@ -35,6 +48,11 @@ hound = "3.5"
 # proxy (which re-signs certs with a private root installed in the OS keychain)
 # fail the download with `invalid peer certificate: UnknownIssuer`.
 ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
+# Symbol-name extraction for FTS index augmentation (semantic-index task
+# 1.10, S7b Condition A): a small language-agnostic regex over common
+# declaration keywords (fn/struct/class/def/...), run once per chunk at
+# index time. Not on any hot per-keystroke path.
+regex = "1"
 [features]
 default = ["whisper", "local-llm"]
 whisper = ["dep:whisper-rs"]

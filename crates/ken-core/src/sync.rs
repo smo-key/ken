@@ -38,7 +38,8 @@ struct GitOut {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<GitOut> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    let out = crate::proc::quiet(&mut cmd)
         .args(args)
         .current_dir(root)
         // Never hang on a credential prompt — fail into the attention state.
@@ -104,6 +105,45 @@ pub fn sync_auto(project: &Project) -> bool {
         .unwrap_or(true)
 }
 
+/// Default gap between the first change of a burst and the auto-commit that
+/// follows it. One hour, deliberately: at 30s Ken committed half-finished
+/// edits mid-session. The debounce deadline is set by the FIRST change in a
+/// burst and cannot be pushed back by continued typing (`get_or_insert` in
+/// `engine_loop`), so this means "at most one auto-commit per hour of active
+/// work", not "an hour after you finally stop".
+pub const DEFAULT_PUSH_DEBOUNCE_SECS: u64 = 60 * 60;
+
+/// Default minimum gap between focus-triggered pulls. Left short: a pull
+/// only fires when you switch to a project, and a stale pull means working
+/// against out-of-date teammate state — the opposite of the point.
+pub const DEFAULT_PULL_THROTTLE_SECS: u64 = 60;
+
+/// Read a positive duration from the project's `sync` block, falling back to
+/// `default_secs`. Zero and negative values are rejected rather than
+/// honoured: a zero debounce would commit on every keystroke batch, which is
+/// never what someone means by "faster".
+fn sync_secs(project: &Project, key: &str, default_secs: u64) -> Duration {
+    let secs = project
+        .config
+        .extra
+        .get("sync")
+        .and_then(|v| v.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|s| *s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+/// Build the engine config for a project, honouring its `sync` block:
+/// `{"auto": bool, "pushDebounceSecs": u64, "pullThrottleSecs": u64}`.
+pub fn sync_config_for(project: &Project) -> SyncConfig {
+    SyncConfig {
+        push_debounce: sync_secs(project, "pushDebounceSecs", DEFAULT_PUSH_DEBOUNCE_SECS),
+        pull_throttle: sync_secs(project, "pullThrottleSecs", DEFAULT_PULL_THROTTLE_SECS),
+        ..SyncConfig::default()
+    }
+}
+
 /// Is active git sync in effect for this root? (git repo + remote + auto on)
 pub fn sync_active(root: &Path) -> bool {
     if !is_git_repo(root) {
@@ -111,6 +151,34 @@ pub fn sync_active(root: &Path) -> bool {
     }
     let auto = Project::open(root).map(|p| sync_auto(&p)).unwrap_or(true);
     auto && remote_and_branch(root).0.is_some()
+}
+
+/// How long a [`sync_active`] answer stays good for in [`engine_loop`]'s
+/// hot path.
+const SYNC_ACTIVE_TTL: Duration = Duration::from_secs(30);
+
+/// [`sync_active`] spawns two `git` processes (`remote` + `rev-parse`), so
+/// calling it once per watcher event is far more expensive than it looks:
+/// a workspace ingesting several git-backed members produces a continuous
+/// stream of `Msg::Changed`, and each one became two process spawns per
+/// member. Whether a repo has a remote and auto-sync on changes on a human
+/// timescale, so the answer is cached for `SYNC_ACTIVE_TTL`.
+///
+/// `force` bypasses the cache for the two explicit user-driven messages
+/// (`PullNow`/`SyncNow`), which are throttled/rare and where acting on a
+/// half-minute-old answer would be visibly wrong — e.g. right after the
+/// user adds a remote and hits Sync now.
+fn sync_active_cached(root: &Path, cache: &mut Option<(Instant, bool)>, force: bool) -> bool {
+    if !force {
+        if let Some((at, active)) = *cache {
+            if at.elapsed() < SYNC_ACTIVE_TTL {
+                return active;
+            }
+        }
+    }
+    let active = sync_active(root);
+    *cache = Some((Instant::now(), active));
+    active
 }
 
 /// Idempotently keep Ken's transient files out of the repo via
@@ -429,8 +497,8 @@ impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
             binary: None,
-            pull_throttle: Duration::from_secs(60),
-            push_debounce: Duration::from_secs(30),
+            pull_throttle: Duration::from_secs(DEFAULT_PULL_THROTTLE_SECS),
+            push_debounce: Duration::from_secs(DEFAULT_PUSH_DEBOUNCE_SECS),
             draft_timeout: Duration::from_secs(5 * 60),
         }
     }
@@ -533,19 +601,22 @@ fn engine_loop(
 
     let mut last_pull: Option<Instant> = None;
     let mut next_push: Option<Instant> = None;
+    // See `sync_active_cached` — without this, every watcher event costs two
+    // `git` spawns.
+    let mut active_cache: Option<(Instant, bool)> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Msg::PullNow) => {
                 let throttled =
                     last_pull.is_some_and(|t| t.elapsed() < cfg.pull_throttle);
-                if sync_active(&root) && !throttled {
+                if sync_active_cached(&root, &mut active_cache, true) && !throttled {
                     last_pull = Some(Instant::now());
                     cycle(&root, &mut db, &draft_tx, &cfg, &notify, true);
                 }
             }
             Ok(Msg::SyncNow) => {
-                if sync_active(&root) {
+                if sync_active_cached(&root, &mut active_cache, true) {
                     last_pull = Some(Instant::now());
                     next_push = None;
                     cycle(&root, &mut db, &draft_tx, &cfg, &notify, true);
@@ -555,7 +626,7 @@ fn engine_loop(
             }
             Ok(Msg::Changed(paths)) => {
                 detect_conflicted_copies(&root, &mut db, &paths, &notify);
-                if sync_active(&root) {
+                if sync_active_cached(&root, &mut active_cache, false) {
                     // Earliest deadline wins.
                     next_push.get_or_insert(Instant::now() + cfg.push_debounce);
                 }
@@ -566,7 +637,7 @@ fn engine_loop(
 
         if next_push.is_some_and(|t| t <= Instant::now()) {
             next_push = None;
-            if sync_active(&root) {
+            if sync_active_cached(&root, &mut active_cache, false) {
                 cycle(&root, &mut db, &draft_tx, &cfg, &notify, false);
             }
         }
@@ -1053,6 +1124,83 @@ mod tests {
             .extra
             .insert("sync".into(), json!({"auto": false}));
         assert!(!sync_auto(&p));
+    }
+
+    /// The `sync` block drives the engine's timers, and an absent block
+    /// means the defaults — notably a one-hour auto-commit debounce, not the
+    /// half-minute that used to commit work mid-edit.
+    #[test]
+    fn sync_config_reads_the_project_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(60 * 60));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(60));
+
+        p.config.extra.insert(
+            "sync".into(),
+            json!({"auto": true, "pushDebounceSecs": 300, "pullThrottleSecs": 15}),
+        );
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(300));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(15));
+    }
+
+    /// A zero or malformed interval must fall back to the default rather
+    /// than degenerate into committing on every change batch.
+    #[test]
+    fn sync_config_rejects_nonsense_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.extra.insert(
+            "sync".into(),
+            json!({"pushDebounceSecs": 0, "pullThrottleSecs": "soon"}),
+        );
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(60 * 60));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(60));
+    }
+
+    /// The watcher hot path must not re-spawn `git` per event. Primed with
+    /// an answer that contradicts reality (`true` for a folder that is not a
+    /// repo at all), an unforced call must return the cached value — proving
+    /// it never recomputed — while a forced call recomputes and corrects the
+    /// cache.
+    #[test]
+    fn sync_active_cached_reuses_its_answer_until_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut cache = Some((Instant::now(), true));
+        assert!(
+            sync_active_cached(root, &mut cache, false),
+            "an unforced call within the TTL must reuse the cached answer"
+        );
+
+        assert!(
+            !sync_active_cached(root, &mut cache, true),
+            "a forced call must recompute — this folder is not a git repo"
+        );
+        assert_eq!(
+            cache.map(|(_, active)| active),
+            Some(false),
+            "the recomputed answer must replace the stale cache"
+        );
+
+        // And the corrected answer is now itself cached.
+        assert!(!sync_active_cached(root, &mut cache, false));
+    }
+
+    /// An expired entry must be re-derived rather than trusted forever.
+    #[test]
+    fn sync_active_cached_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = Some((Instant::now() - SYNC_ACTIVE_TTL - Duration::from_secs(1), true));
+        assert!(
+            !sync_active_cached(dir.path(), &mut cache, false),
+            "past the TTL the stale `true` must not survive"
+        );
     }
 
     fn wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {

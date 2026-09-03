@@ -1,5 +1,6 @@
 // Live recording state (Svelte 5 runes). One recorder at a time.
 import { api, type AudioDevice, type ModelStatus, type PermissionStatus, type RecordPhase } from "./api";
+import { forFocused } from "./app.svelte";
 
 class RecordStore {
   phase = $state<RecordPhase>("idle");
@@ -81,6 +82,7 @@ class RecordStore {
       if (this.storage !== "audio") this.transcribing = true;
     });
     await api.onTranscriptProgress((ev) => {
+      if (!forFocused(ev.project_id)) return;
       // Recording docs land under Recordings/; that prefix keeps a concurrent
       // video transcription from driving this bar.
       if (this.transcribing && ev.relPath.startsWith("Recordings/")) {

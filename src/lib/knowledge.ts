@@ -1,7 +1,34 @@
 // Pure helpers behind the knowledge views: the deterministic map
 // layout (no physics, no stored positions) and safe match highlighting
 // for the timeline search.
-import type { EntityEdge, EntityRow } from "./api";
+import type { EntityRow } from "./api";
+
+export type EntityKind = EntityRow["kind"];
+
+/** The minimal node shape the Map's layout/view logic needs — structurally
+ *  matches `EntityRow`, so per-project data satisfies it with zero changes.
+ *  This is `MapScreen`'s data-source seam (federated-kg task 3.2): workspace
+ *  mode feeds it global entities (same `kind` set, per proposal.md), which
+ *  have no `sources` (they use `doc_pointers` in the wiki panel instead), so
+ *  `sources` stays optional here. */
+export interface MapEntity {
+  id: number;
+  kind: EntityKind;
+  name: string;
+  summary: string;
+  sources?: string[];
+}
+
+/** The minimal edge shape the Map's layout/view logic needs — identical to
+ *  `EntityEdge`'s own fields, kept as a separate structural type so callers
+ *  outside the knowledge-model domain (workspace-KG global edges) don't need
+ *  to import `EntityEdge` itself. */
+export interface MapEdgeInput {
+  id: number;
+  a: number;
+  b: number;
+  label: string;
+}
 
 export type MapRing = "primary" | "inner" | "outer" | "unconnected";
 
@@ -34,8 +61,8 @@ const CY = 46;
  * name, so the same model always draws the same picture.
  */
 export function layoutMap(
-  entities: EntityRow[],
-  edges: EntityEdge[],
+  entities: MapEntity[],
+  edges: MapEdgeInput[],
 ): Map<number, MapNode> {
   const out = new Map<number, MapNode>();
   if (entities.length === 0) return out;
@@ -66,9 +93,9 @@ export function layoutMap(
     }
   }
 
-  const inner: EntityRow[] = [];
-  const outer: EntityRow[] = [];
-  const unconnected: EntityRow[] = [];
+  const inner: MapEntity[] = [];
+  const outer: MapEntity[] = [];
+  const unconnected: MapEntity[] = [];
   for (const e of entities) {
     if (primary && e.id === primary.id) continue;
     if ((degree.get(e.id) ?? 0) === 0) unconnected.push(e);
@@ -88,7 +115,7 @@ export function layoutMap(
 /** Even spacing around an ellipse, hash-ordered and hash-jittered. */
 function placeRing(
   out: Map<number, MapNode>,
-  nodes: EntityRow[],
+  nodes: MapEntity[],
   ring: MapRing,
   rx: number,
   ry: number,
@@ -114,8 +141,6 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-export type EntityKind = EntityRow["kind"];
-
 /** Per-node display state the Map renders from — the declutter decision. */
 export interface NodeView {
   /** Rendered at all. A kind filter is the only thing that hides a node. */
@@ -129,8 +154,8 @@ export interface NodeView {
 }
 
 export interface MapViewInput {
-  entities: EntityRow[];
-  edges: EntityEdge[];
+  entities: MapEntity[];
+  edges: MapEdgeInput[];
   /** Free-text search over name + summary; empty means no search. */
   query: string;
   /** Kinds to keep; empty array means all kinds. */
@@ -147,8 +172,8 @@ export interface MapViewInput {
 
 /** Undirected adjacency over entities present in the model. */
 export function adjacency(
-  entities: EntityRow[],
-  edges: EntityEdge[],
+  entities: MapEntity[],
+  edges: MapEdgeInput[],
 ): Map<number, Set<number>> {
   const ids = new Set(entities.map((e) => e.id));
   const adj = new Map<number, Set<number>>();

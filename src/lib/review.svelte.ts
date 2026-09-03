@@ -12,6 +12,7 @@ import {
   type InboxItem,
   type InboxKind,
 } from "./api";
+import { forFocused } from "./app.svelte";
 
 /** Actions the detail pane offers, derived from item kind. */
 export type InboxAction =
@@ -207,8 +208,12 @@ class ReviewStore {
     if (this.subscribed) return;
     this.subscribed = true;
     this.unlisteners = await Promise.all([
-      api.onIngestRunChanged(() => this.scheduleRefresh()),
-      api.onIndexUpdated(() => this.scheduleRefresh()),
+      api.onIngestRunChanged((ev) => {
+        if (forFocused(ev.project_id)) this.scheduleRefresh();
+      }),
+      api.onIndexUpdated((stats) => {
+        if (forFocused(stats.project_id)) this.scheduleRefresh();
+      }),
       api.onReviewChanged(() => this.scheduleRefresh()),
     ]);
     await this.refresh();

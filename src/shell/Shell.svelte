@@ -9,11 +9,13 @@
   import FilesScreen from "../screens/FilesScreen.svelte";
   import ReviewScreen from "../screens/ReviewScreen.svelte";
   import IngestsScreen from "../screens/IngestsScreen.svelte";
+  import TasksScreen from "../screens/TasksScreen.svelte";
   import MapScreen from "../screens/MapScreen.svelte";
   import TimelineScreen from "../screens/TimelineScreen.svelte";
   import RecordScreen from "../screens/RecordScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
   import { SvelteSet } from "svelte/reactivity";
+
 
   // Screens the user has actually opened this session (home is always live).
   const visited = new SvelteSet<string>();
@@ -27,6 +29,10 @@
       app.searchOpen = !app.searchOpen;
     } else if (e.key === "Escape" && app.searchOpen) {
       app.searchOpen = false;
+    } else if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "p" && app.workspace) {
+      // Cycle the focused workspace member (workspace task 4.3).
+      e.preventDefault();
+      void app.cycleFocusedMember();
     }
   }
 </script>
@@ -50,6 +56,9 @@
       {/if}
       {#if visited.has("ingests")}
         <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
+      {/if}
+      {#if visited.has("tasks")}
+        <div class="pane" hidden={app.screen !== "tasks"}><TasksScreen /></div>
       {/if}
       {#if visited.has("map")}
         <div class="pane" hidden={app.screen !== "map"}><MapScreen /></div>

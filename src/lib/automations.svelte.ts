@@ -2,6 +2,7 @@
 // events. Fed by list/get commands + the shared ingest-run-changed event,
 // filtered to kind==="automation" (ingest-kind events route to ingests.svelte).
 import { api, type Automation, type AutomationDetail, type IngestEvent } from "./api";
+import { forFocused } from "./app.svelte";
 
 const TERMINAL = new Set(["fresh", "failed", "discarded", "cancelled"]);
 
@@ -29,6 +30,7 @@ class AutomationsStore {
 
   private async onEvent(ev: IngestEvent) {
     if (!routesToAutomation(ev)) return;
+    if (!forFocused(ev.project_id)) return;
     this.live = { ...this.live, [ev.slug]: ev };
     if (TERMINAL.has(ev.status)) {
       await this.refresh();

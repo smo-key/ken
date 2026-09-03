@@ -2,16 +2,71 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { knowledge } from "../lib/knowledge.svelte";
+  import { memberColor, workspaceKg } from "../lib/workspaceKg.svelte";
   import {
     computeMapView,
     layoutMap,
     type EntityKind,
+    type MapEdgeInput,
+    type MapEntity,
     type MapNode,
     type NodeView,
   } from "../lib/knowledge";
-  import type { EntityRow } from "../lib/api";
+  import EntityWikiPanel from "./EntityWikiPanel.svelte";
 
-  onMount(() => void knowledge.visit());
+  // Data-source seam (federated-kg task 3.2): omitted props reproduce
+  // today's per-project Map byte-for-byte (fed from `knowledge.model`).
+  // Passing `entities`/`edges` (+ optionally `colorOf`/`badgeOf`/`onSelect`)
+  // feeds the same layout/render pipeline from elsewhere — e.g. this
+  // screen's own Workspace mode below, which exercises the seam on itself
+  // rather than through a separate mount point (task 3.3: "gate it inside
+  // the existing Map screen ... rather than inventing new navigation").
+  let {
+    entities: injectedEntities,
+    edges: injectedEdges,
+    colorOf,
+    badgeOf,
+    onSelect,
+    hideChrome = false,
+  }: {
+    entities?: MapEntity[];
+    edges?: MapEdgeInput[];
+    /** Overrides the kind-based node color with a CSS color value; return
+     *  undefined to leave that node at its default kind color. */
+    colorOf?: (entity: MapEntity) => string | undefined;
+    /** Small pill rendered on a node, e.g. a multi-member badge. */
+    badgeOf?: (entity: MapEntity) => string | null;
+    onSelect?: (id: number | null) => void;
+    /** Suppresses the per-project-only chrome (empty state, Deep rebuild,
+     *  build-status overlay, built-in detail panel) — the caller owns all
+     *  of that instead. Default false preserves today's screen unchanged. */
+    hideChrome?: boolean;
+  } = $props();
+
+  /** This screen's own Workspace mode (federated-kg task 3.3), visible only
+   *  once the `federatedKg` flag resolves on — never shown, and never
+   *  entered, otherwise, so the per-project path is untouched with the
+   *  flag off (task 4.1's "visually unchanged"). Only meaningful for the
+   *  screen's own top-level mount (`hideChrome` false); a caller that
+   *  already injects `entities` owns its own mode entirely. */
+  let workspaceMode = $state(false);
+
+  function setMode(mode: "project" | "workspace") {
+    const next = mode === "workspace";
+    if (next === workspaceMode) return;
+    workspaceMode = next;
+    selected = null;
+    if (next) {
+      void workspaceKg.refreshOverview();
+      if (workspaceKg.searchQuery) void workspaceKg.search(workspaceKg.searchQuery);
+    }
+  }
+
+  onMount(() => {
+    if (hideChrome) return;
+    void knowledge.visit();
+    void workspaceKg.init();
+  });
 
   // Fixed-size world in px: nodes are placed inside it and the whole
   // layer is panned+scaled with a single transform. layoutMap gives %
@@ -37,8 +92,54 @@
   ];
 
   const model = $derived(knowledge.model);
+
+  // The seam (task 3.2): an injected `entities`/`edges` prop wins; failing
+  // that, this screen's own Workspace mode (task 3.3) feeds the explored
+  // workspace-KG subgraph; failing that, today's per-project model — so
+  // omitting every prop with the toggle never switched reproduces the
+  // original per-project-only screen exactly.
+  const activeEntities = $derived<MapEntity[]>(
+    injectedEntities ?? (workspaceMode ? [...workspaceKg.nodes.values()] : (model?.entities ?? [])),
+  );
+  const activeEdges = $derived<MapEdgeInput[]>(
+    injectedEdges ?? (workspaceMode ? [...workspaceKg.edges.values()] : (model?.edges ?? [])),
+  );
+  const activeColorOf = $derived(
+    colorOf ?? (workspaceMode ? (e: MapEntity) => wsColorOf(e) : undefined),
+  );
+  const activeBadgeOf = $derived(
+    badgeOf ?? (workspaceMode ? (e: MapEntity) => wsBadgeOf(e) : undefined),
+  );
+  const activeOnSelect = $derived(
+    onSelect ??
+      (workspaceMode
+        ? (id: number | null) => {
+            if (id === null) workspaceKg.deselect();
+            else void workspaceKg.select(id);
+          }
+        : undefined),
+  );
+
+  /** Member-hue color for a node (federated-kg task 3.3): the first member
+   *  its doc pointers touch, stable-hashed to a hue. Stub / unopened nodes
+   *  have no pointer data yet, so they fall back to the default kind color
+   *  (`colorOf` returning undefined leaves `--k` at its CSS class value). */
+  function wsColorOf(entity: MapEntity): string | undefined {
+    const members = workspaceKg.memberIdsOf(entity.id);
+    return members[0] ? memberColor(members[0]) : undefined;
+  }
+
+  /** "×N" badge when a global entity's doc pointers touch more than one
+   *  member (task 3.3: "multi-member badges"). */
+  function wsBadgeOf(entity: MapEntity): string | null {
+    const members = workspaceKg.memberIdsOf(entity.id);
+    return members.length > 1 ? `×${members.length}` : null;
+  }
+
+  const showChrome = $derived(!hideChrome);
+
   const nodes = $derived<Map<number, MapNode>>(
-    model ? layoutMap(model.entities, model.edges) : new Map(),
+    layoutMap(activeEntities, activeEdges),
   );
 
   let selected = $state<number | null>(null);
@@ -61,26 +162,31 @@
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   function onQueryInput() {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => (query = rawQuery), 120);
+    debounceTimer = setTimeout(() => {
+      query = rawQuery;
+      // In Workspace mode the query also drives a server-side search that
+      // seeds new nodes into the explored subgraph (no "list all" command
+      // exists — see `workspaceKg.svelte.ts`); the client-side highlight
+      // below still runs over whatever is currently loaded either way.
+      if (workspaceMode) void workspaceKg.search(rawQuery);
+    }, 120);
   }
 
   const view = $derived<Map<number, NodeView>>(
-    model
-      ? computeMapView({
-          entities: model.entities,
-          edges: model.edges,
-          query,
-          kinds: [...activeKinds],
-          selected,
-          hovered,
-          showAllLabels: scale >= LABEL_ALL_SCALE,
-          prominentCount: PROMINENT_LABELS,
-        })
-      : new Map(),
+    computeMapView({
+      entities: activeEntities,
+      edges: activeEdges,
+      query,
+      kinds: [...activeKinds],
+      selected,
+      hovered,
+      showAllLabels: scale >= LABEL_ALL_SCALE,
+      prominentCount: PROMINENT_LABELS,
+    }),
   );
 
   const drawnEdges = $derived(
-    (model?.edges ?? []).flatMap((e) => {
+    activeEdges.flatMap((e) => {
       const a = nodes.get(e.a);
       const b = nodes.get(e.b);
       const va = view.get(e.a);
@@ -93,20 +199,22 @@
     }),
   );
 
-  const selectedEntity = $derived<EntityRow | null>(
+  const selectedEntity = $derived<MapEntity | null>(
     selected !== null
-      ? (model?.entities.find((e) => e.id === selected) ?? null)
+      ? (activeEntities.find((e) => e.id === selected) ?? null)
       : null,
   );
 
-  // The selected node's relationships, ready for the detail panel.
+  // The selected node's relationships, ready for the per-project detail
+  // panel (Workspace mode gets its full wiki page from `workspaceKg`
+  // instead — see `EntityWikiPanel` below).
   const connections = $derived(
-    selected === null || !model
+    selected === null
       ? []
-      : model.edges.flatMap((e) => {
+      : activeEdges.flatMap((e) => {
           const otherId = e.a === selected ? e.b : e.b === selected ? e.a : null;
           if (otherId === null) return [];
-          const other = model.entities.find((x) => x.id === otherId);
+          const other = activeEntities.find((x) => x.id === otherId);
           return other ? [{ other, label: e.label }] : [];
         }),
   );
@@ -226,22 +334,32 @@
     panning = false;
     (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     // A click on the background (no drag) deselects.
-    if (!wasDrag) selected = null;
+    if (!wasDrag) {
+      selected = null;
+      activeOnSelect?.(null);
+    }
   }
 
-  // Click a node → select it and glide the pan so it sits centred (scale
-  // preserved). The transition runs because panning is off here.
-  function focusNode(entity: EntityRow) {
-    const node = nodes.get(entity.id);
-    if (!node) return;
-    selected = entity.id;
-    panning = false;
-    panX = canvasW / 2 - worldX(node.xPct) * scale;
-    panY = canvasH / 2 - worldY(node.yPct) * scale;
+  // Select by id and glide the pan so it sits centred (scale preserved) —
+  // shared by clicking a node and following an in-panel wiki link
+  // (`EntityWikiPanel`'s out-/back-links), so both land on the same node.
+  function focusById(id: number) {
+    selected = id;
+    const node = nodes.get(id);
+    if (node) {
+      panning = false; // the transition runs because panning is off here
+      panX = canvasW / 2 - worldX(node.xPct) * scale;
+      panY = canvasH / 2 - worldY(node.yPct) * scale;
+    }
+    activeOnSelect?.(id);
   }
 
-  function nodeTitle(entity: EntityRow): string {
-    const where = entity.sources[0] ? ` — ${entity.sources[0]}` : "";
+  function focusNode(entity: MapEntity) {
+    focusById(entity.id);
+  }
+
+  function nodeTitle(entity: MapEntity): string {
+    const where = entity.sources?.[0] ? ` — ${entity.sources[0]}` : "";
     return `${entity.summary || entity.name}${where}`;
   }
 
@@ -255,7 +373,7 @@
 </script>
 
 <div class="screen">
-  {#if knowledge.empty}
+  {#if !workspaceMode && showChrome && knowledge.empty}
     <div class="empty">
       {#if knowledge.error}
         <div class="error">Last rebuild didn't finish — {knowledge.error}</div>
@@ -280,7 +398,7 @@
         {/if}
       </div>
     </div>
-  {:else if model}
+  {:else if workspaceMode || hideChrome || model}
     <div
       class="canvas"
       class:grabbing={panning}
@@ -321,9 +439,10 @@
             </line>
           {/each}
         </svg>
-        {#each model.entities as entity (entity.id)}
+        {#each activeEntities as entity (entity.id)}
           {@const node = nodes.get(entity.id)}
           {@const nv = view.get(entity.id)}
+          {@const badge = activeBadgeOf?.(entity)}
           {#if node && nv && nv.visible}
             <button
               class="node kind-{entity.kind} {node.ring}"
@@ -334,6 +453,7 @@
               class:selected={selected === entity.id}
               style:left="{worldX(node.xPct)}px"
               style:top="{worldY(node.yPct)}px"
+              style:--k={activeColorOf?.(entity)}
               title={nodeTitle(entity)}
               onpointerdown={(e) => e.stopPropagation()}
               onpointerenter={() => (hovered = entity.id)}
@@ -345,17 +465,28 @@
             >
               <span class="tag" aria-hidden="true"></span>
               {#if nv.labeled}<span class="node-name">{entity.name}</span>{/if}
+              {#if badge}<span class="node-badge">{badge}</span>{/if}
             </button>
           {/if}
         {/each}
       </div>
 
       <div class="toolbar">
+        {#if !hideChrome && workspaceKg.enabled}
+          <div class="mode-toggle" role="group" aria-label="Map scope">
+            <button class="chip" class:on={!workspaceMode} onclick={() => setMode("project")}>
+              This project
+            </button>
+            <button class="chip" class:on={workspaceMode} onclick={() => setMode("workspace")}>
+              Workspace
+            </button>
+          </div>
+        {/if}
         <input
           class="search"
           type="search"
-          placeholder="Search the map…"
-          aria-label="Search the map"
+          placeholder={workspaceMode ? "Search the workspace…" : "Search the map…"}
+          aria-label={workspaceMode ? "Search the workspace" : "Search the map"}
           bind:value={rawQuery}
           oninput={onQueryInput}
         />
@@ -379,30 +510,91 @@
         <button class="btn btn-small" title="Fit to view" aria-label="Fit to view" onclick={zoomToFit}>Fit</button>
       </div>
 
-      {#if knowledge.llmPaused}
-        <div class="status-overlay">{knowledge.llmNotice}</div>
-      {:else if knowledge.coverage}
-        <div class="status-overlay" class:pulse={knowledge.coverage.analyzed < knowledge.coverage.total}>
-          {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed{#if knowledge.coverage.failed > 0}<span class="muted"> · {knowledge.coverage.failed} failed</span>{/if}
-        </div>
-      {:else if knowledge.building}
-        <div class="status-overlay pulse">Deep rebuild in progress…</div>
-      {:else if knowledge.error}
-        <div class="status-overlay error">Last rebuild didn't finish — {knowledge.error}</div>
+      {#if workspaceMode}
+        {#if workspaceKg.buildState?.state === "building"}
+          <div class="status-overlay pulse">
+            Rebuilding the workspace graph… ({workspaceKg.buildState.total} member{workspaceKg.buildState.total === 1 ? "" : "s"})
+          </div>
+        {:else if workspaceKg.buildState?.state === "unavailable"}
+          <div class="status-overlay error">Workspace graph build didn't finish — {workspaceKg.buildState.reason}</div>
+        {:else if workspaceKg.overview}
+          <div class="status-overlay">
+            {workspaceKg.overview.globalEntities} entities · {workspaceKg.overview.edges} edges
+            {#if workspaceKg.overview.members.some((m) => m.stale)}
+              <span class="muted"> · {workspaceKg.overview.members.filter((m) => m.stale).length} member(s) stale</span>
+            {/if}
+          </div>
+        {/if}
+        {#if workspaceKg.overview && workspaceKg.overview.members.length > 0}
+          <div class="ws-legend">
+            {#each workspaceKg.overview.members as m (m.projectId)}
+              <span
+                class="ws-legend-item"
+                class:stale={m.stale}
+                title={m.stale ? `${m.name} — stale, next rebuild re-reads it` : m.name}
+              >
+                <span class="ws-legend-dot" style:background={memberColor(m.projectId)}></span>
+                {m.name}
+              </span>
+            {/each}
+          </div>
+        {/if}
+        {#if activeEntities.length === 0 && workspaceKg.buildState?.state !== "building"}
+          <div class="ws-hint">
+            Search above to explore the workspace graph — entities and their links appear as you go.
+          </div>
+        {/if}
+      {:else if !hideChrome}
+        {#if knowledge.llmPaused}
+          <div class="status-overlay">{knowledge.llmNotice}</div>
+        {:else if knowledge.coverage}
+          <div class="status-overlay" class:pulse={knowledge.coverage.analyzed < knowledge.coverage.total}>
+            {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed{#if knowledge.coverage.failed > 0}<span class="muted"> · {knowledge.coverage.failed} failed</span>{/if}
+          </div>
+        {:else if knowledge.building}
+          <div class="status-overlay pulse">Deep rebuild in progress…</div>
+        {:else if knowledge.error}
+          <div class="status-overlay error">Last rebuild didn't finish — {knowledge.error}</div>
+        {/if}
       {/if}
 
-      <div class="rebuild">
-        <button
-          class="btn btn-small"
-          title="Rebuild the whole map with a deeper, curated pass (uses Claude)"
-          disabled={knowledge.building || !knowledge.claudeFound}
-          onclick={() => void knowledge.refresh()}
-        >
-          Deep rebuild
-        </button>
-      </div>
+      {#if !hideChrome}
+        <div class="rebuild">
+          {#if workspaceMode}
+            <button
+              class="btn btn-small"
+              title="Re-federate the workspace graph from every open member"
+              disabled={workspaceKg.buildState?.state === "building"}
+              onclick={() => void workspaceKg.rebuild()}
+            >
+              Rebuild workspace graph
+            </button>
+          {:else}
+            <button
+              class="btn btn-small"
+              title="Rebuild the whole map with a deeper, curated pass (uses Claude)"
+              disabled={knowledge.building || !knowledge.claudeFound}
+              onclick={() => void knowledge.refresh()}
+            >
+              Deep rebuild
+            </button>
+          {/if}
+        </div>
+      {/if}
 
-      {#if selectedEntity}
+      {#if workspaceMode}
+        {#if workspaceKg.selectedId !== null}
+          <div class="detail">
+            <EntityWikiPanel
+              entity={workspaceKg.selectedEntity}
+              loading={workspaceKg.selectedLoading}
+              error={workspaceKg.selectedError}
+              overview={workspaceKg.overview}
+              onNavigate={focusById}
+            />
+          </div>
+        {/if}
+      {:else if !hideChrome && selectedEntity}
         <div class="detail">
           <div class="detail-head">
             <span class="tag kind-{selectedEntity.kind}" aria-hidden="true"></span>
@@ -428,7 +620,7 @@
               </ul>
             </div>
           {/if}
-          {#if selectedEntity.sources.length > 0}
+          {#if selectedEntity.sources && selectedEntity.sources.length > 0}
             <div class="detail-sources">
               {#each selectedEntity.sources as source (source)}
                 <button
@@ -555,6 +747,26 @@
     z-index: 3;
     box-shadow: 0 0 0 2px var(--accent), var(--shadow-card);
   }
+  /* Multi-member badge (federated-kg task 3.3): a small pill riding the
+     node's corner, independent of the kind/member color underneath. */
+  .node-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--surface);
+    box-shadow: var(--shadow-card);
+  }
+
+  .mode-toggle {
+    display: flex;
+    gap: 4px;
+  }
 
   .toolbar {
     position: absolute;
@@ -655,6 +867,55 @@
   /* The failed tally rides alongside the coverage count as a quiet aside. */
   .status-overlay .muted {
     color: var(--ink-tertiary);
+  }
+
+  /* Member legend (federated-kg task 3.3): stacks below the rebuild
+     button + status overlay, which already occupy the top-left corner. */
+  .ws-legend {
+    position: absolute;
+    top: 92px;
+    left: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-width: 220px;
+  }
+  .ws-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--ink-secondary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ws-legend-item.stale {
+    color: var(--needs-input);
+    border-color: color-mix(in srgb, var(--needs-input) 45%, var(--border));
+  }
+  .ws-legend-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .ws-hint {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    max-width: 320px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--ink-tertiary);
+    pointer-events: none;
   }
 
   .detail {

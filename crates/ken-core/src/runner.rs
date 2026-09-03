@@ -56,29 +56,57 @@ impl CancelToken {
     }
 }
 
+/// File names to try for the claude CLI in a given directory, most-preferred
+/// first.
+///
+/// On Windows `npm install -g` drops THREE launchers side by side: `claude`
+/// (a `#!/bin/sh` script for Git Bash), `claude.cmd`, and `claude.ps1`. Only
+/// the `.cmd` is runnable by `CreateProcess`; handing it the extensionless
+/// one fails at spawn with "%1 is not a valid Win32 application" (os error
+/// 193) — and `is_executable` can't catch that, since on Windows it is just
+/// an `is_file` check and the shell script is very much a file. So the bare
+/// name must be tried LAST here rather than first.
+///
+/// `.cmd` is safe to hand to `std::process::Command`: since the fix for
+/// CVE-2024-24576, std routes `.bat`/`.cmd` through `cmd.exe` with its own
+/// argument escaping rather than refusing them.
+#[cfg(windows)]
+const CLAUDE_NAMES: &[&str] = &["claude.cmd", "claude.exe", "claude.bat", "claude"];
+#[cfg(not(windows))]
+const CLAUDE_NAMES: &[&str] = &["claude"];
+
 /// Find the claude CLI: PATH first, then the usual install locations that
 /// GUI apps' skinny PATH misses.
 pub fn discover_claude() -> Option<PathBuf> {
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("claude");
-            if is_executable(&candidate) {
-                return Some(candidate);
+            if let Some(found) = first_runnable(&dir) {
+                return Some(found);
             }
         }
     }
     let home = dirs::home_dir()?;
-    for candidate in [
-        home.join(".local/bin/claude"),
-        home.join(".claude/local/claude"),
-        PathBuf::from("/opt/homebrew/bin/claude"),
-        PathBuf::from("/usr/local/bin/claude"),
-    ] {
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
+    let mut fallbacks = vec![
+        home.join(".local/bin"),
+        home.join(".claude/local"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ];
+    // Ken launches as a GUI app, whose PATH routinely misses npm's global
+    // bin — the very place the CLI lands on Windows.
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        fallbacks.push(PathBuf::from(appdata).join("npm"));
     }
-    None
+    fallbacks.iter().find_map(|dir| first_runnable(dir))
+}
+
+/// The first [`CLAUDE_NAMES`] entry in `dir` that exists and looks runnable.
+fn first_runnable(dir: &Path) -> Option<PathBuf> {
+    CLAUDE_NAMES.iter().find_map(|name| {
+        let candidate = dir.join(name);
+        is_executable(&candidate).then_some(candidate)
+    })
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -685,6 +713,45 @@ mod tests {
     use super::test_support::write_fake_claude;
     use super::*;
     use crate::hooks::{install_hooks, HookListener};
+
+    /// The exact layout `npm install -g @anthropic-ai/claude-code` leaves on
+    /// Windows: an extensionless `#!/bin/sh` launcher beside `claude.cmd`.
+    /// Picking the former is what produced "%1 is not a valid Win32
+    /// application (os error 193)" when the morning digest tried to run.
+    #[test]
+    #[cfg(windows)]
+    fn windows_discovery_prefers_the_cmd_over_npms_shell_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("claude"), "#!/bin/sh\nexec node foo\n").unwrap();
+        std::fs::write(dir.path().join("claude.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("claude.ps1"), "# ps\n").unwrap();
+
+        let found = first_runnable(dir.path()).expect("a launcher is present");
+        assert_eq!(
+            found.file_name().unwrap(),
+            "claude.cmd",
+            "the shell script cannot be spawned by CreateProcess"
+        );
+    }
+
+    /// With only the shell launcher present there is nothing better to
+    /// return, so discovery still yields it rather than reporting the CLI
+    /// missing — the spawn error is more informative than "not installed".
+    #[test]
+    #[cfg(windows)]
+    fn windows_discovery_falls_back_to_the_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("claude"), "#!/bin/sh\n").unwrap();
+        let found = first_runnable(dir.path()).expect("the bare name is a last resort");
+        assert_eq!(found.file_name().unwrap(), "claude");
+    }
+
+    /// An empty directory must not produce a candidate.
+    #[test]
+    fn discovery_skips_a_directory_with_no_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(first_runnable(dir.path()).is_none());
+    }
 
     fn setup(behavior: &str) -> (tempfile::TempDir, PathBuf, HookListener) {
         let dir = tempfile::tempdir().unwrap();

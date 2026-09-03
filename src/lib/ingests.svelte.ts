@@ -9,6 +9,7 @@ import {
   type LiveStatus,
   type RunRow,
 } from "./api";
+import { forFocused } from "./app.svelte";
 
 /** Run statuses that mean "the run is over". */
 const TERMINAL: LiveStatus[] = ["fresh", "failed", "discarded", "cancelled", "pending_approval"];
@@ -49,6 +50,7 @@ class IngestsStore {
   private async onEvent(ev: IngestEvent) {
     // Automation events share the channel but belong to the automations store.
     if (!routesToIngest(ev)) return;
+    if (!forFocused(ev.project_id)) return;
     // queued/waiting/running are non-terminal: keep the transient marker so the
     // detail pane can render the live caption; only TERMINAL drops it + refreshes.
     this.live = { ...this.live, [ev.slug]: ev };

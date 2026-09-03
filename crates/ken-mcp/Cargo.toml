@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ken-core = { path = "../ken-core" }
+ken-core = { path = "../ken-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

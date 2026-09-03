@@ -131,12 +131,36 @@ pub fn content_hash(text: &str) -> String {
 /// entities carry no sources (the merge attributes them to this file), and
 /// relations name entities by their display name.
 pub fn compose_file_prompt(rel_path: &str, text: &str, today: &str) -> String {
+    compose_file_prompt_with_addendum(rel_path, text, today, "")
+}
+
+/// Same as [`compose_file_prompt`], with an optional project-profiler
+/// addendum (design D3: `profiler::profile_prompt_addendum` — summary +
+/// focus hints, already capped at 500 chars) inserted into the fixed
+/// preamble so it counts against `EXTRACT_CHAR_BUDGET` like everything else
+/// in the prompt. An empty/blank `addendum` reproduces `compose_file_prompt`
+/// exactly byte-for-byte — this is how the profiler flag being off (or no
+/// profile existing) stays inert here: the caller simply never passes a
+/// non-empty addendum in that case, so nothing about this function's output
+/// changes.
+pub fn compose_file_prompt_with_addendum(
+    rel_path: &str,
+    text: &str,
+    today: &str,
+    addendum: &str,
+) -> String {
+    let addendum_block = if addendum.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", addendum.trim())
+    };
     // Budget the whole prompt, not just the body: the instructions must fit
     // "alongside" the document inside EXTRACT_CHAR_BUDGET. Build the fixed
     // preamble first, then let the body fill whatever characters remain.
     let head = format!(
         "You are Ken, extracting the knowledge in ONE document for a project's \
-Map and Timeline. Today's date is {today}.\n\n\
+Map and Timeline. Today's date is {today}.\n\
+{addendum_block}\n\
 Read the document below (path: {rel_path}) and output ONLY a JSON object — no \
 prose before or after, no code fences — shaped exactly like this:\n\
 {{\n\
@@ -380,6 +404,27 @@ pub fn extract_one<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    extract_one_with_addendum(db, rel_path, content_hash, today, at, generate, "")
+}
+
+/// Same as [`extract_one`], with an optional project-profiler prompt
+/// addendum (design D3) threaded into [`compose_file_prompt_with_addendum`].
+/// `addendum` is normally `profiler::profile_prompt_addendum(&profile)` when
+/// the `profiler` flag is on and a profile exists — an empty string (what
+/// [`extract_one`] always passes) reproduces the plain extraction path
+/// exactly, which is how flag-off/no-profile inertness holds here.
+pub fn extract_one_with_addendum<G>(
+    db: &mut Db,
+    rel_path: &str,
+    content_hash: &str,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+) -> Result<()>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let text = db.get_text(rel_path)?.unwrap_or_default();
     // An empty (or whitespace-only) file has nothing to extract — mark it done
     // and skip the generation. A blank `.md`, a stub, or a file whose extractor
@@ -389,7 +434,7 @@ where
         db.mark_extraction_done(rel_path, content_hash, at)?;
         return Ok(());
     }
-    let prompt = compose_file_prompt(rel_path, &text, today);
+    let prompt = compose_file_prompt_with_addendum(rel_path, &text, today, addendum);
     match generate(&prompt) {
         Ok(value) => {
             let delta = parse_delta_value(&value);
@@ -416,10 +461,25 @@ pub fn process_next_pending<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    process_next_pending_with_addendum(db, today, at, generate, "")
+}
+
+/// Same as [`process_next_pending`], threading an optional project-profiler
+/// addendum (design D3) through to [`extract_one_with_addendum`].
+pub fn process_next_pending_with_addendum<G>(
+    db: &mut Db,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+) -> Result<Option<String>>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let Some((rel_path, content_hash)) = db.next_pending_extraction()? else {
         return Ok(None);
     };
-    extract_one(db, &rel_path, &content_hash, today, at, generate)?;
+    extract_one_with_addendum(db, &rel_path, &content_hash, today, at, generate, addendum)?;
     Ok(Some(rel_path))
 }
 
@@ -733,6 +793,45 @@ mod tests {
     }
 
     #[test]
+    fn process_next_pending_with_addendum_reaches_the_generated_prompt() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("notes/kickoff.md", "md", 1, 1, "indexed", None, "We hired Priya.").unwrap();
+        db.enqueue_extraction_if_changed("notes/kickoff.md", &content_hash("We hired Priya.")).unwrap();
+        let seen_prompt = std::cell::RefCell::new(String::new());
+        let generate = |p: &str| -> Result<serde_json::Value> {
+            *seen_prompt.borrow_mut() = p.to_string();
+            Ok(serde_json::json!({"entities": [], "relations": [], "events": []}))
+        };
+        process_next_pending_with_addendum(
+            &mut db, "2026-07-14", 100, &generate, "Project summary: A billing tool.\nFocus areas: vendors",
+        )
+        .unwrap();
+        assert!(seen_prompt.borrow().contains("Project summary: A billing tool."));
+        assert!(seen_prompt.borrow().contains("Focus areas: vendors"));
+    }
+
+    #[test]
+    fn process_next_pending_with_empty_addendum_matches_plain_path() {
+        // Consumer inertness (project-profiler 1.6): the addendum-aware entry
+        // point called with "" must behave exactly like the plain one, so a
+        // caller that never resolves a profile (flag off, or none exists)
+        // gets byte-identical prompts either way.
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("notes/kickoff.md", "md", 1, 1, "indexed", None, "We hired Priya.").unwrap();
+        db.enqueue_extraction_if_changed("notes/kickoff.md", &content_hash("We hired Priya.")).unwrap();
+        let seen_prompt = std::cell::RefCell::new(String::new());
+        let generate = |p: &str| -> Result<serde_json::Value> {
+            *seen_prompt.borrow_mut() = p.to_string();
+            Ok(serde_json::json!({"entities": [], "relations": [], "events": []}))
+        };
+        process_next_pending_with_addendum(&mut db, "2026-07-14", 100, &generate, "").unwrap();
+        assert_eq!(
+            seen_prompt.into_inner(),
+            compose_file_prompt("notes/kickoff.md", "We hired Priya.", "2026-07-14")
+        );
+    }
+
+    #[test]
     fn empty_file_is_marked_done_without_generating() {
         let mut db = Db::open_in_memory().unwrap();
         // A blank file: whitespace-only extracted text.
@@ -773,6 +872,31 @@ mod tests {
         let p = compose_file_prompt("big.md", &big, "2026-07-14");
         // The document body is capped; the surrounding instructions are small.
         assert!(p.matches('x').count() <= EXTRACT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn compose_file_prompt_is_byte_identical_with_empty_addendum() {
+        // project-profiler D3: the profile addendum seam must be inert when
+        // there is nothing to add — the plain `compose_file_prompt` and the
+        // addendum variant called with "" must produce the exact same text.
+        let a = compose_file_prompt("notes/kickoff.md", "We hired Priya.", "2026-07-14");
+        let b = compose_file_prompt_with_addendum("notes/kickoff.md", "We hired Priya.", "2026-07-14", "");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compose_file_prompt_with_addendum_inserts_profile_context_within_budget() {
+        let addendum = "Project summary: A billing migration tool.\nFocus areas: vendors, cutover";
+        let p = compose_file_prompt_with_addendum(
+            "notes/kickoff.md",
+            "We hired Priya.",
+            "2026-07-14",
+            addendum,
+        );
+        assert!(p.contains("Project summary: A billing migration tool."));
+        assert!(p.contains("Focus areas: vendors, cutover"));
+        assert!(p.contains("notes/kickoff.md"));
+        assert!(p.chars().count() <= EXTRACT_CHAR_BUDGET);
     }
 
     #[test]

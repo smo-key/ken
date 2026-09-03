@@ -793,6 +793,7 @@ mod tests {
             name: "t".into(),
             id: uuid::Uuid::new_v4(),
             excluded: Vec::new(),
+            features: serde_json::Map::new(),
             extra: serde_json::Map::new(),
         };
         let project = Project { root: PathBuf::from("/tmp/x"), config: config.clone() };

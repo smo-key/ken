@@ -2,14 +2,35 @@
   import type { Component } from "svelte";
   import { app, type Screen } from "../lib/app.svelte";
   import { review } from "../lib/review.svelte";
+  import { tasksStore } from "../lib/tasks.svelte";
+  import { families } from "../lib/families.svelte";
+  import FamilyTray from "../family/FamilyTray.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
   import Files from "@lucide/svelte/icons/files";
   import SquareCheck from "@lucide/svelte/icons/square-check";
   import Layers from "@lucide/svelte/icons/layers";
+  import Kanban from "@lucide/svelte/icons/kanban";
   import Network from "@lucide/svelte/icons/network";
   import Clock from "@lucide/svelte/icons/clock";
   import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
+  import Bell from "@lucide/svelte/icons/bell";
+
+  let familyTrayOpen = $state(false);
+
+  // Resolve the `kenTasks` flag as soon as (and only once) a workspace is
+  // open — the Tasks tab requires both (proposal: "workspace mode + kenTasks
+  // flag on"). `tasksStore.init()` is idempotent, so this just no-ops on
+  // every re-run after the first successful check.
+  $effect(() => {
+    if (app.workspace) void tasksStore.init();
+  });
+
+  // ken-families task 4.2: the notification tray is a standalone
+  // collaboration bus (proposal: "works with no workspace open"), so unlike
+  // `tasksStore` above it resolves its flag once at nav-rail mount rather
+  // than waiting on a workspace.
+  void families.init();
 
   const items: { key: Screen; icon: Component; label: string }[] = [
     { key: "home", icon: LayoutGrid, label: "Home" },
@@ -23,6 +44,12 @@
 </script>
 
 <nav>
+  <!-- No project switcher here. It lives in the title bar
+       (`ProjectSwitcher.svelte`), which is where people reach for it and
+       which also owns rename/forget, open-a-folder, and the "All
+       projects" merged Files tree. A second selector in the rail framed
+       the whole app as being IN one project, which is what made Home read
+       as project-specific. Ctrl+P still cycles members. -->
   {#each items as item (item.key)}
     {@const Icon = item.icon}
     <button
@@ -41,6 +68,37 @@
       {/if}
     </button>
   {/each}
+  {#if app.workspace && tasksStore.enabled}
+    <button
+      class:active={app.screen === "tasks"}
+      onclick={() => (app.screen = "tasks")}
+      title="Tasks"
+    >
+      <span class="icon"><Kanban size={16} strokeWidth={1.75} /></span>Tasks
+      {#if tasksStore.board.needsAttention.length > 0}
+        <span class="count" title="{tasksStore.board.needsAttention.length} tasks need attention">
+          {tasksStore.board.needsAttention.length}
+        </span>
+      {/if}
+    </button>
+  {/if}
+  {#if families.enabled}
+    <button
+      class:active={familyTrayOpen}
+      onclick={() => (familyTrayOpen = !familyTrayOpen)}
+      title="Family inbox"
+    >
+      <span class="icon"><Bell size={16} strokeWidth={1.75} /></span>Families
+      {#if families.totalUnread > 0}
+        <span class="count" title="{families.totalUnread} unread family inbox items">
+          {families.totalUnread}
+        </span>
+      {/if}
+    </button>
+    {#if familyTrayOpen}
+      <FamilyTray close={() => (familyTrayOpen = false)} />
+    {/if}
+  {/if}
   <button
     class="settings"
     class:active={app.screen === "settings"}

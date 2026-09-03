@@ -2,6 +2,7 @@
 // model, whether a manual Deep rebuild is running, incremental coverage, and
 // whether the local model is available to keep extracting.
 import { api, type KnowledgeModel } from "./api";
+import { forFocused } from "./app.svelte";
 
 class KnowledgeStore {
   model = $state<KnowledgeModel | null>(null);
@@ -55,6 +56,7 @@ class KnowledgeStore {
     if (!this.initDone) {
       this.initDone = true;
       await api.onKnowledgeModelState((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.state === "building") {
           this.building = true;
           this.error = null;

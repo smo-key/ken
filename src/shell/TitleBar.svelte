@@ -14,7 +14,14 @@
 
   let switcherOpen = $state(false);
 
-  const initial = $derived(app.project?.name?.charAt(0).toUpperCase() ?? "?");
+  // In the merged Files tree the button names the mode, not a project —
+  // showing one member's name while the tree lists all of them is the
+  // kind of quiet mismatch that makes people distrust the control.
+  const showingAll = $derived(app.treeShowsAllProjects && !!app.workspace && app.screen === "files");
+  const initial = $derived(
+    showingAll ? "*" : (app.project?.name?.charAt(0).toUpperCase() ?? "?"),
+  );
+  const projectLabel = $derived(showingAll ? "All projects" : (app.project?.name ?? ""));
   const syncTitle = $derived.by(() => {
     if (app.scanError) return app.scanError;
     if (app.syncState === "attention")
@@ -44,7 +51,7 @@
 
   <button class="project" onclick={() => (switcherOpen = !switcherOpen)}>
     <span class="badge">{initial}</span>
-    {app.project?.name}
+    {projectLabel}
     <span
       class="dot"
       class:busy={app.scanning || app.syncState === "syncing"}

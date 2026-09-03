@@ -119,6 +119,27 @@
 
 <button class="scrim" onclick={close} aria-label="Close project switcher"></button>
 <div class="menu">
+  <!-- Files can show every member at once (`get_tree_all` returns the
+       whole workspace with each path prefixed by its member folder), so
+       the switcher offers it as a peer of the individual projects rather
+       than hiding it in a second control. Only on Files: the other
+       screens each draw one project's data. -->
+  {#if app.workspace && app.screen === "files"}
+    <button
+      class="row"
+      class:current={app.treeShowsAllProjects}
+      onclick={() => {
+        void app.setTreeShowsAllProjects(true);
+        close();
+      }}
+    >
+      <span class="badge">*</span>
+      <span class="info">
+        <span class="name">All projects</span>
+        <span class="path">Every project in this workspace, in one tree</span>
+      </span>
+    </button>
+  {/if}
   {#each app.registry as entry (entry.id)}
     <button
       class="row"
@@ -132,6 +153,8 @@
         // Neutralize the row action during rename so the popover stays open
         // and the space is typed into the input.
         if (renamingId === entry.id) return;
+        // Choosing one project leaves the merged tree behind.
+        if (app.treeShowsAllProjects) void app.setTreeShowsAllProjects(false);
         pick(entry.path, entry.available);
       }}
       oncontextmenu={(e) => rowMenu(e, entry)}

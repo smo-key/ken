@@ -7,7 +7,7 @@
   import Search from "@lucide/svelte/icons/search";
   import { api, type FileRow } from "../lib/api";
   import type { HydrationProgress } from "../lib/api";
-  import { app } from "../lib/app.svelte";
+  import { app, forFocused } from "../lib/app.svelte";
   import { find } from "../lib/find.svelte";
   import FindBar from "./FindBar.svelte";
   import { isEditable, timeAgo } from "../lib/format";
@@ -106,11 +106,14 @@
     // after it finishes.
     api
       .onHydrationProgress((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.relPath === relPath) hydration = ev;
       })
       .then((u) => (unlistenHydration = u));
     await load();
-    unlisten = await api.onIndexUpdated(() => void checkDisk());
+    unlisten = await api.onIndexUpdated((stats) => {
+      if (forFocused(stats.project_id)) void checkDisk();
+    });
   });
 
   async function load(forceCloudDownload = false) {

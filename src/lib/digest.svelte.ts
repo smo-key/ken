@@ -1,6 +1,7 @@
 // Today's-digest state for the Home card: the parsed row, whether a
 // generation is running, and whether Claude is around to write one.
 import { api, type DigestDto } from "./api";
+import { forFocused } from "./app.svelte";
 
 class DigestStore {
   digest = $state<DigestDto | null>(null);
@@ -15,6 +16,7 @@ class DigestStore {
       this.error = null;
     });
     await api.onDigestUpdated((digest) => {
+      if (!forFocused(digest.project_id)) return;
       this.digest = digest;
       this.generating = false;
       this.error = null;
@@ -24,7 +26,10 @@ class DigestStore {
       this.error = message;
     });
     // Re-read after (re)scans — also covers switching projects.
-    await api.onIndexUpdated(() => void this.refresh());
+    await api.onIndexUpdated((stats) => {
+      if (!forFocused(stats.project_id)) return;
+      void this.refresh();
+    });
     this.claudeFound =
       (await api.claudeDoctor().catch(() => null))?.found ?? false;
     await this.refresh();

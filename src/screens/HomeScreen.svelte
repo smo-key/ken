@@ -9,6 +9,12 @@
   import { homeRecents, recentlyOpened } from "../lib/recent";
   import HomeSearch from "./HomeSearch.svelte";
   import HomeStatus from "./HomeStatus.svelte";
+  import MembersStrip from "./MembersStrip.svelte";
+  import WorkspaceDigestCard from "./WorkspaceDigestCard.svelte";
+  import { workspaceHome } from "../lib/workspaceHome.svelte";
+  import { tasksStore } from "../lib/tasks.svelte";
+  import ScopePicker from "./ScopePicker.svelte";
+  import { scope } from "../lib/scope.svelte";
   import RecentFiles from "./RecentFiles.svelte";
   import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
@@ -27,7 +33,13 @@
     ]);
   }
 
-  onMount(() => void digest.init());
+  onMount(() => {
+    void digest.init();
+    // ken-home-workspace: no-ops without a workspace open, so the
+    // single-project path is untouched.
+    void workspaceHome.init();
+    void scope.init();
+  });
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -177,6 +189,36 @@
       {/if}
     </section>
 
+    <!-- Workspace layer: renders only with a workspace open, so with the
+         `workspace` flag off Home is byte-identical to before. -->
+    {#if workspaceHome.enabled}
+      <section class="rise" style="--d: {delay('digest')}">
+        <WorkspaceDigestCard />
+      </section>
+    {/if}
+
+    <!-- The daily board, workspace-wide: `needsAttention` already spans
+         every member, so this is the board's own answer rather than the
+         focused member's slice of it. -->
+    {#if workspaceHome.enabled && tasksStore.enabled && tasksStore.board.needsAttention.length > 0}
+      <section class="rise" style="--d: {delay('waiting')}">
+        <div class="overline amber">On your board</div>
+        <div class="group">
+          {#each tasksStore.board.needsAttention.slice(0, 6) as item (item.id)}
+            <button class="row board-row" onclick={() => (app.screen = "tasks")}>
+              <span class="rdot amber"></span>
+              <div class="rtext">
+                <strong>{item.title}</strong>
+                {#if item.reasons.length > 0}
+                  — {item.reasons.map((r) => r.reason).join(", ")}
+                {/if}
+              </div>
+            </button>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
     {#if hasWaiting}
       <section class="rise" style="--d: {delay('waiting')}">
         <div class="overline amber">Waiting on you</div>
@@ -240,8 +282,11 @@
       </section>
     {/if}
 
-    <!-- The page's primary action: opens the ⌘K palette, which owns search. -->
+    <!-- The page's primary action: opens the ⌘K palette, which owns search.
+         The scope picker above it sets what questions are about — search
+         AND chat — and defaults to all projects. -->
     <section class="find rise" style="--d: {delay('search')}">
+      <ScopePicker />
       <HomeSearch />
     </section>
 
@@ -251,9 +296,15 @@
       </section>
     {/if}
 
-    <!-- Footer: a few at-a-glance stats and where team-sync stands -->
+    <!-- Footer: the members strip in a workspace (every manifest member,
+         including the ones that no longer resolve), the single-project
+         stats card otherwise. -->
     <section class="status rise" style="--d: {delay('status')}">
-      <HomeStatus />
+      {#if workspaceHome.enabled}
+        <MembersStrip />
+      {:else}
+        <HomeStatus />
+      {/if}
     </section>
 
   </div>
@@ -472,6 +523,21 @@
     flex: 1;
     font-size: 13px;
     line-height: 1.6;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  /* Board rows are buttons (they open Tasks) but must read as rows. */
+  .board-row {
+    width: 100%;
+    background: transparent;
+    border: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .board-row:hover {
+    background: var(--surface);
   }
   /* Secondary "Ignore" action reads quieter than the primary "View". */
   .btn.ghost {

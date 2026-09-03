@@ -2,6 +2,7 @@
 //! watcher batches, exclusion changes, and full reindex — one code path.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -74,6 +75,58 @@ pub fn is_office_lock_name(name: &str) -> bool {
     name.starts_with("~$")
 }
 
+/// Ken-owned directories directly under `.ken/` that stay indexable and
+/// watchable despite the rest of `.ken/` being hidden — ken-memory's
+/// project-scope memories (`.ken/memory/`) and ken-tasks' per-repo task home
+/// (`.ken/tasks/`). `.ken/project.json`, `.ken/index-profile.json`, and any
+/// other current or future `.ken/` metadata deliberately stay off this list.
+/// A feature that wants the same treatment adds its subdir name here, not a
+/// one-off literal elsewhere.
+const KEN_ALLOWLISTED_SUBDIRS: &[&str] = &["memory", "tasks"];
+
+/// Is `rel` (project-root-relative, forward-slash separated, no leading
+/// slash) a Ken-owned indexable subpath living under the otherwise fully
+/// hidden `.ken/` directory? True only for `.ken/memory/**` and
+/// `.ken/tasks/**`; `.ken` itself is not "under" `.ken`, so it returns
+/// `false` too — scan.rs's walker and watch.rs's `relevant_path` each still
+/// need to let the bare `.ken` directory be entered/observed one level deep
+/// to reach these allowlisted subpaths, which is their job, not this
+/// predicate's. Shared by both so a file one indexes is always a file the
+/// other watches, and vice versa.
+pub fn is_ken_allowlisted_path(rel: &str) -> bool {
+    let Some(sub) = rel
+        .strip_prefix(crate::project::CONFIG_DIR)
+        .and_then(|s| s.strip_prefix('/'))
+    else {
+        return false;
+    };
+    KEN_ALLOWLISTED_SUBDIRS
+        .iter()
+        .any(|dir| sub == *dir || sub.starts_with(&format!("{dir}/")))
+}
+
+/// Walk one allowlisted Ken-owned subdirectory (`.ken/memory` or
+/// `.ken/tasks`) like an ordinary project folder: office-lock and junk-dir
+/// filtering still applies, and a nested dot-directory (e.g. a hypothetical
+/// `.ken/tasks/.trash/`) still stays hidden — the allowlist covers
+/// `memory/**` and `tasks/**`, not "every path anywhere under `.ken`". A
+/// missing directory (most projects have no memories/tasks yet) yields no
+/// entries rather than an error.
+fn ken_owned_subwalk(dir: &std::path::Path) -> impl Iterator<Item = PathBuf> {
+    ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !is_office_lock_name(&name) && !(e.path().is_dir() && is_junk_dir_name(&name))
+        })
+        .build()
+        .flatten()
+        .map(|e| e.into_path())
+}
+
 /// File status values stored in the index.
 pub const STATUS_INDEXED: &str = "indexed";
 pub const STATUS_METADATA_ONLY: &str = "metadata_only";
@@ -115,22 +168,61 @@ fn is_transient_error(error: &str) -> bool {
 pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
 
-    // What's on disk (rel_path -> size, mtime, cloud placeholder?)
-    let mut on_disk: HashMap<String, (i64, i64, bool)> = HashMap::new();
+    // kenignore (D2): built-ins first, user `.kenignore` appended last so a
+    // `!` line can override them. Loaded once per scan, not per file —
+    // `classify` is pure and re-parsing per path would be wasted work.
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let user_rules = project.kenignore_rules();
+    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+
+    // What's on disk (rel_path -> size, mtime, cloud placeholder?, tier)
+    let mut on_disk: HashMap<String, (i64, i64, bool, crate::kenignore::Tier)> = HashMap::new();
+    // A git repo's own `.gitignore` is the best statement anyone has of
+    // "this is generated, not authored" — build output, caches, server
+    // world data. Honouring it in a repo is why a Gradle project indexes
+    // its `src/` and not its 1.7GB `build/`, without the user writing a
+    // `.kenignore` that restates what git already knows.
+    //
+    // Gated on the project actually BEING a repo, because the original
+    // reasoning still holds everywhere else: a notes folder is not a code
+    // repo, and a stray `.gitignore` inherited from a parent directory
+    // must not silently hide someone's documents. `parents(false)` keeps
+    // this to the project's own rules for the same reason — a workspace
+    // parent's `.gitignore` has no authority over a member's contents.
+    //
+    // LIMITATION, verified by test rather than assumed: `.kenignore` is
+    // applied to paths this walk YIELDS, so in a repo a `!` line cannot
+    // pull back something `.gitignore` already excluded — the walker
+    // never hands it over to be reclassified. To index a gitignored path
+    // deliberately, un-ignore it in `.gitignore` (a `!` line there), or
+    // move it out from under the pattern. `.kenignore` remains able to
+    // exclude further, and to demote to search-only, which is what it is
+    // overwhelmingly used for.
+    let is_repo = project.root.join(".git").exists();
     let walker = ignore::WalkBuilder::new(&project.root)
         .hidden(true) // skip dotfiles: .git, .ken, .DS_Store…
-        .git_ignore(false) // knowledge folders aren't code repos
+        .git_ignore(is_repo)
+        .git_exclude(is_repo)
+        .parents(false)
+        .require_git(true)
         .git_global(false)
-        .git_exclude(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            name != ".ken"
+            name != crate::project::CONFIG_DIR
                 && !is_office_lock_name(&name)
                 && !(e.path().is_dir() && is_junk_dir_name(&name))
         })
-        .build();
-    for entry in walker.flatten() {
-        let path = entry.path();
+        .build()
+        .flatten()
+        .map(|e| e.into_path());
+    // `.ken/` is hidden wholesale above (D2 hard-ignore); walk its
+    // allowlisted subpaths (`.ken/memory/`, `.ken/tasks/`) separately so
+    // ken-memory and ken-tasks documents reach the index like any other file
+    // — see `is_ken_allowlisted_path` for exactly what qualifies.
+    let allowlisted = KEN_ALLOWLISTED_SUBDIRS.iter().flat_map(|sub| {
+        ken_owned_subwalk(&project.root.join(crate::project::CONFIG_DIR).join(sub))
+    });
+    for path in walker.chain(allowlisted) {
         if !path.is_file() {
             continue;
         }
@@ -141,6 +233,13 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if project.is_excluded(&rel_str) {
             continue;
         }
+        // kenignore D3: "Ignore-tier paths simply never produce rows —
+        // identical to today's exclusion path." Skip exactly like `excluded`
+        // above so an ignored file leaves no file/FTS row either.
+        let tier = crate::kenignore::classify(&rel_str, false, &rule_sets);
+        if tier == crate::kenignore::Tier::Ignore {
+            continue;
+        }
         if let Ok(meta) = path.metadata() {
             let mtime = meta
                 .modified()
@@ -148,7 +247,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta)));
+            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta), tier));
         }
     }
 
@@ -169,7 +268,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     }
 
     // Adds/updates
-    for (rel, (size, mtime, dataless)) in &on_disk {
+    for (rel, (size, mtime, dataless, tier)) in &on_disk {
         match indexed.get(rel) {
             Some((s, m, status, error)) if s == size
                 && m == mtime
@@ -181,7 +280,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             Some(_) => stats.updated += 1,
             None => stats.added += 1,
         }
-        let status = index_one(project, db, rel, *size, *mtime, *dataless)?;
+        let status = index_one(project, db, rel, *size, *mtime, *dataless, *tier)?;
         if status == STATUS_FAILED {
             stats.failed += 1;
         }
@@ -206,6 +305,7 @@ fn index_one(
     size: i64,
     mtime: i64,
     dataless: bool,
+    tier: crate::kenignore::Tier,
 ) -> Result<&'static str> {
     let abs = project.root.join(rel);
     let kind = FileKind::from_path(&abs);
@@ -229,8 +329,13 @@ fn index_one(
     db.upsert_file(rel, kind.as_str(), size, mtime, status, error.as_deref(), &text)?;
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
-    // churn without a content change never re-runs extraction.
-    if status == STATUS_INDEXED {
+    // churn without a content change never re-runs extraction. kenignore D3/
+    // task 1.5: search-only files are searchable but never enter the
+    // knowledge model, so extraction is gated to full-tier only. FTS (the
+    // upsert_file call above) and OCR (the enqueue below) both stay
+    // tier-blind (both tiers are searchable) — only this extraction enqueue
+    // is gated.
+    if status == STATUS_INDEXED && tier == crate::kenignore::Tier::Full {
         let hash = crate::knowledge_model::content_hash(&text);
         db.enqueue_extraction_if_changed(rel, &hash)?;
     }
@@ -264,6 +369,16 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     let excluded = project.is_excluded(rel)
         || is_hidden_rel(rel)
         || rel.rsplit('/').next().is_some_and(is_office_lock_name);
+    // kenignore D3: an Ignore-tier path is treated exactly like `excluded` —
+    // no row at all. This is a basic per-event check, not D4's fuller
+    // old-tier -> new-tier transition diffing (deleting stale KM
+    // contributions on Full->SearchOnly, etc.) — that belongs to task 1.6 and
+    // the src-tauri watcher work, out of scope here.
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let user_rules = project.kenignore_rules();
+    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+    let tier = crate::kenignore::classify(rel, false, &rule_sets);
+    let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -273,7 +388,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let dataless = cloud::is_dataless(&meta);
-        index_one(project, db, rel, meta.len() as i64, mtime, dataless)?;
+        index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         Ok(true)
     } else if db.get_file(rel)?.is_some() {
         db.remove_file(rel)?;
@@ -287,8 +402,14 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     }
 }
 
+/// Hidden for single-path reindex purposes. Mirrors the walker's rule — any
+/// dot-prefixed component hides the path — with the same `.ken/` allowlist
+/// carve-out, so a memory or task file created through the UI (which reaches
+/// the index via `refresh_path`, not the walker) is indexed exactly like one
+/// found by a full scan. Without this the two entry points disagree, and the
+/// disagreement is silent: the file simply never appears in search.
 fn is_hidden_rel(rel: &str) -> bool {
-    rel.split('/').any(|part| part.starts_with('.'))
+    rel.split('/').any(|part| part.starts_with('.')) && !is_ken_allowlisted_path(rel)
 }
 
 /// Full rebuild: drop everything and rescan.
@@ -357,7 +478,7 @@ mod tests {
         let meta = project.root.join("note.md").metadata().unwrap();
         let status = index_one(
             &project, &mut db, "note.md",
-            meta.len() as i64, 0, false,
+            meta.len() as i64, 0, false, crate::kenignore::Tier::Full,
         ).unwrap();
         assert_eq!(status, STATUS_INDEXED);
         // The file is now queued with the hash of its extracted text.
@@ -368,7 +489,7 @@ mod tests {
 
         // Re-indexing identical content does NOT re-queue once it's done.
         db.mark_extraction_done("note.md", &crate::knowledge_model::content_hash("Priya leads billing."), 1).unwrap();
-        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false).unwrap();
+        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
@@ -380,7 +501,7 @@ mod tests {
         // An image (no EXIF text): enqueued for OCR.
         fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
         let meta = project.root.join("photo.png").metadata().unwrap();
-        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string()),
@@ -393,7 +514,7 @@ mod tests {
         // An SVG is vector-only — the OCR bridge can't rasterize it — so skip.
         fs::write(project.root.join("logo.svg"), b"<svg></svg>").unwrap();
         let m = project.root.join("logo.svg").metadata().unwrap();
-        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "SVG must not enqueue OCR");
 
         // The fixture PDF has only a one-line text layer (sparse) — exactly the
@@ -402,7 +523,7 @@ mod tests {
         // covered directly by `pdf_low_text_heuristic`.)
         let pdf = project.root.join("vendor/contract.pdf");
         let pm = pdf.metadata().unwrap();
-        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("vendor/contract.pdf".to_string()),
@@ -419,16 +540,16 @@ mod tests {
         let meta = project.root.join("photo.png").metadata().unwrap();
         let (size, mtime) = (meta.len() as i64, 5);
 
-        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
         let (rel, hash) = db.next_pending_ocr().unwrap().unwrap();
         db.mark_ocr_done(&rel, &hash, &[]).unwrap();
 
         // Same (size, mtime): re-indexing does NOT re-OCR.
-        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "unchanged image must not re-OCR");
 
         // A changed mtime (new version) re-queues it.
-        index_one(&project, &mut db, "photo.png", size, mtime + 1, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime + 1, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string())
@@ -483,7 +604,7 @@ mod tests {
         let (_dir, project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
 
-        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true).unwrap();
+        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true, crate::kenignore::Tier::Full).unwrap();
 
         assert_eq!(status, STATUS_CLOUD_ONLY);
         let row = db.get_file("notes/meeting.md").unwrap().unwrap();
@@ -618,6 +739,150 @@ mod tests {
         drop(dir);
     }
 
+    /// In a git repo, `.gitignore` is honoured — otherwise a Gradle
+    /// project's 1.7GB `build/` and a server's `run/universe` world data
+    /// land in the index.
+    #[test]
+    fn gitignore_is_honoured_inside_a_repo() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "build/\nrun/\n").unwrap();
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::create_dir_all(dir.path().join("run/universe")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("build/out.txt"), "generated artifact").unwrap();
+        fs::write(dir.path().join("run/universe/region.txt"), "world data").unwrap();
+        fs::write(dir.path().join("src/main.txt"), "authored source").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        assert!(db.get_file("src/main.txt").unwrap().is_some(), "source must index");
+        assert!(db.get_file("build/out.txt").unwrap().is_none(), "build output must not");
+        assert!(
+            db.get_file("run/universe/region.txt").unwrap().is_none(),
+            "world data must not"
+        );
+        drop(dir);
+    }
+
+    /// …and NOT outside one. A notes folder that happens to carry a
+    /// `.gitignore` (copied in, inherited) must not have its documents
+    /// silently hidden.
+    #[test]
+    fn gitignore_is_ignored_outside_a_repo() {
+        let (dir, project) = temp_project();
+        fs::write(dir.path().join(".gitignore"), "notes/\n").unwrap();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/plan.md"), "a real document").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(
+            db.get_file("notes/plan.md").unwrap().is_some(),
+            "no .git means .gitignore has no authority here"
+        );
+        drop(dir);
+    }
+
+    /// Pins the limitation documented at the walker: `.kenignore` filters
+    /// what the walk YIELDS, so in a repo a `!` line cannot resurrect a
+    /// path `.gitignore` already excluded. Asserted so the behavior can't
+    /// drift silently in either direction — if someone later makes `!`
+    /// win, this test should fail and be updated deliberately.
+    #[test]
+    fn kenignore_bang_cannot_resurrect_a_gitignored_path() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+        fs::write(dir.path().join(".kenignore"), "!dist/\n").unwrap();
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/notes.md"), "wanted, but gitignored").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(
+            db.get_file("dist/notes.md").unwrap().is_none(),
+            "the walker never yields it, so kenignore never sees it"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn ken_memory_and_tasks_are_indexed_but_other_dot_ken_paths_are_not() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".ken/memory")).unwrap();
+        fs::create_dir_all(dir.path().join(".ken/tasks/archive/2026-07")).unwrap();
+        fs::write(dir.path().join(".ken/memory/foo.md"), "a project memory").unwrap();
+        fs::write(dir.path().join(".ken/tasks/bar.md"), "a task").unwrap();
+        fs::write(
+            dir.path().join(".ken/tasks/archive/2026-07/old.md"),
+            "an archived task",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".ken/index-profile.json"), "{}").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        // Allowlisted: walked and indexed, including a nested archive folder.
+        assert!(db.get_file(".ken/memory/foo.md").unwrap().is_some());
+        assert!(db.get_file(".ken/tasks/bar.md").unwrap().is_some());
+        assert!(db.get_file(".ken/tasks/archive/2026-07/old.md").unwrap().is_some());
+
+        // Everything else under `.ken/` stays excluded, same as today.
+        assert!(db.get_file(".ken/project.json").unwrap().is_none());
+        assert!(db.get_file(".ken/index-profile.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn other_dot_directories_still_excluded_alongside_ken_allowlist() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".ken/memory")).unwrap();
+        fs::write(dir.path().join(".ken/memory/foo.md"), "a project memory").unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        fs::create_dir_all(dir.path().join(".vscode")).unwrap();
+        fs::write(dir.path().join(".vscode/settings.json"), "{}").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        assert!(db.get_file(".ken/memory/foo.md").unwrap().is_some());
+        assert!(db.get_file(".git/HEAD").unwrap().is_none());
+        assert!(db.get_file(".vscode/settings.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn is_ken_allowlisted_path_matches_the_allowlist() {
+        // `.ken/memory/**` and `.ken/tasks/**` qualify; `.ken` itself, other
+        // `.ken/` metadata, and non-`.ken` paths never do — this predicate
+        // only answers "is this specifically a Ken-owned carve-out", nothing
+        // broader. `scan::scan` and `watch::relevant_path` both delegate to
+        // it for that one narrow question; see
+        // `watch::tests::scan_and_watch_agree_on_ken_paths` for the fuller
+        // walked-vs-watched agreement check.
+        let cases: &[(&str, bool)] = &[
+            (".ken/memory/foo.md", true),
+            (".ken/memory/sub/bar.md", true),
+            (".ken/tasks/bar.md", true),
+            (".ken/tasks/archive/2026-07/old.md", true),
+            (".ken", false),
+            (".ken/project.json", false),
+            (".ken/index-profile.json", false),
+            (".git/HEAD", false),
+            (".vscode/settings.json", false),
+            ("notes/meeting.md", false),
+        ];
+        for (rel, want_ken_allowlisted) in cases {
+            assert_eq!(
+                is_ken_allowlisted_path(rel),
+                *want_ken_allowlisted,
+                "is_ken_allowlisted_path({rel:?})"
+            );
+        }
+    }
+
     #[test]
     fn office_lock_files_not_indexed() {
         let (dir, project) = temp_project();
@@ -651,6 +916,36 @@ mod tests {
         fs::remove_file(dir.path().join("notes/hot.md")).unwrap();
         assert!(refresh_path(&project, &mut db, "notes/hot.md").unwrap());
         assert!(db.search("hot new note", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refresh_path_indexes_ken_allowlisted_files_but_not_metadata() {
+        // The third entry point into the index: files created through the UI
+        // reach it via `refresh_path`, not the walker. It must apply the same
+        // `.ken/` allowlist, or a memory written in-app is silently unsearchable
+        // while an identical file found by a full scan is not.
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        let memory_dir = dir.path().join(".ken/memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("ways-of-working.md"), "prefers small diffs\n").unwrap();
+        assert!(refresh_path(&project, &mut db, ".ken/memory/ways-of-working.md").unwrap());
+        assert!(!db.search("prefers small diffs", 5).unwrap().is_empty());
+
+        // Ken's own metadata stays out, exactly as before.
+        fs::write(dir.path().join(".ken/index-profile.json"), "{\"kind\":\"code\"}\n").unwrap();
+        assert!(!refresh_path(&project, &mut db, ".ken/index-profile.json").unwrap());
+        assert!(db.get_file(".ken/index-profile.json").unwrap().is_none());
+
+        // And no other dot-directory becomes reachable.
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("COMMIT_EDITMSG"), "unique gitmessage token\n").unwrap();
+        assert!(!refresh_path(&project, &mut db, ".git/COMMIT_EDITMSG").unwrap());
+        assert!(db.search("unique gitmessage token", 5).unwrap().is_empty());
+        drop(dir);
     }
 
     #[test]

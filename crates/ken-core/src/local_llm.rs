@@ -578,7 +578,7 @@ pub fn init(base_dir: PathBuf) {
 }
 
 #[allow(dead_code)]
-fn base_dir() -> Option<PathBuf> {
+pub(crate) fn base_dir() -> Option<PathBuf> {
     BASE_DIR.get()?.lock().unwrap().clone()
 }
 
@@ -695,6 +695,39 @@ fn make_real_engine() -> std::result::Result<Box<dyn Engine>, EngineBuildError> 
     ))
 }
 
+/// The single, process-wide llama.cpp backend.
+///
+/// `LlamaBackend::init()` wraps `llama_backend_init()`, which touches a global
+/// and MUST run exactly once per process — a second call errors
+/// (`BackendAlreadyInitialized`). Both the generative [`llama::LlamaEngine`] and
+/// the embedding `LlamaEmbedder` (embedder.rs) run as separate llama.cpp
+/// contexts in this one process, so they share this backend rather than each
+/// calling `init()`. `LlamaBackend` is a fieldless, auto-`Send`+`Sync` handle,
+/// so a `'static` shared reference is sound. The `Mutex` serializes the
+/// first-init race; after that `OnceLock::get()` is a lock-free fast path.
+#[cfg(feature = "local-llm")]
+pub(crate) fn shared_backend() -> Result<&'static llama_cpp_2::llama_backend::LlamaBackend> {
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use std::sync::{Mutex, OnceLock};
+
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    // Serialize first init so two threads never both call `LlamaBackend::init()`
+    // (the loser would get `BackendAlreadyInitialized`).
+    let _guard = INIT_LOCK.lock().unwrap();
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let backend = LlamaBackend::init()
+        .map_err(|e| Error::Other(format!("couldn't start llama.cpp: {e}")))?;
+    let _ = BACKEND.set(backend);
+    Ok(BACKEND.get().expect("backend just set"))
+}
+
 /// The real llama.cpp engine, copying Task 1's VERIFIED llama-cpp-2 0.1.151 call
 /// sequence verbatim. `token_to_bytes`/`Special` are deprecated convenience
 /// wrappers (they run the `token_to_piece_bytes` buffer-resize loop internally);
@@ -718,17 +751,18 @@ mod llama {
     /// The real llama.cpp engine. Holds the backend + weights for the process
     /// lifetime; a fresh context is created per generation (cheap next to load).
     pub struct LlamaEngine {
-        backend: LlamaBackend,
+        backend: &'static LlamaBackend,
         model: LlamaModel,
         n_ctx: u32,
     }
 
     impl LlamaEngine {
         pub fn load(path: &Path) -> Result<Self> {
-            let backend = LlamaBackend::init()
-                .map_err(|e| Error::Other(format!("couldn't start llama.cpp: {e}")))?;
+            // Share the one process-wide backend with the embedder rather than
+            // calling `LlamaBackend::init()` a second time (which would error).
+            let backend = super::shared_backend()?;
             let params = LlamaModelParams::default().with_n_gpu_layers(1000); // Metal: offload all
-            let model = LlamaModel::load_from_file(&backend, path, &params)
+            let model = LlamaModel::load_from_file(backend, path, &params)
                 .map_err(|e| Error::Other(format!("couldn't load the answers model: {e}")))?;
             Ok(LlamaEngine { backend, model, n_ctx: 8192 })
         }
@@ -751,7 +785,7 @@ mod llama {
                 .with_n_batch(self.n_ctx);
             let mut ctx = self
                 .model
-                .new_context(&self.backend, ctx_params)
+                .new_context(self.backend, ctx_params)
                 .map_err(|e| Error::Other(format!("llama context failed: {e}")))?;
 
             let raw = self

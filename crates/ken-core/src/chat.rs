@@ -137,6 +137,56 @@ pub fn build_context_preamble(focused: Option<&str>, open: &[String]) -> Option<
     ))
 }
 
+/// Cap on how many sibling projects we name, for the same reason
+/// `MAX_CONTEXT_FILES` exists.
+const MAX_SCOPE_PROJECTS: usize = 12;
+
+/// Build the cross-project scope preamble for an "all projects" (or group)
+/// chat.
+///
+/// Ken's chat is a Claude Code session whose cwd is the FOCUSED project, so
+/// widening scope is a matter of telling the session which sibling folders
+/// it may read — it can open absolute paths once those folders are trusted.
+/// That falls out of the architecture rather than fighting it, and it gives
+/// exactly the ruling this feature was specified under: **read across every
+/// project in scope, write only inside the focused one** unless the user
+/// names another. A session that could freely edit seven repos would turn
+/// one misread instruction into seven repos' worth of damage.
+///
+/// Returns `None` when there is nothing to widen to (no siblings), so a
+/// single-project workspace sends exactly what it sends today.
+pub fn build_scope_preamble(
+    focused_name: &str,
+    focused_root: &str,
+    siblings: &[(String, String)],
+    group_name: Option<&str>,
+) -> Option<String> {
+    if siblings.is_empty() {
+        return None;
+    }
+    let shown = siblings.len().min(MAX_SCOPE_PROJECTS);
+    let mut lines = String::new();
+    for (name, root) in &siblings[..shown] {
+        lines.push_str(&format!("\n- {name}: {root}"));
+    }
+    if siblings.len() > shown {
+        lines.push_str(&format!("\n- … and {} more", siblings.len() - shown));
+    }
+    let scope_label = match group_name {
+        Some(g) => format!("the \"{g}\" group of projects"),
+        None => "every project in this workspace".to_string(),
+    };
+    Some(format!(
+        "[Scope — this question is about {scope_label}, not just one. \
+         Besides the current project ({focused_name}, at {focused_root}) you \
+         may READ files in these sibling projects by absolute path when they \
+         are relevant:{lines}\n\
+         Make edits only inside {focused_name} unless the user explicitly \
+         names another project to change. If answering needs a file from a \
+         sibling, read it rather than guessing.]"
+    ))
+}
+
 /// Ensure Claude Code treats `project_root` as a trusted folder before we spawn
 /// it. On a first interactive run in an unseen folder the CLI shows a blocking
 /// "Do you trust the files in this folder?" onboarding dialog (it records the
@@ -589,6 +639,46 @@ mod tests {
         assert_eq!(valid_model_alias(""), None);
         assert_eq!(valid_model_alias("gpt-4"), None);
         assert_eq!(valid_model_alias("claude-fable-5"), None);
+    }
+
+    #[test]
+    fn scope_preamble_none_without_siblings() {
+        assert_eq!(build_scope_preamble("ken", "/w/ken", &[], None), None);
+    }
+
+    #[test]
+    fn scope_preamble_names_siblings_and_pins_writes_to_the_focused_project() {
+        let siblings = vec![
+            ("realms".to_string(), "/w/realms".to_string()),
+            ("realms-tools".to_string(), "/w/realms-tools".to_string()),
+        ];
+        let p = build_scope_preamble("ken", "/w/ken", &siblings, None).unwrap();
+        assert!(p.contains("/w/realms-tools"), "sibling path missing: {p}");
+        assert!(p.contains("every project in this workspace"));
+        // The read/write asymmetry is the whole safety property.
+        assert!(p.contains("READ"), "read permission not stated: {p}");
+        assert!(
+            p.contains("edits only inside ken"),
+            "write restriction not stated: {p}"
+        );
+    }
+
+    #[test]
+    fn scope_preamble_names_the_group_when_scoped_to_one() {
+        let siblings = vec![("realms-tools".to_string(), "/w/realms-tools".to_string())];
+        let p = build_scope_preamble("realms", "/w/realms", &siblings, Some("Shattered Realms"))
+            .unwrap();
+        assert!(p.contains("\"Shattered Realms\" group"), "{p}");
+        assert!(!p.contains("every project in this workspace"));
+    }
+
+    #[test]
+    fn scope_preamble_caps_long_lists() {
+        let siblings: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("p{i}"), format!("/w/p{i}")))
+            .collect();
+        let p = build_scope_preamble("ken", "/w/ken", &siblings, None).unwrap();
+        assert!(p.contains("and 18 more"), "list not capped: {p}");
     }
 
     #[test]

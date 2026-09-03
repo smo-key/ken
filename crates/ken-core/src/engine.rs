@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::automation;
+use crate::chunker::{self, IndexProfile};
 use crate::db::Db;
+use crate::embedder::Embedder;
 use crate::hooks::{install_hooks, HookListener};
 use crate::project::Project;
 use crate::recipe::{self, Refresh};
@@ -72,6 +74,17 @@ pub struct EngineConfig {
     pub binary: Option<PathBuf>,
     pub timeout: Duration,
     pub debounce: Duration,
+    /// Live on/off switch for the semantic-index build step. `None` = flag
+    /// off, no embed calls, `execute_ingest` behaves exactly as before this
+    /// feature existed. `Some(embedder)` = flag on, `rebuild_semantic_index`
+    /// runs after each successful ingest. Wrapped in `Arc<Mutex<..>>` (not a
+    /// plain field) so the app layer can toggle it while the engine's worker
+    /// thread is already running — `EngineConfig` itself is captured by value
+    /// into that thread at `IngestEngine::start()` and cloned per-run, but
+    /// cloning only copies the `Arc` pointer, so a `.lock().unwrap().replace(..)`
+    /// / `.take()` from outside is visible on the very next run without
+    /// restarting the engine.
+    pub semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
 }
 
 impl Default for EngineConfig {
@@ -80,6 +93,7 @@ impl Default for EngineConfig {
             binary: None,
             timeout: Duration::from_secs(15 * 60),
             debounce: Duration::from_secs(10),
+            semantic_embedder: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -652,6 +666,38 @@ fn execute_ingest(
 
     match outcome {
         Ok(RunOutcome::Completed) => {
+            // Semantic build step, gated by the live on/off switch. A
+            // rebuild failure is surfaced as an activity note but never
+            // fails the ingest run itself — FTS indexing already succeeded,
+            // and the semantic index can be retried on the next run.
+            if let Some(embedder) = cfg.semantic_embedder.lock().unwrap().as_deref_mut() {
+                let progress_slug = slug.to_string();
+                let progress_session = session_id.clone();
+                let rebuild_result = rebuild_semantic_index(&project, db, embedder, token, |done, total| {
+                    on_event(IngestEvent {
+                        kind: "ingest".to_string(),
+                        slug: progress_slug.clone(),
+                        run_id,
+                        session_id: Some(progress_session.clone()),
+                        status: "running".to_string(),
+                        detail: None,
+                        activity: Some(format!("Embedding chunks: {done}/{total}")),
+                        elapsed_secs: None,
+                        eta_secs: None,
+                    });
+                });
+                if let Err(e) = rebuild_result {
+                    on_event(IngestEvent::at(
+                        "ingest",
+                        slug,
+                        run_id,
+                        Some(session_id.clone()),
+                        "running",
+                        Some(format!("Semantic index rebuild failed: {e}")),
+                    ));
+                }
+            }
+
             match refresh::evaluate(&project, &recipe, &rules, &plan) {
                 Ok(out) if out.applied => {
                     finish(db, "fresh", Some(&out.summary), None, Some(out.change_ratio));
@@ -683,6 +729,143 @@ fn execute_ingest(
         }
         Err(e) => finish(db, "failed", None, Some(&e.to_string()), None),
     }
+}
+
+/// Number of chunk texts embedded per `Embedder::embed` call. Keeps a single
+/// call bounded and gives the cancel check a reasonable granularity without
+/// paying per-chunk call overhead.
+const EMBED_BATCH: usize = 16;
+
+/// Regenerate `chunks` and `vec_chunks` from the project's indexed contents
+/// alone (nothing else feeds it — see spec "The semantic index is entirely
+/// derived"). Incremental: `Db::upsert_chunks` diffs by `content_hash` per
+/// file, so unchanged files cost no embed calls.
+///
+/// Cancellation is checked once per file, before that file's chunks are
+/// upserted — never mid-file. This matters: `upsert_chunks` persists a file's
+/// `chunks` rows (keyed by content hash) before this function gets a chance
+/// to embed them, so bailing out *after* the upsert but *before*
+/// `store_embeddings` would leave that file's changed chunks permanently
+/// un-embedded — a later rebuild would see the same hash and treat them as
+/// already-up-to-date. Checking only at the top of the loop avoids that trap.
+///
+/// Returns `Ok(true)` if every indexed file was processed (and `embed_model`
+/// / `embed_dim` / `semantic_built_at` were recorded in `meta`), or
+/// `Ok(false)` if `token` was cancelled before completion (meta is left
+/// untouched in that case, so the next rebuild attempt starts from a
+/// known-stale state instead of a falsely-fresh one).
+pub fn rebuild_semantic_index(
+    project: &Project,
+    db: &mut Db,
+    embedder: &mut dyn Embedder,
+    token: &CancelToken,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<bool> {
+    rebuild_semantic_index_with_profile(project, db, embedder, token, on_progress, None)
+}
+
+/// Same as [`rebuild_semantic_index`], resolving each file's chunk profile
+/// as `stored_profile.chunking_for(rel_path)` else `IndexProfile::default_for`
+/// (design D3) when `profile` is `Some`. `profile` is normally
+/// `Some(&profiler::ProjectProfile::load(&project.root))` only when the
+/// `profiler` flag is on for this project — passing `None` (what
+/// [`rebuild_semantic_index`] always does) reproduces the plain
+/// extension-default chunking exactly, which is how flag-off/no-profile
+/// inertness holds here.
+pub fn rebuild_semantic_index_with_profile(
+    project: &Project,
+    db: &mut Db,
+    embedder: &mut dyn Embedder,
+    token: &CancelToken,
+    mut on_progress: impl FnMut(usize, usize),
+    profile: Option<&crate::profiler::ProjectProfile>,
+) -> Result<bool> {
+    let files: Vec<_> = db
+        .list_files()?
+        .into_iter()
+        .filter(|f| f.status == "indexed")
+        .collect();
+    let total = files.len();
+
+    db.ensure_vec_chunks(embedder.dim())?;
+
+    // kenignore (D2/D3): tier is classified once per file here, against the
+    // same rule sets scan.rs uses. Built-in rule sets (task 1.3) are not yet
+    // wired up (no ken-memory/ken-tasks pseudo-members exist in this repo
+    // yet), so only the user's `.kenignore` participates for now.
+    let user_rules = project.kenignore_rules();
+    let rule_sets: &[&[crate::kenignore::Rule]] = &[&user_rules];
+
+    for (done, file) in files.into_iter().enumerate() {
+        if token.is_cancelled() {
+            return Ok(false);
+        }
+
+        let tier = crate::kenignore::classify(&file.rel_path, false, rule_sets);
+        if tier == crate::kenignore::Tier::Ignore {
+            // Defensive: scan.rs should already keep Ignore-tier paths out of
+            // `files`, but if one slips through (e.g. a `.kenignore` edit
+            // landed after the last scan), don't chunk/embed it, and drop any
+            // stale chunks left from before it became Ignore.
+            db.delete_chunks(&file.rel_path)?;
+            on_progress(done + 1, total);
+            continue;
+        }
+
+        let text = match db.get_text(&file.rel_path)? {
+            Some(t) => t,
+            None => {
+                on_progress(done + 1, total);
+                continue;
+            }
+        };
+
+        // project-profiler D3: stored-profile-else-default. `profile` is
+        // only `Some` when the caller resolved the `profiler` flag on and
+        // loaded a profile (see this function's doc comment) — `None`
+        // (the `rebuild_semantic_index` wrapper's default) always falls
+        // through to the plain extension default, unchanged from before
+        // this hook existed.
+        let idx_profile = profile
+            .and_then(|p| p.chunking_for(&file.rel_path))
+            .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
+        let chunks = chunker::chunk_file(&file.rel_path, &text, &idx_profile);
+        let changed = db.upsert_chunks(&file.rel_path, &chunks, tier)?;
+
+        // `changed` is a subsequence of `chunks` in the same relative order
+        // (both walk seq ascending; `upsert_chunks` only omits unchanged
+        // entries). Two-pointer match by content_hash to recover each
+        // changed chunk's text — safe even if two chunks share identical
+        // text (and thus identical hash), since position order is preserved
+        // on both sides.
+        let mut embed_ids: Vec<i64> = Vec::with_capacity(changed.len());
+        let mut embed_texts: Vec<String> = Vec::with_capacity(changed.len());
+        let mut changed_iter = changed.into_iter().peekable();
+        for c in &chunks {
+            if let Some((_, hash)) = changed_iter.peek() {
+                if hash == &c.content_hash {
+                    let (id, _) = changed_iter.next().unwrap();
+                    embed_ids.push(id);
+                    embed_texts.push(c.text.clone());
+                }
+            }
+        }
+
+        for (id_batch, text_batch) in embed_ids
+            .chunks(EMBED_BATCH)
+            .zip(embed_texts.chunks(EMBED_BATCH))
+        {
+            let vecs = embedder.embed(text_batch)?;
+            db.store_embeddings(id_batch, &vecs)?;
+        }
+
+        on_progress(done + 1, total);
+    }
+
+    db.set_embed_model(&embedder.model_id())?;
+    db.set_embed_dim(embedder.dim())?;
+    db.set_semantic_built_at(now_epoch())?;
+    Ok(true)
 }
 
 enum Phase {
@@ -959,9 +1142,11 @@ pub fn discard_automation_proposal(db: &mut Db, item_id: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedder::FakeEmbedder;
     use crate::recipe::{Mode, Recipe, Refresh};
     use crate::runner::test_support::write_fake_claude;
     use crate::scan;
+    use crate::search::{self, FtsHit, VecHit};
     use std::fs;
     use std::sync::mpsc::Receiver;
 
@@ -1030,6 +1215,7 @@ mod tests {
                 binary: Some(bin),
                 timeout: Duration::from_secs(30),
                 debounce: Duration::from_millis(debounce_ms),
+                ..Default::default()
             },
             move |ev| {
                 let _ = etx.send(ev);
@@ -1269,6 +1455,7 @@ mod tests {
                 binary: Some(binary),
                 timeout: Duration::from_secs(300),
                 debounce: Duration::from_millis(100),
+                ..Default::default()
             },
             move |ev| {
                 eprintln!("[event] {} -> {} {:?}", ev.slug, ev.status, ev.detail);
@@ -1486,5 +1673,160 @@ mod tests {
         // The matching-kind cancel does stop it.
         r.engine.cancel(RunKind::Ingest, "people");
         wait_status(&r.events, "cancelled", 10);
+    }
+
+    /// Runs `search_chunks_fts` + `semantic_search` + `search::merge_and_rerank`
+    /// for a query — the same building blocks task 2.2's `hybrid_search`
+    /// command is expected to compose, with results always reranked before
+    /// return (S7b Condition C).
+    fn hybrid_search(db: &Db, embedder: &mut FakeEmbedder, query: &str) -> Vec<search::HybridHit> {
+        let fts_hits: Vec<FtsHit> = db.search_chunks_fts(query, 10).unwrap();
+        let query_vec = embedder.embed(&[query.to_string()]).unwrap().remove(0);
+        let vec_hits: Vec<VecHit> = db
+            .semantic_search(&query_vec, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(chunk_id, path, text, distance)| VecHit {
+                chunk_id,
+                path,
+                text,
+                distance,
+            })
+            .collect();
+        search::merge_and_rerank(&fts_hits, &vec_hits, query)
+    }
+
+    #[test]
+    fn rebuild_semantic_index_with_none_profile_matches_plain_wrapper() {
+        // project-profiler consumer-hook inertness (1.5/1.6): the plain
+        // `rebuild_semantic_index` is exactly `rebuild_semantic_index_with_profile`
+        // called with `None` — so a caller that never resolves a profile
+        // (flag off, or none exists) gets identical chunk output either way.
+        let project_dir = tempfile::tempdir().unwrap();
+        fs::write(project_dir.path().join("note.md"), "# Hi\nSome prose text here.\n").unwrap();
+        let project = Project::create(project_dir.path(), "T").unwrap();
+
+        let mut db_a = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db_a).unwrap();
+        let mut embedder_a = FakeEmbedder::new();
+        rebuild_semantic_index(&project, &mut db_a, &mut embedder_a, &CancelToken::new(), |_, _| {}).unwrap();
+
+        let mut db_b = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db_b).unwrap();
+        let mut embedder_b = FakeEmbedder::new();
+        rebuild_semantic_index_with_profile(
+            &project, &mut db_b, &mut embedder_b, &CancelToken::new(), |_, _| {}, None,
+        )
+        .unwrap();
+
+        assert_eq!(db_a.chunk_count().unwrap(), db_b.chunk_count().unwrap());
+        assert!(db_a.chunk_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn rebuild_semantic_index_with_profile_uses_stored_chunking_over_default() {
+        // A stored profile mapping *.md to Skip mode must suppress chunks
+        // for markdown files even though the extension default is Prose.
+        let project_dir = tempfile::tempdir().unwrap();
+        fs::write(project_dir.path().join("note.md"), "# Hi\nSome prose text here.\n").unwrap();
+        let project = Project::create(project_dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let mut profile = crate::profiler::ProjectProfile::default();
+        profile.chunking.push(crate::profiler::PatternProfile {
+            pattern: "*.md".into(),
+            profile: IndexProfile { mode: chunker::ChunkMode::Skip, target_tokens: 1, overlap_pct: 0.0 },
+        });
+
+        let mut embedder = FakeEmbedder::new();
+        rebuild_semantic_index_with_profile(
+            &project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}, Some(&profile),
+        )
+        .unwrap();
+
+        assert_eq!(db.chunk_count().unwrap(), 0, "the Skip-mode profile entry should suppress all chunks");
+    }
+
+    #[test]
+    fn semantic_rebuild_and_hybrid_search_finds_exact_text_chunk() {
+        // Lightweight fixture (not the full Rig): a project dir with two
+        // fixture files, a separate app-dir DB, scanned but with no
+        // engine/hooks/automation involved — task 1.8 only needs
+        // `rebuild_semantic_index` plus the search building blocks.
+        let project_dir = tempfile::tempdir().unwrap();
+        let app_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project_dir.path().join("notes")).unwrap();
+        fs::write(
+            project_dir.path().join("notes/a.md"),
+            "# Zephyr\nThe quokka juggles xylophones at midnight.\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.path().join("notes/b.md"),
+            "# Other\nSomething entirely unrelated about spreadsheets.\n",
+        )
+        .unwrap();
+
+        let project = Project::create(project_dir.path(), "T").unwrap();
+        let db_path = app_dir.path().join("test.db");
+        let mut db = Db::open_at(&db_path).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let mut embedder = FakeEmbedder::new();
+        let token = CancelToken::new();
+        let completed =
+            rebuild_semantic_index(&project, &mut db, &mut embedder, &token, |_, _| {}).unwrap();
+        assert!(completed, "rebuild should run to completion (no cancel token set)");
+
+        // FTS finds the distinctive keyword.
+        let by_keyword = hybrid_search(&db, &mut embedder, "quokka");
+        assert!(
+            by_keyword.iter().any(|h| h.path == "notes/a.md"),
+            "expected notes/a.md among hybrid results for 'quokka', got {:?}",
+            by_keyword
+        );
+
+        // KNN finds the exact chunk text: under FakeEmbedder's no-prefix
+        // determinism, a query built from the same string as a stored
+        // chunk embeds to the identical vector, so it must come back as
+        // an exact (distance ~0) semantic hit.
+        let stored_chunk_text = by_keyword
+            .iter()
+            .find(|h| h.path == "notes/a.md")
+            .map(|h| h.snippet.clone())
+            .expect("notes/a.md snippet");
+        let by_exact_chunk = hybrid_search(&db, &mut embedder, &stored_chunk_text);
+        assert!(
+            by_exact_chunk.iter().any(|h| h.path == "notes/a.md"),
+            "expected notes/a.md among hybrid results for its own exact chunk text, got {:?}",
+            by_exact_chunk
+        );
+
+        // --- rebuild-after-drop equivalence (spec.md's explicit scenario:
+        // "WHEN chunks and vec_chunks are dropped and a rebuild runs THEN
+        // hybrid search results are equivalent to before the deletion") ---
+        let before = hybrid_search(&db, &mut embedder, "quokka");
+
+        for f in db.list_files().unwrap() {
+            db.delete_chunks(&f.rel_path).unwrap();
+        }
+        let token2 = CancelToken::new();
+        let completed2 =
+            rebuild_semantic_index(&project, &mut db, &mut embedder, &token2, |_, _| {}).unwrap();
+        assert!(completed2, "second rebuild should also run to completion");
+
+        let after = hybrid_search(&db, &mut embedder, "quokka");
+        assert_eq!(
+            before
+                .iter()
+                .map(|h| (h.path.clone(), h.source))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|h| (h.path.clone(), h.source))
+                .collect::<Vec<_>>(),
+            "hybrid search results must be equivalent after a drop + rebuild"
+        );
     }
 }
