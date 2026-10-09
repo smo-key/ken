@@ -85,6 +85,7 @@ pub fn chatml_prompt(system: &str, user: &str) -> String {
 /// The most prompt tokens we may feed given a context window that must also
 /// hold `max_tokens` of generated output, with a small safety margin. Pure so
 /// the batch-sizing/clamp logic is unit-tested without a real model.
+#[cfg_attr(not(feature = "local-llm"), allow(dead_code))]
 pub(crate) fn max_prompt_tokens(n_ctx: usize, max_tokens: usize) -> usize {
     n_ctx.saturating_sub(max_tokens).saturating_sub(8).max(1)
 }
@@ -95,6 +96,7 @@ pub(crate) fn max_prompt_tokens(n_ctx: usize, max_tokens: usize) -> usize {
 /// long middle of the document. Returned length is always `<= cap`. Generic and
 /// pure (no llama types) so it's unit-tested; a real prompt over the model's
 /// context is truncated here rather than erroring the whole generation.
+#[cfg_attr(not(feature = "local-llm"), allow(dead_code))]
 pub(crate) fn clamp_prompt_tokens<T: Clone>(tokens: &[T], cap: usize) -> Vec<T> {
     if tokens.len() <= cap {
         return tokens.to_vec();
