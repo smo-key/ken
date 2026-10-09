@@ -7,9 +7,14 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-ken-core = { path = "../ken-core" }
+# local-llm for the embedding model alone, so search means as well as matches:
+# without it every MCP search was keyword only (Shattered Realms eval, 2026-10-06).
+ken-core = { path = "../ken-core", default-features = false, features = ["local-llm"] }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+# Local dates for task stamps: the same `chrono::Local` the app uses.
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

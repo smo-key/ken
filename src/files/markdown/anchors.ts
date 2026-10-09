@@ -107,7 +107,7 @@ export function findHeadingForTarget(
 }
 
 /** Scroll a heading into view inside the editor's own scroll container. */
-function revealHeading(view: EditorView, pos: number): boolean {
+export function revealHeading(view: EditorView, pos: number): boolean {
   const dom = view.nodeDOM(pos);
   if (!(dom instanceof HTMLElement)) return false;
   dom.scrollIntoView({ block: "start", behavior: "smooth" });

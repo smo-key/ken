@@ -7,12 +7,16 @@
   import Search from "@lucide/svelte/icons/search";
   import { api, type FileRow } from "../lib/api";
   import type { HydrationProgress } from "../lib/api";
-  import { app } from "../lib/app.svelte";
+  import { app, forFocused } from "../lib/app.svelte";
+  import { chats } from "../lib/chats.svelte";
+  import EditReview from "../chat/EditReview.svelte";
   import { find } from "../lib/find.svelte";
   import FindBar from "./FindBar.svelte";
   import { isEditable, timeAgo } from "../lib/format";
   import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
+  import PageLinks from "./PageLinks.svelte";
+  import CodeMap from "./CodeMap.svelte";
   import PlainEditor from "./PlainEditor.svelte";
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
@@ -20,8 +24,17 @@
   import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isHtmlPath } from "./previews/html";
   import { docDir, type AttachmentAdapter } from "./markdown/attachments";
+  import { shortcut } from "../lib/platform";
+  import { toast } from "../lib/toast.svelte";
+  import { resolveRelativeHref, resolveWikiLink, type LinkClick } from "./markdown/wikiLinks";
+  import { memberLeaf } from "../lib/api";
 
   let { relPath }: { relPath: string } = $props();
+
+  // An edit Claude proposed to this file in chat, shown over the page as a
+  // diff to accept or deny; and the place a clicked citation asked for.
+  const pendingEdit = $derived(chats.pendingEditFor(relPath));
+  const revealHere = $derived(app.revealAt?.path === relPath ? app.revealAt : null);
 
   // .csv/.tsv get the grid editor even though the backend kind is "code"
   // (csv) or "binary" (tsv). Routed by extension, ahead of the plain editor.
@@ -91,6 +104,18 @@
     meta !== null && (isEditable(meta.kind) || isCsv) && !tooLarge,
   );
   const kind = $derived(meta?.kind ?? "binary");
+  // Ken could not read this file: the reason, and Ignore to stop flagging it.
+  const failure = $derived(
+    meta?.status === "failed" && !app.ignored.includes(relPath) ? (meta.error ?? "no reason given") : null,
+  );
+
+  async function ignoreFailure() {
+    try {
+      await app.ignoreFile(relPath);
+    } catch (e) {
+      toast.error("Could not ignore the file", e);
+    }
+  }
   // Read-only = we know what the file is and it renders as a preview rather than
   // an editor: either not editable at all (PreviewPane — PDF/image/office/HTML
   // page), or text that's too big to edit. Suppressed until the file is resolved
@@ -114,11 +139,14 @@
     // after it finishes.
     api
       .onHydrationProgress((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.relPath === relPath) hydration = ev;
       })
       .then((u) => (unlistenHydration = u));
     await load();
-    unlisten = await api.onIndexUpdated(() => void checkDisk());
+    unlisten = await api.onIndexUpdated((stats) => {
+      if (forFocused(stats.project_id)) void checkDisk();
+    });
   });
 
   async function load(forceCloudDownload = false) {
@@ -222,8 +250,13 @@
   // Files pasted or dropped into the Markdown editor are saved beside the
   // document; relative image srcs render through the asset protocol.
   const attachments: AttachmentAdapter = {
-    save: async (file) =>
-      api.writeNewFile(docDir(relPath), file.name, new Uint8Array(await file.arrayBuffer())),
+    save: async (file) => {
+      // Like `doSave`: writes go to the focused repo, so once focus has moved
+      // away from the repo this pane was opened in, refuse rather than drop
+      // the file into another repo's same-named folder.
+      if (app.focused !== owner) throw new Error("this page's repo is no longer focused");
+      return api.writeNewFile(docDir(relPath), file.name, new Uint8Array(await file.arrayBuffer()));
+    },
     resolve: (target) => api.mediaSrc(target),
   };
 
@@ -235,14 +268,67 @@
     saveTimer = setTimeout(() => void doSave(), 800);
   }
 
+  // The repo this file was opened in. A save goes to the focused repo, so
+  // once focus moves (the Files menu, a citation) this pane saves nothing:
+  // two repos can hold the same path (every wiki has START-HERE.md).
+  const owner = app.focused;
+  /** Saves so far: the links panel reads the page's links again after each. */
+  let savedCount = $state(0);
+
+  /** A `[[link]]` in the page: open the page it names, in this repo. */
+  /** The workspace's repos by folder name, for repo names in code. */
+  function repoNamed(name: string) {
+    const n = name.toLowerCase();
+    return app.members.find((m) => !!m.id && memberLeaf(m.name).toLowerCase() === n) ?? null;
+  }
+
+  /** Follow a link in the page: a [[page]], a page or web address, or a
+   *  repo's name (opens that repo in Files). */
+  function openLink(link: LinkClick): boolean {
+    if (link.kind === "wiki") {
+      void openWikiLink(link.target);
+      return true;
+    }
+    if (link.kind === "repo") {
+      const m = repoNamed(link.name);
+      if (!m?.id) return false;
+      void app.focusMember(m.id, { stay: true });
+      return true;
+    }
+    const href = link.href;
+    if (/^(https?:|mailto:)/i.test(href)) {
+      void api.openWebUrl(href).catch((e) => toast.error("Could not open the link", e));
+      return true;
+    }
+    if (href.startsWith("ken://")) return false;
+    const page = resolveRelativeHref(href, relPath);
+    if (!page) return false;
+    if (app.files.some((f) => f.relPath === page)) app.openTab(page, true);
+    else toast.show(`No file at ${page} in this repo.`);
+    return true;
+  }
+
+  async function openWikiLink(target: string) {
+    // The index knows aliases (a page's frontmatter names it too); the file
+    // list covers a page indexed a moment ago.
+    const page =
+      (await api.resolvePageLink(relPath, target).catch(() => null)) ??
+      resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
+    if (page) app.openTab(page, true);
+    else toast.show(`No page named "${target.split("|")[0]}" in this repo.`);
+  }
+
   async function doSave() {
     if (!dirty || diskChanged) return;
+    if (app.focused !== owner) return;
     try {
       knownMtime = await api.saveFile(relPath, latest);
       dirty = false;
       savedAt = Date.now();
+      saveError = null;
+      savedCount += 1;
     } catch (e) {
-      loadError = `Couldn't save: ${e}`;
+      saveError = `Couldn't save: ${e}`;
     }
   }
 
@@ -308,7 +394,7 @@
     {/if}
     <button
       class="action icon-only"
-      title="Find in document (⌘F)"
+      title="Find in document ({shortcut('mod+F')})"
       aria-label="Find in document"
       onclick={() => find.toggle()}
     >
@@ -344,6 +430,22 @@
       </span>
       <button class="btn btn-small" onclick={keepMine}>Keep my version</button>
       <button class="btn btn-small" onclick={reloadFromDisk}>Take the disk version</button>
+    </div>
+  {/if}
+
+  {#if failure}
+    <div class="failed" role="status">
+      <span class="fdot"></span>
+      <span class="ftext"><strong>Ken could not read this file.</strong> {failure}</span>
+      <button class="btn btn-small" title="Stop flagging this file (only for you)" onclick={() => void ignoreFailure()}>
+        Ignore
+      </button>
+    </div>
+  {/if}
+
+  {#if pendingEdit}
+    <div class="proposal">
+      <EditReview messageId={pendingEdit.messageId} proposal={pendingEdit.proposal} showOpen={false} />
     </div>
   {/if}
 
@@ -414,9 +516,17 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} {relPath} {attachments} />
+        <MarkdownEditor
+          initial={content}
+          onchange={onEdit}
+          {relPath}
+          {attachments}
+          reveal={revealHere}
+          onlink={openLink}
+          isRepo={(name) => !!repoNamed(name)}
+        />
       {:else}
-        <PlainEditor initial={content} onchange={onEdit} />
+        <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {/if}
     {/key}
   {:else if meta}
@@ -437,6 +547,11 @@
       }}
       onerror={(m) => (saveError = m)}
     />
+  {/if}
+  {#if meta?.kind === "md"}
+    <PageLinks {relPath} refresh={reloadKey + savedCount} />
+  {:else if /\.(rs|py|pyi|jsx?|mjs|cjs|tsx?|mts|cts|go|java|cs)$/i.test(relPath)}
+    <CodeMap {relPath} refresh={reloadKey} />
   {/if}
 </div>
 
@@ -535,6 +650,12 @@
   .sdot.dirty {
     background: var(--needs-input);
   }
+  .proposal {
+    margin: 10px 16px 0;
+    max-height: 45vh;
+    overflow: auto;
+    flex: none;
+  }
   .conflict {
     display: flex;
     align-items: center;
@@ -546,6 +667,37 @@
     border-radius: 10px;
     font-size: 12.5px;
     flex: none;
+  }
+  .failed {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    /* Below the floating action bar, which sits over the top right. */
+    margin: 46px 20px 0;
+    padding: 9px 14px;
+    background: color-mix(in srgb, var(--danger) 6%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+    border-radius: 10px;
+    font-size: 12.5px;
+    flex: none;
+  }
+  .fdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    flex: none;
+  }
+  .ftext {
+    flex: 1;
+    min-width: 0;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    overflow-wrap: anywhere;
+  }
+  .ftext strong {
+    color: var(--danger);
+    font-weight: 600;
   }
   .cdot {
     width: 8px;

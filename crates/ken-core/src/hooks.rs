@@ -13,6 +13,12 @@ use serde_json::{json, Value};
 use crate::{Error, Result};
 
 pub const HOOK_PATH: &str = "/ken-hook";
+/// Where Ken's own MCP server asks the running app to act on the screen (open
+/// a file at a line, when the person asked). Each request carries the
+/// listener's token in `X-Ken-Token`; any other caller gets a 403.
+pub const UI_PATH: &str = "/ken-ui";
+
+type UiHandler = Arc<Mutex<Option<Box<dyn Fn(Value) + Send>>>>;
 
 #[derive(Debug, Clone)]
 pub struct HookEvent {
@@ -30,6 +36,8 @@ pub struct HookListener {
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     server: Arc<tiny_http::Server>,
+    token: String,
+    ui: UiHandler,
 }
 
 impl HookListener {
@@ -44,9 +52,12 @@ impl HookListener {
         let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let token = uuid::Uuid::new_v4().to_string();
+        let ui: UiHandler = Arc::new(Mutex::new(None));
         let s = server.clone();
         let subs = subscribers.clone();
         let stop = shutdown.clone();
+        let (t_token, t_ui) = (token.clone(), ui.clone());
         let thread = std::thread::spawn(move || {
             for mut request in s.incoming_requests() {
                 if stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -54,6 +65,25 @@ impl HookListener {
                 }
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
+                if request.url().starts_with(UI_PATH) {
+                    let authorized = request
+                        .headers()
+                        .iter()
+                        .any(|h| h.field.equiv("X-Ken-Token") && h.value.as_str() == t_token);
+                    let status = match (authorized, serde_json::from_str::<Value>(&body)) {
+                        (false, _) => 403,
+                        (true, Ok(v)) => match t_ui.lock().unwrap().as_ref() {
+                            Some(handle) => {
+                                handle(v);
+                                200
+                            }
+                            None => 503,
+                        },
+                        (true, Err(_)) => 400,
+                    };
+                    let _ = request.respond(tiny_http::Response::empty(status));
+                    continue;
+                }
                 if request.url().starts_with(HOOK_PATH) {
                     if let Ok(v) = serde_json::from_str::<Value>(&body) {
                         let event = v
@@ -89,7 +119,25 @@ impl HookListener {
             shutdown,
             thread: Some(thread),
             server,
+            token,
+            ui,
         })
+    }
+
+    /// The URL Ken's MCP server posts screen requests to.
+    pub fn ui_url(&self) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, UI_PATH)
+    }
+
+    /// The secret a screen request must carry; new each run.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Set what a screen request does. It must not block: the listener
+    /// serves one request at a time.
+    pub fn set_ui_handler(&self, handle: impl Fn(Value) + Send + 'static) {
+        *self.ui.lock().unwrap() = Some(Box::new(handle));
     }
 
     pub fn port(&self) -> u16 {
@@ -216,6 +264,35 @@ mod tests {
         let ev = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(ev.event, "Stop");
         assert_eq!(ev.session_id, "sess-a");
+    }
+
+    fn post_ui(port: u16, token: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let req = format!(
+            "POST {UI_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Ken-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        let _ = stream.read_to_string(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn a_screen_request_needs_the_token() {
+        let listener = HookListener::start().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        listener.set_ui_handler(move |v| {
+            let _ = tx.send(v);
+        });
+        let wrong = post_ui(listener.port(), "not-it", r#"{"open":"a.md"}"#);
+        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+        let ok = post_ui(listener.port(), listener.token(), r#"{"open":"a.md","line":3}"#);
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let v = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(v["open"], "a.md");
+        assert!(rx.try_recv().is_err(), "the refused request never reached the app");
     }
 
     #[test]

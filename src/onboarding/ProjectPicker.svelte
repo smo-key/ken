@@ -1,84 +1,76 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type RegistryEntryStatus } from "../lib/api";
+  import { api, type RecentWorkspace } from "../lib/api";
+  import { timeAgo } from "../lib/format";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import SetupFlow from "./SetupFlow.svelte";
 
+  // Ken works in workspaces: this screen opens one it knows, or sets up a
+  // new one (Folder, Team, Repos, Index).
   let error = $state<string | null>(null);
+  let setupOpen = $state(false);
 
-  async function forgetId(id: string) {
-    await api.forgetProject(id);
-    await app.refreshRegistry();
+  // Workspaces opened before, newest first: open one again in a click.
+  let recentWorkspaces = $state<RecentWorkspace[]>([]);
+  async function loadRecentWorkspaces() {
+    try {
+      recentWorkspaces = await api.listRecentWorkspaces();
+    } catch {
+      recentWorkspaces = [];
+    }
   }
-
-  function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
+  async function openRecentWorkspace(ws: RecentWorkspace) {
+    if (!ws.available) return;
+    error = null;
+    try {
+      await app.openWorkspace(ws.path);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  // A folder picked to open that holds no workspace: said plainly, with the
+  // way to make one.
+  let noWorkspaceAt = $state<string | null>(null);
+  async function openWorkspaceFolder() {
+    error = null;
+    noWorkspaceAt = null;
+    const folder = await openDialog({ directory: true, title: "Choose the workspace's folder" });
+    if (typeof folder !== "string") return;
+    try {
+      await app.openWorkspace(folder);
+    } catch (e) {
+      if (String(e).includes(".ken-workspace")) noWorkspaceAt = folder;
+      else error = String(e);
+    }
+  }
+  async function forgetWorkspace(id: string) {
+    await api.forgetWorkspace(id);
+    await loadRecentWorkspaces();
+  }
+  function workspaceMenu(e: MouseEvent, ws: RecentWorkspace) {
     e.preventDefault();
     const x = e.clientX;
     const y = e.clientY;
     openContextMenu(x, y, [
-      {
-        label: "Open",
-        icon: FolderOpen,
-        disabled: !entry.available,
-        onSelect: () => openExisting(entry.path, entry.available),
-      },
+      { label: "Open", icon: FolderOpen, disabled: !ws.available, onSelect: () => openRecentWorkspace(ws) },
       "separator",
       {
-        label: "Remove from Ken…",
+        label: "Remove from this list",
         icon: Trash2,
         danger: true,
-        onSelect: () =>
-          openConfirm(x, y, {
-            title: `Remove “${entry.name}”?`,
-            body: "Removes it from Ken's list — the folder and its files stay on disk.",
-            confirmLabel: "Remove from Ken",
-            onConfirm: () => void forgetId(entry.id),
-          }),
+        onSelect: () => void forgetWorkspace(ws.id),
       },
     ]);
   }
-  let pendingPath = $state<string | null>(null);
-  let pendingName = $state("");
 
-  async function chooseFolder() {
-    error = null;
-    const folder = await openDialog({
-      directory: true,
-      title: "Choose the folder that holds your knowledge",
-    });
-    if (typeof folder !== "string") return;
-    pendingPath = folder;
-    pendingName = folder.split("/").pop() ?? "My project";
-  }
-
-  async function confirmCreate() {
-    if (!pendingPath) return;
-    try {
-      await app.createProject(pendingPath, pendingName.trim() || "My project");
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function openExisting(path: string, available: boolean) {
-    if (!available) return;
-    error = null;
-    try {
-      await app.openProject(path);
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function forget(id: string, e: MouseEvent) {
-    e.stopPropagation();
-    await api.forgetProject(id);
-    await app.refreshRegistry();
-  }
+  onMount(() => {
+    void loadRecentWorkspaces();
+  });
 </script>
 
 <div class="wrap" data-tauri-drag-region>
@@ -93,52 +85,63 @@
       reads it, keeps watch, and makes every fact findable.
     </p>
 
-    {#if pendingPath}
-      <div class="confirm">
-        <div class="mono path">{pendingPath}</div>
-        <label>
-          Project name
-          <input
-            bind:value={pendingName}
-            onkeydown={(e) => {
-              e.stopPropagation();
-              if (e.key === "Enter") confirmCreate();
-            }}
-          />
-        </label>
-        <div class="confirm-actions">
-          <button class="btn btn-primary" onclick={confirmCreate}>Create project</button>
-          <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
-        </div>
-      </div>
+    {#if setupOpen}
+      <SetupFlow onclose={() => (setupOpen = false)} />
     {:else}
-      <button class="btn btn-primary big" onclick={chooseFolder}>Choose a folder…</button>
+      <!-- Ken works in workspaces: open one Ken already knows, or set up a
+           new one. Set-up is offered on a fresh install too: confirming it
+           turns the workspace feature on. -->
+      <div class="choose-row stacked">
+        <button class="choice" onclick={openWorkspaceFolder}>
+          <span class="choice-title">Open a workspace</span>
+          <span class="choice-note">
+            Pick the folder of a workspace set up before, on this machine or
+            by a teammate.
+          </span>
+        </button>
+        <button class="choice" onclick={() => (setupOpen = true)}>
+          <span class="choice-title">Set up a new workspace</span>
+          <span class="choice-note">
+            Pick the repos Ken should know, wherever they live. It proposes what
+            each is, its team and how deep to read it; nothing is written until
+            you confirm.
+          </span>
+        </button>
+      </div>
+      {#if noWorkspaceAt}
+        <div class="error">
+          No Ken workspace in {noWorkspaceAt}.
+          <button class="btn btn-ghost" onclick={() => { noWorkspaceAt = null; setupOpen = true; }}>Set one up</button>
+        </div>
+      {/if}
     {/if}
 
     {#if error}
       <div class="error">{error}</div>
     {/if}
 
-    {#if app.registry.length > 0 && !pendingPath}
-      <div class="recent-label">Recent projects</div>
+    {#if recentWorkspaces.length > 0 && !setupOpen}
+      <div class="recent-label">Recent workspaces</div>
       <div class="recents">
-        {#each app.registry as entry (entry.id)}
+        {#each recentWorkspaces as ws (ws.id)}
           <button
             class="recent"
-            class:unavailable={!entry.available}
-            onclick={() => openExisting(entry.path, entry.available)}
-            oncontextmenu={(e) => rowMenu(e, entry)}
+            class:unavailable={!ws.available}
+            onclick={() => openRecentWorkspace(ws)}
+            oncontextmenu={(e) => workspaceMenu(e, ws)}
           >
-            <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
+            <span class="badge">{ws.name.charAt(0).toUpperCase()}</span>
             <span class="info">
-              <span class="name">{entry.name}</span>
-              <span class="mono path-small">{entry.path}</span>
-              {#if !entry.available}
+              <span class="name">{ws.name}</span>
+              <span class="mono path-small">{ws.path}</span>
+              {#if ws.available}
+                <span class="path-small">{timeAgo(ws.openedAt)}</span>
+              {:else}
                 <span class="missing">Folder not found</span>
               {/if}
             </span>
-            {#if !entry.available}
-              <span class="forget" role="button" tabindex="0" onclick={(e) => forget(entry.id, e)} onkeydown={() => {}}>Remove</span>
+            {#if !ws.available}
+              <span class="forget" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
             {/if}
           </button>
         {/each}
@@ -151,8 +154,14 @@
   .wrap {
     height: 100vh;
     display: flex;
+    /* A too-tall panel (Features expanded, long candidate list) must stay
+       reachable: `align-items: center` alone clips it at BOTH ends with no
+       scroll. `safe center` degrades to `flex-start` once it would overflow;
+       the plain `center` above it is the fallback for engines without it. */
     align-items: center;
+    align-items: safe center;
     justify-content: center;
+    overflow-y: auto;
     /* Gentle lined paper: faint rules every 28px on the paper ground. */
     background:
       repeating-linear-gradient(
@@ -166,6 +175,9 @@
   }
   .panel {
     width: 460px;
+    max-width: 100%;
+    /* Never let the centering flexbox compress the panel — it scrolls instead. */
+    flex: none;
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -198,52 +210,48 @@
     line-height: 1.7;
     color: var(--ink-secondary);
   }
-  .big {
-    height: 40px;
-    font-size: 14px;
-    align-self: flex-start;
-    margin-top: 6px;
+  .choose-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
   }
-  .confirm {
+  /* Two real options: stacked cards, equal weight, so neither wins by
+     emphasis. */
+  .choose-row.stacked {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .choice {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    text-align: left;
+    padding: 12px 14px;
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 16px 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .path {
-    font-size: 12px;
-    color: var(--ink-secondary);
-    word-break: break-all;
-  }
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-secondary);
-  }
-  input {
-    height: 36px;
-    padding: 0 12px;
-    border-radius: 8px;
     border: 1px solid var(--border-strong);
-    background: var(--surface);
-    font-size: 14px;
+    border-radius: var(--radius-control);
+    box-shadow: var(--shadow-control);
+    font: inherit;
+    cursor: pointer;
     color: var(--ink);
-    outline: none;
-    font-family: inherit;
   }
-  input:focus {
+  .choice:hover {
+    border-color: var(--accent);
+  }
+  .choice:focus-visible {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+    outline: none;
   }
-  .confirm-actions {
-    display: flex;
-    gap: 8px;
+  .choice-title {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .choice-note {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink-tertiary);
   }
   .error {
     font-size: 13px;

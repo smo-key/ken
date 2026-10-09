@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Oregano&display=swap" rel="stylesheet">
+<style>
+:root{--bg:oklch(0.975 0.005 85);--panel:oklch(0.955 0.006 85);--rail:oklch(0.965 0.006 85);--surface:oklch(0.995 0.002 85);--line:oklch(0.91 0.007 80);--line-soft:oklch(0.93 0.006 80);--line-strong:oklch(0.86 0.01 80);--ink:oklch(0.23 0.01 60);--ink-2:oklch(0.4 0.01 60);--ink-3:oklch(0.55 0.01 60);--accent:oklch(0.48 0.09 175);--accent-ink:oklch(0.4 0.08 175);--accent-soft:oklch(0.93 0.03 175);--on-accent:#fff;--attn:oklch(0.68 0.13 70);--attn-ink:oklch(0.45 0.1 60);--attn-soft:oklch(0.94 0.05 75);--ok:oklch(0.55 0.11 155);--ok-soft:oklch(0.94 0.04 155);--danger:oklch(0.52 0.15 28);--danger-soft:oklch(0.95 0.03 28);--info:oklch(0.48 0.1 255);--shadow-1:0 1px 2px rgba(30,25,20,.05);--shadow-pop:0 16px 48px rgba(30,25,20,.18)}
+:root[data-theme=dark]{--bg:oklch(0.19 0.008 70);--panel:oklch(0.165 0.008 70);--rail:oklch(0.21 0.008 70);--surface:oklch(0.225 0.009 70);--line:oklch(0.3 0.01 70);--line-soft:oklch(0.27 0.01 70);--line-strong:oklch(0.36 0.01 70);--ink:oklch(0.94 0.008 85);--ink-2:oklch(0.78 0.01 80);--ink-3:oklch(0.64 0.01 75);--accent:oklch(0.72 0.1 175);--accent-ink:oklch(0.8 0.09 175);--accent-soft:oklch(0.3 0.04 175);--on-accent:oklch(0.18 0.02 175);--attn:oklch(0.8 0.13 80);--attn-ink:oklch(0.85 0.11 80);--attn-soft:oklch(0.32 0.05 75);--ok:oklch(0.72 0.12 155);--ok-soft:oklch(0.3 0.04 155);--danger:oklch(0.72 0.14 30);--danger-soft:oklch(0.3 0.05 28);--info:oklch(0.75 0.09 255);--shadow-1:0 1px 2px rgba(0,0,0,.3);--shadow-pop:0 16px 48px rgba(0,0,0,.5)}
+html,body{margin:0;background:var(--bg)}body{font-family:"Hanken Grotesk",system-ui,sans-serif;color:var(--ink);-webkit-font-smoothing:antialiased}a{color:var(--accent-ink);text-decoration:none}a:hover{text-decoration:underline}button{font-family:inherit;cursor:pointer}
+</style>
+</helmet>
+<div style="max-width:1080px;margin:0 auto;padding:56px 32px 96px;display:flex;flex-direction:column;gap:64px">
+  <header style="display:flex;align-items:flex-start;gap:20px">
+    <span style="width:56px;height:56px;border-radius:14px;background:var(--ink);color:var(--bg);display:flex;align-items:center;justify-content:center;font-family:Oregano,cursive;font-size:36px;flex:none">K</span>
+    <div style="display:flex;flex-direction:column;gap:8px;flex:1">
+      <span style="font-size:12px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)">Ken design system · Briefing</span>
+      <h1 style="margin:0;font-family:Newsreader,serif;font-size:42px;font-weight:500;letter-spacing:-.015em;line-height:1.08">Calm by default, clear about what needs you</h1>
+      <p style="margin:0;font-size:16px;line-height:1.6;color:var(--ink-2);max-width:64ch;text-wrap:pretty">This replaces Paper &amp; Ink. The warmth and the serif-led reading stay. The changes: a teal accent for actions, amber reserved for "needs you", one component set used on every screen, and text no smaller than 11px.</p>
+    </div>
+    <button onClick="{{ toggleTheme }}" style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:13px;font-weight:500;display:flex;align-items:center;gap:8px;flex:none"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/sun-moon.svg) center/contain no-repeat"></span>{{ themeLabel }}</button>
+  </header>
+
+  <section style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px">
+    <sc-for list="{{ principles }}" as="p" hint-placeholder-count="4">
+      <div style="display:flex;flex-direction:column;gap:6px;padding-top:14px;border-top:2px solid var(--ink)">
+        <span style="font-size:15px;font-weight:600">{{ p.t }}</span>
+        <span style="font-size:13.5px;line-height:1.55;color:var(--ink-2);text-wrap:pretty">{{ p.d }}</span>
+      </div>
+    </sc-for>
+  </section>
+
+  <section style="display:flex;flex-direction:column;gap:20px">
+    <div style="display:flex;align-items:baseline;gap:12px"><h2 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500">Color</h2><span style="font-size:14px;color:var(--ink-3)">Every color is a token with a light and a dark value. Components only use tokens.</span></div>
+    <div style="display:flex;flex-direction:column;border-top:1px solid var(--line)">
+      <div style="display:grid;grid-template-columns:160px minmax(0,1fr) 120px 120px;gap:16px;padding:8px 0;border-bottom:1px solid var(--line);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)"><span>Token</span><span>Use</span><span>Light</span><span>Dark</span></div>
+      <sc-for list="{{ colors }}" as="c" hint-placeholder-count="12">
+        <sc-if value="{{ c.group }}"><div style="padding:16px 0 6px;font-size:12px;font-weight:700;color:var(--ink-2)">{{ c.group }}</div></sc-if>
+        <sc-if value="{{ c.name }}">
+          <div style="display:grid;grid-template-columns:160px minmax(0,1fr) 120px 120px;gap:16px;padding:7px 0;border-bottom:1px solid var(--line-soft);align-items:center">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:12.5px">--{{ c.name }}</span>
+            <span style="font-size:13.5px;color:var(--ink-2)">{{ c.use }}</span>
+            <span style="height:28px;border-radius:6px;background:{{ c.light }};border:1px solid rgba(0,0,0,.08)"></span>
+            <span style="height:28px;border-radius:6px;background:{{ c.dark }};border:1px solid rgba(255,255,255,.08)"></span>
+          </div>
+        </sc-if>
+      </sc-for>
+    </div>
+  </section>
+
+  <section style="display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:40px">
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <h2 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500">Type</h2>
+      <div style="display:flex;flex-direction:column;border-top:1px solid var(--line)">
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">display 34/500</span><span style="font-family:Newsreader,serif;font-size:34px;font-weight:500;letter-spacing:-.015em;line-height:1.1">Good morning, Sam</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">title 26/500</span><span style="font-family:Newsreader,serif;font-size:26px;font-weight:500;letter-spacing:-.01em">Board meeting, 30 September</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">lead 18/1.55</span><span style="font-family:Newsreader,serif;font-size:18px;line-height:1.55">Three things moved overnight. Priya updated the handbook.</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">heading 15/600</span><span style="font-size:15px;font-weight:600">Your list</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">body 14/1.55</span><span style="font-size:14px;line-height:1.55">Call Marcus about the catering quote</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">small 12.5</span><span style="font-size:12.5px;color:var(--ink-3)">from the board meeting · governance</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">label 11/600</span><span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Needs you</span></div>
+        <div style="display:flex;align-items:baseline;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft)"><span style="width:110px;flex:none;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">mono 12</span><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent-ink)">OPS-142 · Research/Ingested/2025-09-30.md</span></div>
+      </div>
+      <p style="margin:0;font-size:13.5px;line-height:1.55;color:var(--ink-3)">Newsreader for what you read (digest, document and page titles). Hanken Grotesk for everything you operate. JetBrains Mono only for ticket IDs, paths and the terminal. Oregano is the K in the logo and nowhere else.</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <h2 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500">Space &amp; shape</h2>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <sc-for list="{{ spaces }}" as="s" hint-placeholder-count="8">
+          <div style="display:flex;align-items:center;gap:12px"><span style="width:40px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink-3)">{{ s.n }}</span><span style="height:12px;width:{{ s.px }};background:var(--accent);border-radius:2px;opacity:.7"></span><span style="font-size:12.5px;color:var(--ink-3)">{{ s.use }}</span></div>
+        </sc-for>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:8px">
+        <sc-for list="{{ radii }}" as="r" hint-placeholder-count="4">
+          <div style="display:flex;flex-direction:column;gap:6px;align-items:center"><span style="width:56px;height:56px;background:var(--surface);border:1px solid var(--line-strong);border-radius:{{ r.px }}"></span><span style="font-size:12px;color:var(--ink-3);text-align:center">{{ r.n }}</span></div>
+        </sc-for>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:13px;line-height:1.55;color:var(--ink-2);margin-top:8px">
+        <span><b style="font-weight:600">Controls:</b> 28 small, 34 default, 40 large.</span>
+        <span><b style="font-weight:600">Elevation:</b> borders first. Shadows only for things that float (menus, dialogs, search).</span>
+      </div>
+    </div>
+  </section>
+
+  <section style="display:flex;flex-direction:column;gap:28px">
+    <h2 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500">Components</h2>
+
+    <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px">
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Buttons</span>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+          <button style="height:34px;padding:0 14px;border-radius:8px;border:none;background:var(--accent);color:var(--on-accent);font-size:13.5px;font-weight:600" style-hover="filter:brightness(1.08)">Accept</button>
+          <button style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:13.5px;font-weight:500" style-hover="background:var(--bg)">Open in Files</button>
+          <button style="height:34px;padding:0 12px;border-radius:8px;border:none;background:transparent;color:var(--ink-2);font-size:13.5px;font-weight:500" style-hover="background:var(--panel);color:var(--ink)">Later</button>
+          <button style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--danger);background:var(--danger-soft);color:var(--danger);font-size:13.5px;font-weight:600">Undo all</button>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+          <button style="height:28px;padding:0 11px;border-radius:7px;border:none;background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600">Small</button>
+          <button style="height:28px;padding:0 11px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--ink-2);font-size:12.5px">Secondary</button>
+          <button style="height:28px;padding:0 10px;border-radius:7px;border:none;background:transparent;color:var(--accent-ink);font-size:13px;font-weight:600;display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span>Add task</button>
+          <button style="height:40px;padding:0 18px;border-radius:9px;border:none;background:var(--accent);color:var(--on-accent);font-size:14px;font-weight:600">Large</button>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">One primary per group, always first. Destructive actions are never primary.</span>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Badges &amp; status</span>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+          <span style="font-size:11.5px;font-weight:700;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:var(--attn-soft);color:var(--attn-ink);display:inline-flex;align-items:center;justify-content:center">4</span>
+          <span style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;background:var(--attn-soft);color:var(--attn-ink);display:inline-flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--attn)"></span>Needs you</span>
+          <span style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;background:var(--ok-soft);color:var(--ok);display:inline-flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--ok)"></span>Synced</span>
+          <span style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;background:var(--danger-soft);color:var(--danger);display:inline-flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--danger)"></span>Couldn't read</span>
+          <span style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;background:var(--accent-soft);color:var(--accent-ink);display:inline-flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--accent)"></span>Reading</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+          <span style="font-size:12px;color:var(--ink-2);background:var(--panel);border-radius:6px;padding:2px 8px">in progress</span>
+          <span style="font-size:12px;color:var(--ink-2);background:var(--panel);border-radius:6px;padding:2px 8px">finance</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-2);border:1px solid var(--line);border-radius:6px;padding:1px 7px">Q4 Budget.xlsx</span>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">Amber means something is waiting on you, and nothing else. Red is for failures. Status pills always include a word, never just a dot.</span>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Inputs</span>
+        <div style="height:36px;border-radius:10px;border:1px solid var(--line);background:var(--surface);display:flex;align-items:center;gap:10px;padding:0 12px;font-size:13.5px;color:var(--ink-3)"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1">Search or ask Northside Ops…</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:5px;padding:1px 6px">⌘K</span></div>
+        <div style="height:36px;border-radius:8px;border:1px solid var(--accent);box-shadow:0 0 0 3px var(--accent-soft);background:var(--surface);display:flex;align-items:center;padding:0 12px;font-size:13.5px;color:var(--ink)">Send Priya feedback on the handbook</div>
+        <div style="min-height:64px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);padding:10px 12px;font-size:13.5px;color:var(--ink-3);box-sizing:border-box">Reply to Dana…</div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Navigation</span>
+        <div style="display:flex;gap:16px">
+          <div style="width:220px;display:flex;flex-direction:column;gap:2px;padding:8px;border-radius:10px;background:var(--panel)">
+            <div style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;background:var(--accent-soft);color:var(--accent-ink);font-size:13.5px;font-weight:600"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/house.svg) center/contain no-repeat"></span>Home</div>
+            <div style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;color:var(--ink-2);font-size:13.5px;font-weight:500"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/inbox.svg) center/contain no-repeat"></span><span style="flex:1">Inbox</span><span style="font-size:11.5px;font-weight:700;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:var(--attn-soft);color:var(--attn-ink);display:inline-flex;align-items:center;justify-content:center">6</span></div>
+            <div style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;color:var(--ink-2);font-size:13.5px;font-weight:500"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/folder-open.svg) center/contain no-repeat"></span><span style="flex:1">Files</span><span style="width:7px;height:7px;border-radius:4px;background:var(--accent)"></span></div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="display:inline-flex;padding:3px;border-radius:9px;background:var(--panel);gap:2px">
+              <span style="height:28px;padding:0 12px;border-radius:7px;background:var(--surface);box-shadow:var(--shadow-1);font-size:13px;font-weight:600;display:flex;align-items:center">Map</span>
+              <span style="height:28px;padding:0 12px;border-radius:7px;font-size:13px;color:var(--ink-2);display:flex;align-items:center">Timeline</span>
+            </div>
+            <div style="display:flex;gap:16px;border-bottom:1px solid var(--line)">
+              <span style="padding:6px 0;font-size:13.5px;font-weight:600;border-bottom:2px solid var(--ink);margin-bottom:-1px">All · 6</span>
+              <span style="padding:6px 0;font-size:13.5px;color:var(--ink-3)">People · 2</span>
+              <span style="padding:6px 0;font-size:13.5px;color:var(--ink-3)">Ken · 3</span>
+            </div>
+          </div>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">Counts use amber only when they count things waiting on you. A teal dot means new, with nothing to do.</span>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:20px">
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">List rows · tickets are square, tasks are round</span>
+        <div style="display:flex;flex-direction:column;border-top:1px solid var(--line)">
+          <div style="display:flex;align-items:center;gap:12px;min-height:44px;border-bottom:1px solid var(--line-soft)"><span style="width:18px;height:18px;border-radius:5px;border:1.5px solid var(--line-strong);box-sizing:border-box"></span><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent-ink)">OPS-131</span><span style="flex:1;font-size:14px;font-weight:500">Move the shift rota to the new sheet</span><span style="font-size:12px;color:var(--ink-2);background:var(--panel);border-radius:6px;padding:2px 8px">blocked</span><span style="width:60px;text-align:right;font-size:12.5px;font-weight:600;color:var(--danger)">2d late</span></div>
+          <div style="display:flex;align-items:center;gap:12px;min-height:44px;border-bottom:1px solid var(--line-soft);background:var(--accent-soft);margin:0 -10px;padding:0 10px;border-radius:6px"><span style="width:18px;height:18px;border-radius:9px;border:1.5px solid var(--line-strong);box-sizing:border-box;background:var(--surface)"></span><span style="flex:1;font-size:14px;font-weight:500">Call Marcus about the catering quote</span><span style="font-size:12.5px;color:var(--ink-3)">board meeting</span><span style="width:60px;text-align:right;font-size:12.5px;font-weight:600;color:var(--accent-ink)">Today</span></div>
+          <div style="display:flex;align-items:center;gap:12px;min-height:44px;border-bottom:1px solid var(--line-soft)"><span style="width:18px;height:18px;border-radius:9px;border:1.5px dashed var(--attn);box-sizing:border-box"></span><span style="flex:1;font-size:14px;font-weight:500">Review grant draft section 3</span><span style="font-size:12.5px;color:var(--attn-ink)">from Dana</span><button style="height:28px;padding:0 11px;border-radius:7px;border:none;background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600">Accept</button></div>
+          <div style="display:flex;align-items:center;gap:12px;min-height:44px;border-bottom:1px solid var(--line-soft)"><span style="width:18px;height:18px;border-radius:9px;background:var(--accent);box-sizing:border-box;display:flex;align-items:center;justify-content:center"><span style="width:11px;height:11px;background:var(--on-accent);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span></span><span style="flex:1;font-size:14px;color:var(--ink-3);text-decoration:line-through">Book a room for Tuesday standup</span><span style="width:60px;text-align:right;font-size:12.5px;color:var(--ink-3)">Mon</span></div>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">Rows: hover, selected (teal tint) and done. A dashed circle means a teammate sent it and you haven't accepted it yet.</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--rail);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Action card · the "Needs you" unit</span>
+        <div style="display:flex;flex-direction:column;gap:6px;padding:14px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+          <div style="display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;color:var(--danger);text-transform:uppercase;letter-spacing:.05em"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/git-compare.svg) center/contain no-repeat"></span>Conflict · Ken</div>
+          <div style="font-size:14px;font-weight:600;line-height:1.35">Handbook disagrees with Ways of Working</div>
+          <div style="font-size:12.5px;color:var(--ink-3);line-height:1.45">Shift swaps: 48h notice vs. 24h. Pick which one stands.</div>
+          <div style="display:flex;gap:6px;margin-top:4px"><button style="height:28px;padding:0 11px;border-radius:7px;border:none;background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600">Compare</button><button style="height:28px;padding:0 11px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--ink-2);font-size:12.5px">Later</button></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:12px;border:1px dashed var(--line-strong)">
+          <div style="display:flex;align-items:center;gap:8px;font-size:13px"><b style="font-weight:600">Reading</b><span style="color:var(--ink-2)">board-2025-09-30.vtt</span><span style="flex:1"></span><span style="font-variant-numeric:tabular-nums;color:var(--ink-3)">62%</span></div>
+          <div style="height:4px;border-radius:2px;background:var(--line-soft)"><div style="width:62%;height:100%;border-radius:2px;background:var(--accent)"></div></div>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">Kind, then who it's from, a title, one line of context, then at most two actions.</span>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px">
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">File glyphs</span>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <sc-for list="{{ glyphs }}" as="g" hint-placeholder-count="7">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:6px;width:56px"><span style="width:36px;height:36px;border-radius:9px;background:{{ g.soft }};display:flex;align-items:center;justify-content:center"><span style="width:18px;height:18px;background:{{ g.c }};mask:url({{ g.icon }}) center/contain no-repeat"></span></span><span style="font-size:11.5px;color:var(--ink-3)">{{ g.n }}</span></div>
+          </sc-for>
+        </div>
+        <span style="font-size:12.5px;color:var(--ink-3);line-height:1.5">Ken-maintained pages use the ink tile, so the documents Ken keeps up to date stand out from raw files.</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+        <span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Empty state · voice</span>
+        <div style="display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:18px;border-radius:10px;background:var(--bg)">
+          <span style="font-family:Newsreader,serif;font-size:19px;font-weight:500">Nothing waiting on you</span>
+          <span style="font-size:13.5px;color:var(--ink-2);line-height:1.55">When a teammate sends you something, or Ken needs a decision, it shows up here.</span>
+        </div>
+        <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.65;color:var(--ink-2)">
+          <li>Say what happened, then what to do. "Ken couldn't read scan_0042.pdf. It may be a scan with no text."</li>
+          <li>Buttons are verbs: Accept, Compare, Open note. Never "OK".</li>
+          <li>No repo, frontmatter or commit words outside Settings.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;'light'|'dark'&quot;}}">
+class Component extends DCLogic {
+  state = { dark: false };
+  componentDidMount(){ this.apply(); }
+  componentDidUpdate(){ this.apply(); }
+  apply(){ const d = this.props.theme ? this.props.theme === "dark" : this.state.dark; document.documentElement.dataset.theme = d ? "dark" : "light"; }
+  renderVals() {
+    const I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    const dark = this.props.theme ? this.props.theme === "dark" : this.state.dark;
+    const C = (g, rows) => [{group:g}, ...rows.map(([name,use,light,dark])=>({name,use,light,dark}))];
+    const colors = [
+      ...C("Surfaces", [["bg","App background","oklch(0.975 0.005 85)","oklch(0.19 0.008 70)"],["panel","Sidebar, wells, chips","oklch(0.955 0.006 85)","oklch(0.165 0.008 70)"],["rail","Right rail, Ask Ken panel","oklch(0.965 0.006 85)","oklch(0.21 0.008 70)"],["surface","Cards, inputs, editor","oklch(0.995 0.002 85)","oklch(0.225 0.009 70)"],["line","Borders","oklch(0.91 0.007 80)","oklch(0.3 0.01 70)"],["line-strong","Control borders","oklch(0.86 0.01 80)","oklch(0.36 0.01 70)"]]),
+      ...C("Ink", [["ink","Primary text","oklch(0.23 0.01 60)","oklch(0.94 0.008 85)"],["ink-2","Secondary text","oklch(0.4 0.01 60)","oklch(0.78 0.01 80)"],["ink-3","Captions, placeholders","oklch(0.55 0.01 60)","oklch(0.64 0.01 75)"]]),
+      ...C("Meaning", [["accent","Primary actions, selection, links","oklch(0.48 0.09 175)","oklch(0.72 0.1 175)"],["accent-soft","Selected rows, active nav","oklch(0.93 0.03 175)","oklch(0.3 0.04 175)"],["attn","Needs you (only)","oklch(0.68 0.13 70)","oklch(0.8 0.13 80)"],["attn-soft","Needs-you badges","oklch(0.94 0.05 75)","oklch(0.32 0.05 75)"],["ok","Synced, done","oklch(0.55 0.11 155)","oklch(0.72 0.12 155)"],["danger","Failed, conflict, late","oklch(0.52 0.15 28)","oklch(0.72 0.14 30)"],["info","Word documents","oklch(0.48 0.1 255)","oklch(0.75 0.09 255)"]])
+    ];
+    const principles = [
+      {t:"One home per job",d:"Every decision lives in the Inbox. Other screens show it, but resolving it anywhere resolves it everywhere."},
+      {t:"Amber means you",d:"Amber is used only for things that need you. If it's amber, there's something you need to do."},
+      {t:"Read first, operate second",d:"Serif for knowledge, sans for controls. The digest and documents set the tone."},
+      {t:"Plain words",d:"Ken speaks in first person and in full sentences. Developer vocabulary stays in Settings."}
+    ];
+    const spaces = [[4,"icon gaps"],[8,"inside controls"],[12,"between related items"],[16,"card padding"],[20,"between cards"],[24,"page gutters"],[32,"between sections"],[40,"page padding"]].map(([n,use])=>({n,px:(n*3)+"px",use}));
+    const radii = [["6 · chips","6px"],["8 · controls","8px"],["12 · cards","12px"],["16 · overlays","16px"]].map(([n,px])=>({n,px}));
+    const glyphs = [["Doc","file-text","var(--info)","color-mix(in oklch, var(--info) 12%, transparent)"],["Sheet","file-spreadsheet","var(--ok)","var(--ok-soft)"],["PDF","file-type","var(--danger)","var(--danger-soft)"],["Slides","presentation","var(--attn-ink)","var(--attn-soft)"],["Note","notebook-text","var(--ink-2)","var(--panel)"],["Audio","audio-lines","var(--accent-ink)","var(--accent-soft)"],["Ken page","book-open","var(--bg)","var(--ink)"]].map(([n,i,c,soft])=>({n,icon:I(i),c,soft}));
+    return { colors, principles, spaces, radii, glyphs, themeLabel: dark ? "Light" : "Dark", toggleTheme: () => this.setState(s => ({ dark: !s.dark })) };
+  }
+}
+</script>
+</body>
+</html>

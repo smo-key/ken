@@ -25,13 +25,23 @@ pub enum Priority {
 
 /// How many tokens a generation may emit, chosen per job by priority. Quick
 /// answers (Interactive) are a short, streamed summary, so 256 tokens covers a
-/// full answer while keeping the tail latency low. Background Map extraction
-/// only ever emits a small, bounded JSON delta (≤ 40 entities / 60 relations /
-/// 20 events per file — see `knowledge_model`), so its budget is ample and
-/// keeps the per-file decode work — the dominant cost of indexing a large
-/// project — bounded.
+/// full answer while keeping the tail latency low.
+///
+/// Background Map extraction emits a JSON delta of up to 40 entities / 60
+/// relations / 20 events per file (see `knowledge_model`). The budget here was
+/// 512 and described as "ample"; it was not. Forty entities alone, each with a
+/// name, kind and description, is on the order of a thousand tokens, so the
+/// generation was severed mid-array and `parse_json_lenient` then threw the
+/// whole file away. Measured on a real project: 354 errors to 77 successes,
+/// dominated by `EOF while parsing a list`, with every failure costing a full
+/// GPU generation and then being retried twice more by the DB attempt cap.
+///
+/// 2048 leaves 6136 of the 8192-token context for the prompt (see
+/// `max_prompt_tokens`) and costs nothing on short outputs, which stop at EOG
+/// long before the cap. The cap only ever binds on the outputs that were
+/// previously being destroyed.
 pub(crate) const INTERACTIVE_MAX_TOKENS: usize = 256;
-pub(crate) const BACKGROUND_MAX_TOKENS: usize = 512;
+pub(crate) const BACKGROUND_MAX_TOKENS: usize = 2048;
 
 /// The generation length cap for a job at this priority. Scoping the cap here
 /// (rather than on the engine) keeps the quick-answer budget untouched while the
@@ -139,14 +149,153 @@ impl Utf8Streamer {
 /// `}` or `]`. Good enough for the greedy, schema-hinted generations Map
 /// extraction and any JSON caller produce.
 pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
-    let start = text.find(['{', '[']);
-    let end = text.rfind(['}', ']']);
-    let slice = match (start, end) {
-        (Some(s), Some(e)) if e >= s => &text[s..=e],
-        _ => return Err(Error::Other("no JSON object found in the model output".into())),
+    let Some(start) = text.find(['{', '[']) else {
+        return Err(Error::Other("no JSON object found in the model output".into()));
     };
-    serde_json::from_str(slice)
-        .map_err(|e| Error::Other(format!("model output wasn't valid JSON: {e}")))
+    // The strict attempt stays scoped to the outermost bracket pair, so a model
+    // that appends a sentence of commentary after valid JSON still parses.
+    if let Some(end) = text.rfind(['}', ']']) {
+        if end >= start {
+            if let Ok(v) = serde_json::from_str(&text[start..=end]) {
+                return Ok(v);
+            }
+            // The commonest slip of a small model: a comma before a closing
+            // bracket (`{"a": 1,}`). Valid in JavaScript, not in JSON.
+            if let Ok(v) = serde_json::from_str(&drop_trailing_commas(&text[start..=end])) {
+                return Ok(v);
+            }
+        }
+    }
+    // Nothing parsed cleanly. If the text is merely INCOMPLETE — the usual
+    // shape of a generation that hit its token cap — recover the part the model
+    // did finish rather than discarding the whole thing. Repair runs on the
+    // full tail, not the bracket-bounded slice, because a severed generation
+    // frequently has no closing bracket to find.
+    if let Some(repaired) = repair_truncated_json(&text[start..]) {
+        if let Ok(v) = serde_json::from_str(&repaired) {
+            return Ok(v);
+        }
+    }
+    // Still nothing, and not a cut-off answer. The first bracket may not open
+    // the answer (a `[[link]]` in prose the
+    // model echoed), and a finished object may have text after it (it kept
+    // writing). Try each `{` in turn and take the first whole object there,
+    // whatever follows it.
+    for (pos, _) in text.match_indices('{').take(64) {
+        let tail = drop_trailing_commas(&text[pos..]);
+        let mut values = serde_json::Deserializer::from_str(&tail).into_iter::<serde_json::Value>();
+        if let Some(Ok(v)) = values.next() {
+            if v.as_object().is_some_and(|o| !o.is_empty()) {
+                return Ok(v);
+            }
+        }
+    }
+    let detail = match text.rfind(['}', ']']) {
+        Some(end) if end >= start => serde_json::from_str::<serde_json::Value>(&text[start..=end])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unparseable".into()),
+        _ => "output ended before the JSON was closed".into(),
+    };
+    Err(Error::Other(format!("model output wasn't valid JSON: {detail}")))
+}
+
+/// Best-effort recovery of JSON that was cut off mid-value.
+///
+/// A generation that hits its token cap stops wherever it happens to be —
+/// inside a string, between an object's key and value, halfway through an
+/// array. What it produced up to that point is usually most of a useful answer,
+/// and discarding all of it turns a partial result into a total loss. That is
+/// what was happening to Map extraction: the cap severed the JSON and every
+/// affected file was recorded as an error and retried twice more.
+///
+/// Deliberately conservative. It only ever DROPS a trailing incomplete value
+/// and appends the closers for containers that were still open, so the result
+/// is always a prefix of what the model actually said. It never invents a key,
+/// a value, or a delimiter. Returns `None` when nothing was left open, which
+/// means the text is malformed rather than truncated and the caller's original
+/// parse error is the honest thing to report.
+/// `text` with every comma that only whitespace separates from a closing
+/// `}` or `]` removed, outside strings.
+fn drop_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        } else if c == ',' && chars[i + 1..].iter().find(|n| !n.is_whitespace()).is_some_and(|n| matches!(n, '}' | ']')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn repair_truncated_json(slice: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    // Where we could cut and still have a complete value, plus the containers
+    // open at that point. The stack is snapshotted because later pops make the
+    // final stack say nothing about the state back here.
+    let mut safe: Option<(usize, Vec<char>)> = None;
+
+    for (i, ch) in slice.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+                // Just past a complete container: everything to here parses.
+                safe = Some((i + ch.len_utf8(), stack.clone()));
+            }
+            // A comma proves the value before it finished. Cut BEFORE it, so a
+            // dangling separator never survives into the repaired text.
+            ',' => safe = Some((i, stack.clone())),
+            _ => {}
+        }
+    }
+
+    // Balanced: this is not a truncation, so there is nothing here to fix.
+    if stack.is_empty() {
+        return None;
+    }
+
+    let (cut, open) = match safe {
+        Some(found) => found,
+        // Cut off before any value completed, e.g. `[{"name": "half`. The only
+        // honest repair is an empty container of the outermost kind.
+        None => {
+            let (i, c) = slice.char_indices().next()?;
+            (i + c.len_utf8(), stack[..1].to_vec())
+        }
+    };
+
+    let mut out = slice[..cut].to_string();
+    out.extend(open.iter().rev());
+    Some(out)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,7 +542,14 @@ impl LlmService {
             let text = self.run(&this_prompt, true, priority, &mut |_| true)?;
             match parse_json_lenient(&text) {
                 Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    // For diagnosing a model: its unparseable answers, kept.
+                    if let Some(dir) = std::env::var_os("KEN_LLM_DEBUG_DIR") {
+                        let name = format!("unparsed-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(name), format!("{e}\n---\n{text}"));
+                    }
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Other("model produced no JSON".into())))
@@ -578,7 +734,7 @@ pub fn init(base_dir: PathBuf) {
 }
 
 #[allow(dead_code)]
-fn base_dir() -> Option<PathBuf> {
+pub(crate) fn base_dir() -> Option<PathBuf> {
     BASE_DIR.get()?.lock().unwrap().clone()
 }
 
@@ -695,6 +851,39 @@ fn make_real_engine() -> std::result::Result<Box<dyn Engine>, EngineBuildError> 
     ))
 }
 
+/// The single, process-wide llama.cpp backend.
+///
+/// `LlamaBackend::init()` wraps `llama_backend_init()`, which touches a global
+/// and MUST run exactly once per process — a second call errors
+/// (`BackendAlreadyInitialized`). Both the generative [`llama::LlamaEngine`] and
+/// the embedding `LlamaEmbedder` (embedder.rs) run as separate llama.cpp
+/// contexts in this one process, so they share this backend rather than each
+/// calling `init()`. `LlamaBackend` is a fieldless, auto-`Send`+`Sync` handle,
+/// so a `'static` shared reference is sound. The `Mutex` serializes the
+/// first-init race; after that `OnceLock::get()` is a lock-free fast path.
+#[cfg(feature = "local-llm")]
+pub(crate) fn shared_backend() -> Result<&'static llama_cpp_2::llama_backend::LlamaBackend> {
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use std::sync::{Mutex, OnceLock};
+
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    // Serialize first init so two threads never both call `LlamaBackend::init()`
+    // (the loser would get `BackendAlreadyInitialized`).
+    let _guard = INIT_LOCK.lock().unwrap();
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let backend = LlamaBackend::init()
+        .map_err(|e| Error::Other(format!("couldn't start llama.cpp: {e}")))?;
+    let _ = BACKEND.set(backend);
+    Ok(BACKEND.get().expect("backend just set"))
+}
+
 /// The real llama.cpp engine, copying Task 1's VERIFIED llama-cpp-2 0.1.151 call
 /// sequence verbatim. `token_to_bytes`/`Special` are deprecated convenience
 /// wrappers (they run the `token_to_piece_bytes` buffer-resize loop internally);
@@ -715,20 +904,34 @@ mod llama {
     use super::{Engine, Utf8Streamer};
     use crate::{Error, Result};
 
+    /// A JSON object, as GBNF (llama.cpp's own `json.gbnf`, rooted at an
+    /// object: every JSON generation asks for one).
+    const JSON_GRAMMAR: &str = r#"
+root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
+array  ::= "[" ws ( value ("," ws value)* )? "]" ws
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\"" ws
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+ws     ::= | " " | "\n" [ \t]{0,20}
+"#;
+
     /// The real llama.cpp engine. Holds the backend + weights for the process
     /// lifetime; a fresh context is created per generation (cheap next to load).
     pub struct LlamaEngine {
-        backend: LlamaBackend,
+        backend: &'static LlamaBackend,
         model: LlamaModel,
         n_ctx: u32,
     }
 
     impl LlamaEngine {
         pub fn load(path: &Path) -> Result<Self> {
-            let backend = LlamaBackend::init()
-                .map_err(|e| Error::Other(format!("couldn't start llama.cpp: {e}")))?;
-            let params = LlamaModelParams::default().with_n_gpu_layers(1000); // Metal: offload all
-            let model = LlamaModel::load_from_file(&backend, path, &params)
+            // Share the one process-wide backend with the embedder rather than
+            // calling `LlamaBackend::init()` a second time (which would error).
+            let backend = super::shared_backend()?;
+            // All layers to the graphics card unless it is off (`compute`).
+            let params = LlamaModelParams::default().with_n_gpu_layers(crate::compute::gpu_layers());
+            let model = LlamaModel::load_from_file(backend, path, &params)
                 .map_err(|e| Error::Other(format!("couldn't load the answers model: {e}")))?;
             Ok(LlamaEngine { backend, model, n_ctx: 8192 })
         }
@@ -751,7 +954,7 @@ mod llama {
                 .with_n_batch(self.n_ctx);
             let mut ctx = self
                 .model
-                .new_context(&self.backend, ctx_params)
+                .new_context(self.backend, ctx_params)
                 .map_err(|e| Error::Other(format!("llama context failed: {e}")))?;
 
             let raw = self
@@ -775,8 +978,15 @@ mod llama {
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Other(format!("decode failed: {e}")))?;
 
+            // Greedy is the JSON path (`generate_json`): a grammar holds the
+            // model to a JSON object token by token. Unconstrained, a 4B
+            // model left about half of a real team's documents unparseable
+            // (Markdown instead of JSON, a trailing comma, a stray token).
             let mut sampler = if greedy {
-                LlamaSampler::chain_simple([LlamaSampler::greedy()])
+                match LlamaSampler::grammar(&self.model, JSON_GRAMMAR, "root") {
+                    Ok(grammar) => LlamaSampler::chain_simple([grammar, LlamaSampler::greedy()]),
+                    Err(_) => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+                }
             } else {
                 LlamaSampler::chain_simple([
                     LlamaSampler::temp(0.7),
@@ -792,8 +1002,10 @@ mod llama {
             let mut n_cur = batch.n_tokens();
 
             for _ in 0..max_tokens {
+                // `sample` accepts the token it picks (llama_sampler_sample
+                // does). Accepting it again fed the grammar every token twice,
+                // which empties it and aborts the process in llama.cpp.
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(token);
                 if self.model.is_eog_token(token) {
                     break;
                 }
@@ -842,7 +1054,7 @@ mod tests {
         // low; background Map extraction keeps its own bounded budget. Guards the
         // two constants against accidental change.
         assert_eq!(max_tokens_for(Priority::Interactive), 256);
-        assert_eq!(max_tokens_for(Priority::Background), 512);
+        assert_eq!(max_tokens_for(Priority::Background), 2048);
     }
 
     #[test]
@@ -916,8 +1128,86 @@ mod tests {
     }
 
     #[test]
+    fn json_forgives_a_comma_before_a_closing_bracket() {
+        let text = "{\"entities\": [\n  {\"name\": \"Ben, lead\", \"kind\": \"person\"},\n],\n \"events\": [],\n}";
+        let v = parse_json_lenient(text).unwrap();
+        assert_eq!(v["entities"][0]["name"], "Ben, lead", "a comma inside a string stays");
+        assert_eq!(v["events"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn json_is_found_past_a_bracket_in_prose_and_before_more_text() {
+        let text = "See [[AGENTS]] first.\n{\"entities\": [{\"name\": \"SOW\"}]}\n], and some more {text";
+        let v = parse_json_lenient(text).unwrap();
+        assert_eq!(v["entities"][0]["name"], "SOW");
+    }
+
+    #[test]
     fn json_errors_when_there_is_no_object() {
         assert!(parse_json_lenient("no json here at all").is_err());
+    }
+
+    // --- truncation recovery -------------------------------------------
+    // These are the real shapes seen in the extraction queue when the
+    // background budget severed the generation: 354 errors to 77 successes,
+    // dominated by "EOF while parsing a list".
+
+    #[test]
+    fn json_recovers_a_list_severed_between_elements() {
+        // The token cap landed after a complete element and a comma.
+        let text = r#"{"entities":[{"name":"Emberwulf","kind":"mob"},"#;
+        let v = parse_json_lenient(text).expect("truncated list should recover");
+        assert_eq!(v["entities"][0]["name"], "Emberwulf");
+        assert_eq!(v["entities"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_recovers_a_list_severed_inside_a_string() {
+        // The nastier case: cut off mid-value, so the trailing object is
+        // unusable and must be dropped rather than guessed at.
+        let text = r#"{"entities":[{"name":"Emberwulf","kind":"mob"},{"name":"Chest of Wh"#;
+        let v = parse_json_lenient(text).expect("mid-string truncation should recover");
+        let list = v["entities"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "the half-written entity is dropped, not invented");
+        assert_eq!(list[0]["name"], "Emberwulf");
+    }
+
+    #[test]
+    fn json_recovers_when_nothing_completed() {
+        // Severed before even the first value closed. An empty container of the
+        // right kind is the only honest reading.
+        let v = parse_json_lenient(r#"[{"name":"half"#).expect("should degrade to empty");
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn json_repair_never_invents_a_value() {
+        // A repaired document must be a PREFIX of what the model said, plus
+        // closers. Anything else would put words in the model's mouth and end
+        // up in the knowledge graph as fact.
+        let text = r#"{"a":[1,2,3],"b":{"c":"partial"#;
+        let repaired = repair_truncated_json(text).expect("should repair");
+        let body: String = repaired.chars().filter(|c| !matches!(c, '}' | ']')).collect();
+        let orig: String = text.chars().filter(|c| !matches!(c, '}' | ']')).collect();
+        assert!(orig.starts_with(&body), "repair added non-closing content");
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["a"][2], 3);
+    }
+
+    #[test]
+    fn json_repair_declines_balanced_but_broken_text() {
+        // Balanced brackets mean this is malformed, not truncated. Repair must
+        // stand aside so the caller reports the real parse error instead of
+        // silently returning something plausible.
+        assert!(repair_truncated_json(r#"{"a": }"#).is_none());
+    }
+
+    #[test]
+    fn json_still_prefers_a_clean_parse_over_repair() {
+        // Trailing commentary after valid JSON must keep parsing strictly —
+        // the repair path must not change what already worked.
+        let v = parse_json_lenient(r#"{"a":[1,2]} and that is my answer"#).unwrap();
+        assert_eq!(v["a"][1], 2);
     }
 
     #[test]

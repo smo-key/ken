@@ -2,11 +2,31 @@
   import { tick, untrack } from "svelte";
   import { MATCH_CAP, findTextMatches } from "../lib/find";
   import { find, type FindAdapter } from "../lib/find.svelte";
+  import type { Reveal } from "../lib/app.svelte";
 
   let {
     initial,
     onchange,
-  }: { initial: string; onchange: (text: string) => void } = $props();
+    reveal = null,
+  }: { initial: string; onchange: (text: string) => void; reveal?: Reveal | null } = $props();
+
+  // A clicked citation: put the caret on its line and scroll it into view.
+  $effect(() => {
+    const r = reveal;
+    const el = ta;
+    if (!r?.line || !el) return;
+    void r.nonce;
+    untrack(() => {
+      const lines = value.split("\n");
+      const at = Math.min(r.line!, lines.length) - 1;
+      const start = lines.slice(0, at).reduce((n, l) => n + l.length + 1, 0);
+      el.focus();
+      el.setSelectionRange(start, start + (lines[at]?.length ?? 0));
+      const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 22;
+      el.scrollTop = Math.max(0, at * lineHeight - el.clientHeight / 3);
+      syncScroll();
+    });
+  });
 
   let value = $state(initial);
 

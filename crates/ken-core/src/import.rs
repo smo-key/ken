@@ -137,7 +137,8 @@ fn is_safe_relative_folder(folder: &str) -> bool {
         return true;
     }
     let path = Path::new(folder);
-    if path.is_absolute() {
+    // has_root(): on Windows "/etc" is rooted but not absolute.
+    if path.is_absolute() || path.has_root() {
         return false;
     }
     !path

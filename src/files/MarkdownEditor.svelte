@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { Crepe } from "@milkdown/crepe";
   import { editorViewCtx, remarkStringifyOptionsCtx } from "@milkdown/kit/core";
   import type { Ctx } from "@milkdown/kit/ctx";
@@ -35,8 +35,11 @@
     slashShortcutInputRule,
     slashShortcutKeys,
   } from "./markdown/slashShortcuts";
-  import { anchorLinkPlugin } from "./markdown/anchors";
+  import { anchorLinkPlugin, findHeadingForTarget, headingSlug } from "./markdown/anchors";
+  import { lineTarget } from "../lib/citation";
+  import type { Reveal } from "../lib/app.svelte";
   import { headingLinkPlugin } from "./markdown/headingLink";
+  import { wikiLinkPlugin, type LinkClick } from "./markdown/wikiLinks";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
   import { addTocMenuItem, tocPlugins } from "./markdown/toc";
@@ -68,6 +71,9 @@
     onchange,
     relPath,
     attachments,
+    reveal = null,
+    onlink,
+    isRepo = () => false,
   }: {
     initial: string;
     onchange: (markdown: string) => void;
@@ -76,7 +82,48 @@
     /** Storage for pasted/dropped files. Without it (and `relPath`), Crepe's
      *  stock behaviour applies. */
     attachments?: AttachmentAdapter;
+    reveal?: Reveal | null;
+    /** A link was clicked: follow it and say whether it was followed. */
+    onlink?: (link: LinkClick) => boolean;
+    /** Whether a name in code is one of the workspace's repos. */
+    isRepo?: (name: string) => boolean;
   } = $props();
+
+  // A clicked citation: scroll to its heading, or to the block its source
+  // line became, and flash it so the eye lands there.
+  $effect(() => {
+    const r = reveal;
+    const v = view;
+    if (!r || !v) return;
+    void r.nonce;
+    untrack(() => revealIn(v, r));
+  });
+
+  function revealIn(v: EditorView, r: Reveal) {
+    const doc = v.state.doc;
+    let pos: number | undefined = r.anchor ? findHeadingForTarget(doc, r.anchor)?.pos : undefined;
+    if (pos === undefined && r.line) {
+      const t = lineTarget(initial, r.line);
+      if (t.phrase) {
+        const phrase = t.phrase;
+        doc.descendants((node, p) => {
+          if (pos !== undefined) return false;
+          if (node.isTextblock && node.textContent.includes(phrase)) {
+            pos = p;
+            return false;
+          }
+          return true;
+        });
+      }
+      if (pos === undefined && t.heading) pos = findHeadingForTarget(doc, headingSlug(t.heading))?.pos;
+    }
+    if (pos === undefined) return;
+    const dom = v.nodeDOM(pos);
+    if (!(dom instanceof HTMLElement)) return;
+    dom.scrollIntoView({ block: "center", behavior: "smooth" });
+    dom.classList.add("ken-reveal");
+    setTimeout(() => dom.classList.remove("ken-reveal"), 1600);
+  }
 
   let host: HTMLDivElement;
   let crepe: Crepe | undefined;
@@ -458,10 +505,18 @@
       }),
   );
 
+  // Frontmatter is not Markdown the editor knows: it showed as a rule and a
+  // heading and saved back mangled, losing a page's aliases. It is set aside
+  // here and put back on every save.
+  const front = initial.match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/)?.[0] ?? "";
+  // The serializer escapes `[` in text, which turns every [[wiki link]] into
+  // \[\[text]]: put them back.
+  const unescapeWikiLinks = (md: string) => md.replace(/\\\[\\\[([^\n]+?)\\?\]\\?\]/g, "[[$1]]");
+
   onMount(async () => {
     crepe = new Crepe({
       root: host,
-      defaultValue: initial,
+      defaultValue: initial.slice(front.length),
       // Disable LaTeX/math so `$…$` (e.g. two dollar amounts in one sentence)
       // stays literal text instead of being parsed as an inline math node.
       features: {
@@ -503,7 +558,7 @@
     }
     crepe.on((listener) => {
       listener.markdownUpdated((_ctx, markdown, prev) => {
-        if (markdown !== prev) onchange(markdown);
+        if (markdown !== prev) onchange(front + unescapeWikiLinks(markdown));
       });
     });
     crepe.editor.use(findPlugin);
@@ -514,6 +569,7 @@
     crepe.editor.use(slashShortcutKeys);
     crepe.editor.use(anchorLinkPlugin);
     crepe.editor.use(headingLinkPlugin);
+    crepe.editor.use(wikiLinkPlugin((link) => onlink?.(link) ?? false, (name) => isRepo(name)));
     // After the GFM preset: the table schema extension replaces the preset's
     // own `table` node, so it has to be registered last.
     crepe.editor.use(tableFullWidthPlugins);
@@ -560,6 +616,12 @@
 <ImageLightbox />
 
 <style>
+  /* A clicked citation's block, flashed so the eye lands on it. */
+  :global(.milkdown .ken-reveal) {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-radius: 4px;
+    transition: background 1.2s ease-out;
+  }
   .editor-scroll {
     flex: 1;
     min-height: 0;
@@ -596,7 +658,8 @@
     --crepe-color-on-secondary: var(--ink);
     --crepe-color-inverse: var(--ink);
     --crepe-color-on-inverse: var(--paper);
-    --crepe-color-inline-code: var(--accent-deep);
+    /* Code in ink, links in the accent: the two never look alike. */
+    --crepe-color-inline-code: var(--ink-2);
     --crepe-color-error: var(--danger);
     --crepe-color-hover: var(--sunken);
     --crepe-color-selected: var(--selection-bg);

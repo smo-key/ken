@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type RegistryEntryStatus } from "../lib/api";
+  import { api, memberGroup, type RegistryEntryStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
-  import Plus from "@lucide/svelte/icons/plus";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pencil from "@lucide/svelte/icons/pencil";
   import Trash2 from "@lucide/svelte/icons/trash-2";
@@ -17,6 +15,92 @@
   let renamingId = $state<string | null>(null);
   let renameValue = $state("");
   let renameBusy = $state(false);
+
+  // Grouping is the DEFAULT, not a feature you switch on. The workspace
+  // manifest already stores members as `Hytale/Shattered-Realms`, so the
+  // folder structure is known — a flat list here was throwing it away at the
+  // render, not reflecting some simpler truth. Someone who genuinely wants
+  // the four Shattered-Realms folders listed apart can say so, and that
+  // choice is what gets persisted; the grouped view needs no configuration.
+  const GROUP_PREF = "ken.projectSwitcher.grouped";
+  let grouped = $state(readGroupPref());
+
+  function readGroupPref(): boolean {
+    try {
+      return localStorage.getItem(GROUP_PREF) !== "false";
+    } catch {
+      // Private mode, blocked site data, whatever — default to grouped
+      // rather than letting a storage failure change what the user sees.
+      return true;
+    }
+  }
+
+  function setGrouped(on: boolean) {
+    grouped = on;
+    try {
+      localStorage.setItem(GROUP_PREF, String(on));
+    } catch {
+      // Preference is lost on restart; the view is still correct now.
+    }
+  }
+
+  /** Manifest name for a registry entry, or null if it isn't a member of the
+   *  open workspace. `WorkspaceMember.projectId` is the registry id. */
+  const memberNameById = $derived(
+    new Map(
+      (app.workspace?.members ?? [])
+        .filter((m) => m.projectId)
+        .map((m) => [m.projectId as string, m.name]),
+    ),
+  );
+
+  type Section = { key: string; label: string | null; rows: RegistryEntryStatus[] };
+
+  // The repos of this workspace, and only those: Ken works in workspaces,
+  // so a folder outside it is opened as its own workspace, not here. Folder
+  // groups first (alphabetical), then the members at the root.
+  const sections = $derived.by((): Section[] => {
+    const members = app.registry.filter((e) => memberNameById.has(e.id));
+    if (!app.workspace) {
+      return [{ key: "all", label: null, rows: app.registry }];
+    }
+    if (!grouped) {
+      return [{ key: "all", label: null, rows: members }];
+    }
+
+    const byGroup = new Map<string, RegistryEntryStatus[]>();
+    const rootRows: RegistryEntryStatus[] = [];
+
+    for (const entry of members) {
+      const name = memberNameById.get(entry.id) as string;
+      const group = memberGroup(name);
+      if (!group) {
+        rootRows.push(entry);
+        continue;
+      }
+      const bucket = byGroup.get(group);
+      if (bucket) bucket.push(entry);
+      else byGroup.set(group, [entry]);
+    }
+
+    const out: Section[] = [...byGroup.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([label, rows]) => ({ key: `g:${label}`, label, rows }));
+
+    if (rootRows.length > 0) {
+      out.push({ key: "root", label: "In this workspace", rows: rootRows });
+    }
+    return out;
+  });
+
+  /** "All projects" means the merged Files tree, which only Files can draw —
+   *  so choosing it from another screen goes there rather than doing nothing
+   *  visible. Hiding the option everywhere else was the wrong fix for that. */
+  function chooseAllProjects() {
+    void app.setTreeShowsAllProjects(true);
+    app.screen = "files";
+    close();
+  }
 
   async function forgetId(id: string) {
     await api.forgetProject(id);
@@ -65,7 +149,7 @@
         label: "Open",
         icon: FolderOpen,
         disabled: !entry.available,
-        onSelect: () => pick(entry.path, entry.available),
+        onSelect: () => pick(entry),
       },
       {
         label: "Rename…",
@@ -88,10 +172,13 @@
     ]);
   }
 
-  async function pick(path: string, available: boolean) {
-    if (!available) return;
+  async function pick(entry: RegistryEntryStatus) {
+    if (!entry.available) return;
     try {
-      await app.openProject(path);
+      // A member of the open workspace is focused, not reopened alone:
+      // opening it as a project would close the workspace around it.
+      if (app.workspace && memberNameById.has(entry.id)) await app.focusMember(entry.id);
+      else await app.openProject(entry.path);
       close();
     } catch (e) {
       error = String(e);
@@ -103,23 +190,33 @@
     await api.forgetProject(id);
     await app.refreshRegistry();
   }
-
-  async function openFolder() {
-    const folder = await openDialog({ directory: true, title: "Open a folder as a Ken project" });
-    if (typeof folder !== "string") return;
-    const name = folder.split("/").pop() ?? "Project";
-    try {
-      await app.createProject(folder, name);
-      close();
-    } catch (e) {
-      error = String(e);
-    }
-  }
 </script>
 
 <button class="scrim" onclick={close} aria-label="Close project switcher"></button>
 <div class="menu">
-  {#each app.registry as entry (entry.id)}
+  <!-- Files can show every member at once (`get_tree_all` returns the
+       whole workspace with each path prefixed by its member folder), so
+       the switcher offers it as a peer of the individual projects rather
+       than hiding it in a second control. Only on Files: the other
+       screens each draw one project's data. -->
+  {#if app.workspace}
+    <button
+      class="row"
+      class:current={app.treeShowsAllProjects && app.screen === "files"}
+      onclick={chooseAllProjects}
+    >
+      <span class="badge">*</span>
+      <span class="info">
+        <span class="name">All projects</span>
+        <span class="path">Every project in this workspace, in one Files tree</span>
+      </span>
+    </button>
+  {/if}
+  {#each sections as section (section.key)}
+    {#if section.label}
+      <div class="group-head">{section.label}</div>
+    {/if}
+    {#each section.rows as entry (entry.id)}
     <button
       class="row"
       class:current={entry.id === app.project?.id}
@@ -132,7 +229,9 @@
         // Neutralize the row action during rename so the popover stays open
         // and the space is typed into the input.
         if (renamingId === entry.id) return;
-        pick(entry.path, entry.available);
+        // Choosing one project leaves the merged tree behind.
+        if (app.treeShowsAllProjects) void app.setTreeShowsAllProjects(false);
+        pick(entry);
       }}
       oncontextmenu={(e) => rowMenu(e, entry)}
     >
@@ -172,12 +271,22 @@
         <span class="forget" role="button" tabindex="0" onclick={(e) => forget(entry.id, e)} onkeydown={() => {}}>Remove</span>
       {/if}
     </button>
+    {/each}
   {/each}
-  <button class="row new" onclick={openFolder}>
-    <span class="badge plus"><Plus size={15} strokeWidth={1.75} /></span>
-    <span class="info"><span class="name">Open a folder…</span>
-      <span class="path">Any folder becomes a Ken project</span></span>
-  </button>
+  {#if app.workspace}
+    <!-- The opt-out, at the bottom because it is the exception. Only shown
+         when there is actually a folder group to flatten. -->
+    {#if app.workspace.members.some((m) => memberGroup(m.name))}
+      <label class="group-toggle">
+        <input
+          type="checkbox"
+          checked={grouped}
+          onchange={(e) => setGrouped(e.currentTarget.checked)}
+        />
+        Group by folder
+      </label>
+    {/if}
+  {/if}
   {#if error}
     <div class="error">{error}</div>
   {/if}
@@ -221,6 +330,34 @@
   .row:hover {
     background: var(--sunken);
   }
+  /* Quiet enough to scan past when you already know where you are going,
+     present enough to give the list its shape. */
+  .group-head {
+    padding: 8px 10px 3px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-tertiary);
+  }
+  .group-head:first-child {
+    padding-top: 4px;
+  }
+  .group-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px 4px;
+    margin-top: 2px;
+    border-top: 1px solid var(--border);
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
+    cursor: pointer;
+  }
+  .group-toggle input {
+    margin: 0;
+    cursor: pointer;
+  }
   .row.current {
     background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
@@ -240,9 +377,6 @@
     font-family: var(--font-serif);
     font-size: 13px;
     flex: none;
-  }
-  .badge.plus {
-    background: var(--accent);
   }
   .info {
     display: flex;

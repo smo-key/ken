@@ -1,0 +1,73 @@
+{
+  "team": "{{team_name}}",
+  "key": "{{KEY}}",
+  "_key_note": "Ticket ids are KEY-001, KEY-002 ... issued in order, never reused. The filename is the id, and threads, decisions `sources:` citations and run records all point at tickets by it.",
+  "repos": {
+    "{{team_repo}}": {
+      "kind": "team",
+      "base": "main"
+    },
+    "{{wiki_repo}}": {
+      "kind": "wiki",
+      "base": "main"
+    },
+    "{{code_repo}}": {
+      "kind": "code",
+      "base": "main",
+      "protected": [
+        "{{migrations/}}",
+        "{{config/secrets.*}}",
+        "{{tokens file}}"
+      ],
+      "index": {
+        "exclude": [
+          "{{dependency folders}}",
+          "{{build output folders}}"
+        ],
+        "search_only": [
+          "{{src/}}"
+        ]
+      }
+    },
+    "{{reference_repo}}": {
+      "kind": "reference",
+      "base": "{{branch the work reads against}}",
+      "pin": "{{commit last checked}}",
+      "upstream": "{{fetch url}}"
+    }
+  },
+  "_repos_note": "kind: team | wiki | code | reference, or a list when one repo is two. A team that keeps tickets and library in one repo lists that repo once, with kind [\"team\", \"wiki\"], and deletes the separate {{wiki_repo}} entry; the critical_context paths then lose their ../{{wiki_repo}}/ prefix. A code repo belongs to exactly one team; a reference repo belongs to none, is never ticketed and never gets a worktree - a lane that writes there is an over-scope finding. base: the branch the checkout is kept on; Wright never checks anything else out there. pin + upstream: reference repos only - when the upstream moves past the pin, one note in the team inbox; a person re-pins, and the dependency's Platform page records the new version. protected: code repos - paths no lane touches without a person's yes; G1 reads it at kickoff. index: every path is in one of three states: not indexed (exclude), searchable only (search_only) or read for entities; where two patterns match the last one wins, and this file is read after Ken's built-in patterns; code and run records are searchable only. Set once here for everyone. Add keys freely; kind and base may not be removed.",
+  "method": "method/",
+  "overlay": "team/",
+  "people": "people/",
+  "ideas": "ideas/",
+  "models": {
+    "XS": "{{Sonnet model id}}",
+    "S": "{{Opus model id}}",
+    "M": "{{Opus model id}}",
+    "L": "{{Opus model id}}",
+    "XL": "{{Opus model id}}",
+    "design": "{{Opus model id}}",
+    "spike": "{{Opus model id}}",
+    "audit": "{{Opus model id}}",
+    "wright": "{{Opus model id}}"
+  },
+  "_models_note": "The model each size runs on, set once here for the whole team and the same on every machine; in Wright it is Settings > This team > Models. XS runs on Sonnet, and every other size and the wright key (Wright at the board) run on Opus. Each step runs at the effort its preset names: low, medium, high or xhigh. Nothing runs on a model below Sonnet, and a preset never names a model.",
+  "drift_sweep": {
+    "every": "weekly",
+    "runs_as": "{{person}}",
+    "min_pages": "{{pages the sweep must examine}}",
+    "controls": {
+      "moved": "{{page pinned to a commit known to have moved}}",
+      "clean": "{{page known clean}}"
+    }
+  },
+  "_drift_sweep_note": "The standing sweep: the drift check run on this schedule across every page, not only at a ticket's close. Each run writes a run record. When two intervals pass with no run record, the missed sweep is raised at the next ticket close. A run is void if either control comes back wrong: the known-moved page reads clean, or the known-clean page reads flagged. A run that examined fewer pages than min_pages is void too. A Finding (a cited path gone, a ruling's source gone) is a ticket. A Judgment (a diff that touches a constant, a signature or a line the page cites) is one row on the Ideas list (ideas/). A page nobody has verified for thirty days gets a row there too. Wright raises the row, with its source set to sweep. The row names the page and the mismatch.",
+  "worktrees": "{{a folder outside every indexed workspace folder}}/{{KEY}}/",
+  "_worktrees_note": "One per ticket, on its own branch, cut at claim, and never inside the folder the search index covers: a worktree there is a second full copy of the repo in the index, and search hits become ambiguous.",
+  "critical_context": [
+    "../{{wiki_repo}}/START-HERE.md",
+    "../{{wiki_repo}}/Ways-of-Working/Rules/"
+  ],
+  "_note": "critical_context is the set of files every session loads. A file belongs here only if removing it changes what an agent does: give the same ticket to one lane with it and one without, and compare the output. Every file here competes with the work for attention in every session."
+}

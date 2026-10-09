@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ken Home White Box</title>
+<meta name="color-scheme" content="light">
+<style>
+:root{--ink:#111;--line:#555;--soft:#888;--fill:#f4f4f4;--hi:#e0e0e0}
+body{background:#fff;color:var(--ink);font:13px/1.4 "Segoe UI",system-ui,sans-serif;margin:0;padding:28px 24px 80px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:36px 0 8px}
+p{max-width:90ch;margin:6px 0;color:#333}.note{color:var(--soft);font-size:12px}
+.page{position:relative;width:1200px;height:760px;border:2px solid var(--ink);background:#fff;margin:10px 0 6px;box-sizing:border-box;overflow:hidden}
+.tb{position:absolute;left:0;top:0;right:0;height:44px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:0 14px;box-sizing:border-box;background:var(--fill)}
+.tb .sw{border:1px solid var(--ink);padding:3px 10px;background:#fff;white-space:nowrap;border-radius:8px}
+.tb .search{width:480px;height:28px;border:1px solid var(--ink);background:#fff;display:flex;align-items:center;padding:0 10px;color:var(--soft);margin:0 auto;box-sizing:border-box}
+.rail{position:absolute;left:0;top:44px;width:64px;bottom:0;border-right:1px solid var(--line);display:flex;flex-direction:column}
+.rail div{height:52px;display:grid;place-items:center;font-size:11px;border-bottom:1px dashed #ddd}
+.rail .on{background:var(--hi);font-weight:600}
+.rail .bottom{margin-top:auto;border-top:1px dashed #ddd;border-bottom:0}
+.dock{position:absolute;right:0;top:44px;width:40px;bottom:0;border-left:1px solid var(--line);display:flex;flex-direction:column;align-items:center}
+.dock .v{writing-mode:vertical-rl;margin-top:12px;font-size:11px;color:var(--soft)}
+.main{position:absolute;left:64px;top:44px;right:40px;bottom:0;box-sizing:border-box;padding:14px 20px;overflow:hidden}
+.hd{height:32px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line);margin-bottom:10px}
+.hd b{font-size:14px;white-space:nowrap}.sp{flex:1}
+.chip{border:1px solid var(--ink);padding:1px 6px;font-size:11px;white-space:nowrap;background:#fff}
+.chip.dim{color:var(--soft);border-color:var(--soft)}
+.btn{border:1px solid var(--ink);padding:3px 8px;font-size:12px;background:#fff;white-space:nowrap}
+.btn.dim{color:var(--soft);border-color:var(--soft)}
+.div{height:24px;display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--soft);margin-top:10px}
+.div .sp{flex:1}.div a{color:var(--ink);text-transform:none;letter-spacing:0;text-decoration:underline}
+.dg{border:1px solid var(--line);border-radius:12px;padding:6px 12px 8px;background:#fff}
+.dg .dh{display:flex;align-items:center;gap:8px;height:24px;margin-bottom:2px;font-size:12px}
+.dg .dp{margin:0;font-size:12px;line-height:18px;max-width:none}
+.dg .src{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;font-size:11px;color:var(--soft)}
+.dg .src span{border:1px solid var(--soft);padding:0 5px}
+/* one list row: kind, repo, what, detail, age, button */
+.dr{display:grid;grid-template-columns:64px 104px 1fr 56px 96px;column-gap:10px;align-items:center;height:42px;border-bottom:1px dashed #ddd;font-size:12px;padding:0 4px;box-sizing:border-box}
+.dr .k{font-size:11px;color:var(--soft);text-transform:uppercase;letter-spacing:1px}
+.dr .rp{border:1px solid var(--line);font-size:10px;height:16px;display:flex;align-items:center;padding:0 5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dr .tx{min-width:0}.dr .tx b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dr .tx span{display:block;color:var(--soft);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dr .w{color:var(--soft);text-align:right;font-variant-numeric:tabular-nums}
+.dr .btn{text-align:center}
+.dr.more{height:30px;color:var(--soft);grid-template-columns:1fr}
+.entry{border-bottom:1px dashed #ddd;height:30px;display:flex;align-items:center;gap:8px;font-size:12px;padding:0 4px}
+.entry .m{margin-left:auto;color:var(--soft);font-size:11px;white-space:nowrap}
+.entry .rp{border:1px solid var(--line);font-size:10px;padding:0 5px;color:var(--soft)}
+.stat{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat div{border:1px solid var(--line);padding:6px 10px;font-size:11px;color:var(--soft)}
+.stat b{display:block;font-size:18px;line-height:22px;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.cols{display:grid;gap:20px}
+.rx{border:1px solid var(--ink);background:#fff;padding:8px 12px;font-size:12px;line-height:18px;box-sizing:border-box}
+.card{border:1px solid var(--ink);background:var(--fill);padding:8px 10px;box-sizing:border-box;font-size:12px;height:118px;display:flex;flex-direction:column;gap:3px}
+.card b{font-size:13px}.card .l{color:var(--soft);font-size:11px}.card .ft{margin-top:auto;display:flex;gap:6px}
+.card.warn{border-width:2px}
+.old{border:1px dashed var(--line);padding:8px 10px;margin-bottom:8px;font-size:12px;background:#fff;position:relative}
+.old i{position:absolute;right:-230px;top:4px;width:210px;font-style:normal;font-size:11px;color:var(--ink);border-left:2px solid var(--ink);padding-left:8px}
+table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}
+.toc a{margin-right:14px;color:var(--ink)}
+.pick{display:inline-block;border:2px solid var(--ink);padding:0 6px;font-size:11px;margin-left:6px;vertical-align:1px}
+.tr{display:grid;grid-template-columns:72px 1fr 90px 64px;column-gap:10px;align-items:center;height:42px;border-bottom:1px dashed #ddd;font-size:12px;padding:0 4px}
+.tr .id{font-variant-numeric:tabular-nums;text-decoration:underline}.tr .st{border:1px solid var(--line);font-size:10px;padding:0 5px;color:var(--soft);justify-self:start}.tr .due,.tk .due{color:var(--soft);text-align:right;font-size:11px}
+.tr .tx,.tk .tx{min-width:0}.tr .tx b,.tk .tx b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tr .tx span,.tk .tx span{display:block;color:var(--soft);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tk{display:grid;grid-template-columns:18px 1fr 64px 96px;column-gap:10px;align-items:center;height:38px;border-bottom:1px dashed #ddd;font-size:12px;padding:0 4px}.tk .tx b{font-weight:500}
+.cb{width:12px;height:12px;border:1px solid var(--ink);display:inline-block;box-sizing:border-box;background:#fff}.cb.on{background:var(--ink);box-shadow:inset 0 0 0 2px #fff}
+.fl{display:flex;gap:8px;align-items:center;font-size:12px}.fl>span:first-child{width:56px;color:var(--soft)}
+.rx .lb{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--soft);display:block}
+@media (max-width:1260px){body{overflow-x:auto}}
+</style>
+</head>
+<body>
+<h1>Ken Home: white box</h1>
+<p>Home for a team in a workspace. The team switcher in the title bar sets the scope, and every block on the page reads that team. Drawn at 1200 × 760 with the chat dock closed. The data is the ATT eval workspace.</p>
+<p class="toc"><a href="#h0">H0 Today</a><a href="#h1">H1 One list</a><a href="#h2">H2 Two columns</a><a href="#h3">H3 Repo cards</a><a href="#h1b">H1b First day</a><a href="#h1c">H1c Quiet day</a><a href="#h1d">H1d Missing pieces</a><a href="#y1">Y1 Your day</a><a href="#y1b">Y1b A task</a><a href="#y1c">Y1c A ticket</a><a href="#ystore">Y Storage</a><a href="#moves">What moves</a></p>
+
+<!-- ───────────────────────── H0 ───────────────────────── -->
+<h2 id="h0">H0. Home as built. One column, up to nine blocks</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review</div><div>Ingest</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main" style="padding-left:200px">
+    <div style="width:560px">
+      <div class="old"><b>Tuesday, September 30</b> · Today's digest · 07:30 · share</div>
+      <div class="old">Digest prose, serif, for the focused repo only<i>1. Written for one repo. The team switcher does not change it.</i></div>
+      <div class="old">Across ATT: a paragraph per repo<i>2. A second digest. Five repos give five paragraphs under the first.</i></div>
+      <div class="old">On your board<i>3. Three lists of things to do, each styled differently.</i></div>
+      <div class="old">Waiting on you: ingest runs, blocked runs, "N more in Review"</div>
+      <div class="old">Needs a look: files that failed to index</div>
+      <div class="old">Scope picker + search box<i>4. Search is also in the title bar. The picker is a third place to set scope.</i></div>
+      <div class="old">Recent files</div>
+      <div class="old">Repos strip: one row per repo<i>5. The same list as Team, with less on it. Index health is not shown.</i></div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">For comparison. At 1200 wide the column is 680 and the page scrolls about two screens on a busy day. The first thing on it is the focused repo's digest, which is why Home reads at the repo level after the title bar moved to the team.</p>
+
+<!-- ───────────────────────── H1 ───────────────────────── -->
+<h2 id="h1">H1. One list. The team's digest, what waits on you, then recent files and index health <span class="pick">recommended</span></h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 6</div><div>Ingest · 1</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:860px;margin:0 auto">
+      <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="chip dim">6 need you</span><span class="sp"></span><span class="btn dim">Write it again</span><span class="btn dim">Share</span></div>
+      <div class="dg"><div class="dh"><b>Tuesday, September 30</b><span class="chip dim">07:30</span></div>
+        <p class="dp">att-opmodel has 4 commits since yesterday, all in the scheduling service; the Scheduling page in ATT-Wiki still describes the old retry rule. 4WeekScope.md came into the inbox and contradicts the Roadmap page on the pilot date. mgo-designs moved two screens into a new folder, so two links in the wiki no longer open. design-proto and Project Documents did not change.</p>
+        <div class="src"><span>Scheduling.md</span><span>4WeekScope.md</span><span>Roadmap.md</span><span>mgo-designs/screens</span></div>
+      </div>
+      <div class="div">needs you · 6<span class="sp"></span><a>Open Review</a></div>
+      <div class="dr"><span class="k">confirm</span><span class="rp">inbox</span><span class="tx"><b>4WeekScope.md: 3 page changes, 2 contradictions</b><span>Roadmap · pilot date · new page Research/4-week-scope</span></span><span class="w">2 h</span><span class="btn">Review</span></div>
+      <div class="dr"><span class="k">stale</span><span class="rp">ATT-Wiki</span><span class="tx"><b>Scheduling.md describes the old retry rule</b><span>att-opmodel · retry.ts changed in 4 commits</span></span><span class="w">1 d</span><span class="btn">Update</span></div>
+      <div class="dr"><span class="k">moved</span><span class="rp">mgo-designs</span><span class="tx"><b>2 wiki links point at moved files</b><span>screens/login.png · screens/home.png</span></span><span class="w">1 d</span><span class="btn">Fix links</span></div>
+      <div class="dr"><span class="k">gap</span><span class="rp">design-proto</span><span class="tx"><b>No wiki page covers design-proto</b><span>31 files · last commit 6 d ago</span></span><span class="w">6 d</span><span class="btn">Draft a page</span></div>
+      <div class="dr"><span class="k">failed</span><span class="rp">Project Docs</span><span class="tx"><b>Budget FY27.xlsx could not be read</b><span>password protected · still findable by name</span></span><span class="w">3 d</span><span class="btn">View</span></div>
+      <div class="dr more"><span>1 more in Review</span></div>
+      <div class="cols" style="grid-template-columns:1fr 1fr;margin-top:4px">
+        <div>
+          <div class="div">recent files</div>
+          <div class="entry">Scheduling.md <span class="rp">ATT-Wiki</span><span class="m">09:12</span></div>
+          <div class="entry">retry.ts <span class="rp">att-opmodel</span><span class="m">yesterday</span></div>
+          <div class="entry">4WeekScope.md <span class="rp">inbox</span><span class="m">yesterday</span></div>
+          <div class="entry">Operating model v3.pdf <span class="rp">Project Docs</span><span class="m">Mon</span></div>
+        </div>
+        <div>
+          <div class="div">index health<span class="sp"></span><a>Team</a></div>
+          <div class="stat"><div><b>5 / 5</b>repos indexed</div><div><b>112</b>files queued</div><div><b>1</b>failed</div></div>
+          <p class="note" style="margin-top:8px">Last full sweep 06:00 · next at 12:00</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">One column, 860 wide, centred. The header names the team and counts its repos and what waits. The digest is written for the team: one paragraph across all repos, naming the files so each is one click away, with the source chips under it. It replaces both digests on H0. Write it again and Share move to the header. Under it, one list of what needs a person, across every repo in the team, in one row shape: kind (64), repo (104), what and one line of detail, age (56), one button (96). It merges the board, Waiting on you, Needs a look and the Review count. Kinds, in this order: confirm (an ingest's proposals), stale (drift on a page), moved (links to moved files), gap (a repo with no page), failed (a file that would not index), board (a board item needing attention). The list shows six rows; the rest are a count that opens Review. Under the list, two halves: recent files across the team with the repo on each, and index health as three figures that open Team. The search box and scope picker leave Home, because Ctrl K in the title bar does the same and the team switcher sets the scope. The repos strip leaves Home; Team has the full table.</p>
+
+<!-- ───────────────────────── H2 ───────────────────────── -->
+<h2 id="h2">H2. Two columns. Recent files and repos on the left, the digest and the list on the right</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 6</div><div>Ingest · 1</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="chip dim">6 need you</span><span class="sp"></span><span class="btn dim">Write it again</span><span class="btn dim">Share</span></div>
+    <div class="cols" style="grid-template-columns:280px 1fr">
+      <div>
+        <div class="div" style="margin-top:0">repos</div>
+        <div class="entry">ATT-Wiki<span class="m">1 stale</span></div>
+        <div class="entry">att-opmodel<span class="m">4 commits</span></div>
+        <div class="entry">mgo-designs<span class="m">2 moved</span></div>
+        <div class="entry">design-proto<span class="m">no page</span></div>
+        <div class="entry">Project Documents<span class="m">1 failed</span></div>
+        <div class="div">recent files</div>
+        <div class="entry">Scheduling.md<span class="m">09:12</span></div>
+        <div class="entry">retry.ts<span class="m">yesterday</span></div>
+        <div class="entry">4WeekScope.md<span class="m">yesterday</span></div>
+        <div class="entry">Operating model v3.pdf<span class="m">Mon</span></div>
+        <div class="entry">Roadmap.md<span class="m">Mon</span></div>
+        <div class="div">index health</div>
+        <div class="entry">5 / 5 repos indexed<span class="m">112 queued</span></div>
+      </div>
+      <div>
+        <div class="dg"><div class="dh"><b>Tuesday, September 30</b><span class="chip dim">07:30</span></div>
+          <p class="dp">att-opmodel has 4 commits since yesterday, all in the scheduling service; the Scheduling page in ATT-Wiki still describes the old retry rule. 4WeekScope.md came into the inbox and contradicts the Roadmap page on the pilot date. mgo-designs moved two screens into a new folder, so two links in the wiki no longer open.</p></div>
+        <div class="div">needs you · 6<span class="sp"></span><a>Open Review</a></div>
+        <div class="dr"><span class="k">confirm</span><span class="rp">inbox</span><span class="tx"><b>4WeekScope.md: 3 page changes, 2 contradictions</b><span>Roadmap · pilot date</span></span><span class="w">2 h</span><span class="btn">Review</span></div>
+        <div class="dr"><span class="k">stale</span><span class="rp">ATT-Wiki</span><span class="tx"><b>Scheduling.md describes the old retry rule</b><span>retry.ts changed in 4 commits</span></span><span class="w">1 d</span><span class="btn">Update</span></div>
+        <div class="dr"><span class="k">moved</span><span class="rp">mgo-designs</span><span class="tx"><b>2 wiki links point at moved files</b><span>screens/login.png · screens/home.png</span></span><span class="w">1 d</span><span class="btn">Fix links</span></div>
+        <div class="dr"><span class="k">gap</span><span class="rp">design-proto</span><span class="tx"><b>No wiki page covers design-proto</b><span>31 files</span></span><span class="w">6 d</span><span class="btn">Draft a page</span></div>
+        <div class="dr"><span class="k">failed</span><span class="rp">Project Docs</span><span class="tx"><b>Budget FY27.xlsx could not be read</b><span>password protected</span></span><span class="w">3 d</span><span class="btn">View</span></div>
+        <div class="dr more"><span>1 more in Review</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">Wright's 8c layout with Ken's content. Left, 280: the team's repos, each with its one most urgent state, then recent files, then index health on one line. A repo name focuses that repo in Files. Right: the digest and the same list as H1. Everything fits on one screen with no scroll on a busy day. Against H1: the repo list comes back to Home, which duplicates Team, and the left column is narrow for long file names.</p>
+
+<!-- ───────────────────────── H3 ───────────────────────── -->
+<h2 id="h3">H3. Repo cards. The digest, then one card per repo</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 6</div><div>Ingest · 1</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:980px;margin:0 auto">
+      <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="chip dim">6 need you</span><span class="sp"></span><span class="btn dim">Write it again</span><span class="btn dim">Share</span></div>
+      <div class="dg"><div class="dh"><b>Tuesday, September 30</b><span class="chip dim">07:30</span></div>
+        <p class="dp">att-opmodel has 4 commits since yesterday, all in the scheduling service; the Scheduling page in ATT-Wiki still describes the old retry rule. 4WeekScope.md came into the inbox and contradicts the Roadmap page on the pilot date. mgo-designs moved two screens into a new folder, so two links in the wiki no longer open.</p></div>
+      <div class="div">repos</div>
+      <div class="cols" style="grid-template-columns:repeat(3,1fr);gap:10px">
+        <div class="card warn"><b>ATT-Wiki</b><span class="l">wiki · 84 pages · main · 2 h ago</span><span>1 page stale: Scheduling.md</span><span>1 ingest to confirm</span><div class="ft"><span class="btn">Review 2</span><span class="btn dim">Open</span></div></div>
+        <div class="card"><b>att-opmodel</b><span class="l">code · 412 files · main · yesterday</span><span>4 commits since yesterday</span><span class="l">scheduling service</span><div class="ft"><span class="btn dim">Open</span></div></div>
+        <div class="card warn"><b>mgo-designs</b><span class="l">design · 58 files · main · yesterday</span><span>2 files moved, 2 links broken</span><div class="ft"><span class="btn">Fix links</span><span class="btn dim">Open</span></div></div>
+        <div class="card warn"><b>design-proto</b><span class="l">code · 31 files · main · 6 d ago</span><span>No wiki page covers it</span><div class="ft"><span class="btn">Draft a page</span><span class="btn dim">Open</span></div></div>
+        <div class="card warn"><b>Project Documents</b><span class="l">library · 140 files · not git</span><span>1 file failed to index</span><div class="ft"><span class="btn">View</span><span class="btn dim">Open</span></div></div>
+        <div class="card" style="border-style:dashed;background:#fff;color:var(--soft);justify-content:center;align-items:center">+ Add a repo</div>
+      </div>
+      <div class="div">recent files</div>
+      <div class="entry">Scheduling.md <span class="rp">ATT-Wiki</span><span class="m">09:12</span></div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">Organised by repo instead of by task. Each card shows the repo's kind, size, branch and last change, what needs a person in it, and the button for the first thing. A card with something waiting has a 2 border. Reads well with five repos and poorly with fifteen, where it becomes a grid to scan instead of a list to work down. It overlaps Team the most of the three. Recent files falls below the fold.</p>
+
+<!-- ───────────────────────── H1b ───────────────────────── -->
+<h2 id="h1b">H1b. H1 on the first day. No digest yet, the index still running</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review</div><div>Ingest</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:860px;margin:0 auto">
+      <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="sp"></span></div>
+      <div class="dg"><div class="dh"><b>Tuesday, September 30</b></div>
+        <p class="dp">No digest yet. Ken writes the first one when indexing finishes, and then each morning at 07:30.</p>
+        <div style="margin-top:8px"><span class="btn dim">Write it now</span></div>
+      </div>
+      <div class="div">indexing</div>
+      <div class="stat"><div><b>3 / 5</b>repos indexed</div><div><b>1,204</b>files queued</div><div><b>0</b>failed</div></div>
+      <div class="entry" style="margin-top:6px">Project Documents<span class="m">reading 412 of 1,140</span></div>
+      <div class="entry">mgo-designs<span class="m">waiting</span></div>
+      <div class="div">needs you · 0</div>
+      <p class="note">Nothing yet. Drift, gaps and ingest proposals appear here once the index is built.</p>
+      <div class="div">start here</div>
+      <div class="entry">START-HERE.md <span class="rp">ATT-Wiki</span><span class="m">the wiki's first page</span></div>
+      <div class="entry">Drop a file into Ingest<span class="m">Ken files it and proposes page changes</span></div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">The same blocks in the same order, so the page does not change shape after day one. While indexing runs, index health moves above the list and names the repo being read. Write it now is dim until indexing finishes. Start here replaces recent files, which is empty: the wiki's START-HERE page and the one action a new team is most likely to take.</p>
+
+<!-- ───────────────────────── H1c ───────────────────────── -->
+<h2 id="h1c">H1c. H1 on a quiet day. Nothing waits</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review</div><div>Ingest</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:860px;margin:0 auto">
+      <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="chip dim">0 need you</span><span class="sp"></span><span class="btn dim">Write it again</span><span class="btn dim">Share</span></div>
+      <div class="dg"><div class="dh"><b>Wednesday, October 1</b><span class="chip dim">07:30</span></div>
+        <p class="dp">No repo changed since yesterday. The wiki matches the code: no page is stale and every repo has a page.</p></div>
+      <div class="div">needs you · 0</div>
+      <p class="note">Nothing waits. Last checked 07:30.</p>
+      <div class="cols" style="grid-template-columns:1fr 1fr;margin-top:4px">
+        <div>
+          <div class="div">recent files</div>
+          <div class="entry">Scheduling.md <span class="rp">ATT-Wiki</span><span class="m">yesterday</span></div>
+          <div class="entry">retry.ts <span class="rp">att-opmodel</span><span class="m">yesterday</span></div>
+          <div class="entry">Roadmap.md <span class="rp">ATT-Wiki</span><span class="m">Mon</span></div>
+        </div>
+        <div>
+          <div class="div">index health<span class="sp"></span><a>Team</a></div>
+          <div class="stat"><div><b>5 / 5</b>repos indexed</div><div><b>0</b>files queued</div><div><b>0</b>failed</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">The list keeps its heading and says it is empty, with the time of the last check, so an empty list reads as checked and not as broken.</p>
+
+<!-- ───────────────────────── H1d ───────────────────────── -->
+<h2 id="h1d">H1d. H1 with a missing piece. No Claude Code, or no local model</h2>
+<div class="page">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 2</div><div>Ingest</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:860px;margin:0 auto">
+      <div class="hd"><b>ATT</b><span class="chip dim">5 repos</span><span class="chip dim">2 need you</span><span class="sp"></span></div>
+      <div class="rx" style="display:flex;align-items:center;gap:16px;border-width:2px;margin-bottom:8px">
+        <div style="flex:1"><b>Claude Code is not installed</b><br>Without it Ken writes no digest, drafts no pages and reads no ingests. Search, Files and drift still work.</div><span class="btn">How to install</span></div>
+      <div class="rx" style="display:flex;align-items:center;gap:16px;border-width:2px">
+        <div style="flex:1"><b>The local model is not installed</b><br><span class="note">llama 3.2 3B · 2.0 GB</span><br>Without it Ken reads no entities, so Map and Timeline stay empty.</div><span class="btn">Download</span></div>
+      <div class="div">needs you · 2<span class="sp"></span><a>Open Review</a></div>
+      <div class="dr"><span class="k">stale</span><span class="rp">ATT-Wiki</span><span class="tx"><b>Scheduling.md describes the old retry rule</b><span>att-opmodel · retry.ts changed in 4 commits</span></span><span class="w">1 d</span><span class="btn">Open</span></div>
+      <div class="dr"><span class="k">failed</span><span class="rp">Project Docs</span><span class="tx"><b>Budget FY27.xlsx could not be read</b><span>password protected</span></span><span class="w">3 d</span><span class="btn">View</span></div>
+      <div class="cols" style="grid-template-columns:1fr 1fr;margin-top:4px">
+        <div><div class="div">recent files</div><div class="entry">Scheduling.md <span class="rp">ATT-Wiki</span><span class="m">09:12</span></div></div>
+        <div><div class="div">index health</div><div class="stat"><div><b>5 / 5</b>repos indexed</div><div><b>1,204</b>queued · waiting on the model</div><div><b>0</b>entities</div></div></div>
+      </div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">A missing piece takes the digest's place, one row with a 2 border per piece: what is missing, what it stops, and one button. Nothing installs or downloads until a person presses it. Without Claude Code, stale rows open the page instead of offering Update, because Update drafts with it. Index health says the queue is waiting on the model, as in Wright 8c.</p>
+
+<!-- ───────────────────────── Y1 ───────────────────────── -->
+<h2 id="y1">Y1. Home as Your day. Your tickets and your other tasks, each with its state and target date</h2>
+<div class="page" style="height:880px">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">inbox · 1</span><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 6</div><div>Ingest · 1</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div style="width:860px;margin:0 auto">
+      <div class="hd"><b>Your day</b><span class="chip dim">ATT</span><span class="sp"></span><span class="btn">+ Task</span><span class="btn dim">Share</span></div>
+      <div class="dg"><div class="dh"><b>Tuesday, September 30</b><span class="chip dim">07:30</span></div>
+        <p class="dp">ATT-014 has a target of tomorrow and is still in progress. dee sent you the pilot checklist review, for Thursday. att-opmodel has 4 commits since yesterday in the scheduling service, and the Scheduling page still describes the old retry rule. 4WeekScope.md contradicts the Roadmap page on the pilot date.</p></div>
+
+      <div class="div">tickets · 3<span class="sp"></span><span>state</span><span style="width:64px;text-align:right">target</span></div>
+      <div class="tr"><span class="id">ATT-014</span><span class="tx"><b>Retry rule for the scheduler</b><span>att-opmodel · 2 tasks, 1 done</span></span><span class="st">in progress</span><span class="due">Wed</span></div>
+      <div class="tr"><span class="id">ATT-011</span><span class="tx"><b>Pilot date agreed with the client</b><span>Project Docs · blocked on the client</span></span><span class="st">blocked</span><span class="due">Fri</span></div>
+      <div class="tr"><span class="id">ATT-009</span><span class="tx"><b>MGO screen names match the glossary</b><span>mgo-designs</span></span><span class="st">todo</span><span class="due"></span></div>
+
+      <div class="div">other · 4<span class="sp"></span><span style="width:64px;text-align:right">target</span><span style="width:96px"></span></div>
+      <div class="tk"><span class="cb"></span><span class="tx"><b>Review the pilot checklist</b><span>from dee · Project Docs/Pilot checklist.docx</span></span><span class="due">Thu</span><span class="btn">Accept ▾</span></div>
+      <div class="tk"><span class="cb"></span><span class="tx"><b>Update the retry test for the new backoff</b><span>ATT-014 · retry.test.ts</span></span><span class="due">Wed</span><span></span></div>
+      <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">Tue</span><span></span></div>
+      <div class="tk"><span class="cb"></span><span class="tx"><b>Ask sam which pilot sites go first</b><span>note</span></span><span class="due"></span><span></span></div>
+      <div class="tk" style="color:var(--soft)"><span class="cb on"></span><span class="tx"><b style="font-weight:400;text-decoration:line-through">Read the 4-week scope</b><span>done 09:40</span></span><span class="due"></span><span></span></div>
+
+      <div class="cols" style="grid-template-columns:1fr 1fr;margin-top:4px">
+        <div>
+          <div class="div">recent files</div>
+          <div class="entry">ATT-014.md <span class="rp">tickets</span><span class="m">09:12</span></div>
+          <div class="entry">retry.ts <span class="rp">att-opmodel</span><span class="m">yesterday</span></div>
+        </div>
+        <div>
+          <div class="div">index health<span class="sp"></span><a>Team</a></div>
+          <div class="stat"><div><b>5 / 5</b>repos indexed</div><div><b>112</b>files queued</div><div><b>1</b>failed</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="dock"><div class="v">chat · closed</div></div>
+</div>
+<p class="note">Home is renamed Your day: the digest, then your tasks in two lists. Each row shows what it is, the state it is in, and its target date. No filters, sorting controls or counts beyond the list heading. What Review, Ingest and drift hold stays on their own tabs, with the counts on the rail.</p>
+<p class="note">Tickets: the team's ticket files assigned to you (<code>tickets/ATT-014.md</code>, Wright's format), open ones only. A row is the id, the title over the repo it touches and how many of your tasks link to it, the state as the ticket file states it, and the target date. The row opens the ticket in Files. The state is changed in the ticket. A team with no tickets folder shows no Tickets list.</p>
+<p class="note">Other: tasks, todos and notes, all one thing: a title, and optionally a target date, a description, a repeat, and a link to a ticket, a file or a repo. The state is open or done, set with the checkbox; a done item stays greyed until the end of the day, then leaves the list. A task a teammate sent through the team inbox shows Accept ▾ (Accept, Not mine, Reply) until it is accepted. Ordered by target date, then the ones without one. A task linked to a ticket shows the ticket id.</p>
+
+<!-- ───────────────────────── Y1b ───────────────────────── -->
+<h2 id="y1b">Y1b. A task opened. Title, target date, description, link</h2>
+<div class="page" style="height:560px">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div class="on">Home</div><div>Files</div><div>Review</div><div>Ingest</div><div>Team</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div class="cols" style="grid-template-columns:1fr 400px;gap:16px">
+      <div>
+        <div class="div" style="margin-top:0">other · 4</div>
+        <div class="tk" style="background:var(--hi)"><span class="cb"></span><span class="tx"><b>Update the retry test for the new backoff</b><span>ATT-014 · retry.test.ts</span></span><span class="due">Wed</span><span></span></div>
+        <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">Tue</span><span></span></div>
+        <div class="tk"><span class="cb"></span><span class="tx"><b>Ask sam which pilot sites go first</b><span>note</span></span><span class="due"></span><span></span></div>
+      </div>
+      <div class="rx" style="border-width:2px;height:470px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px"><span class="cb"></span><b style="font-size:14px">Update the retry test for the new backoff</b></div>
+        <div class="fl"><span>Target</span><span class="chip">Wed, Oct 1</span><span class="chip dim">clear</span></div>
+        <div class="fl"><span>Repeat</span><span class="chip dim">never ▾</span></div>
+        <div class="fl"><span>Linked</span><span class="chip">ATT-014 ×</span><span class="chip">att-opmodel/src/retry.test.ts ×</span><span class="chip dim">+ link</span></div>
+        <div class="fl"><span>For</span><span class="chip">me</span><span class="chip dim">send to a teammate ▾</span></div>
+        <div style="flex:1;border:1px solid var(--line);padding:8px;font-size:12px;line-height:18px">The backoff went from fixed 5 s to exponential in 4a1c9e0. The test still asserts three calls at 5 s. Change it to assert the delays, not the count.<br><br><span class="note">Markdown. Links to files and pages open in Files.</span></div>
+        <div class="note">Added by you, Mon 14:02 · updated by Ken chat, Tue 09:15</div>
+        <div style="display:flex;gap:8px"><span class="btn dim">Delete</span><span class="sp" style="flex:1"></span><span class="btn">Done</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<p class="note">A task opens in a panel beside the list. Every field saves as it changes. Target is a date or empty. Linked takes tickets (by id), files and repos; a linked ticket lists the task under its ticket in Files. Send to a teammate moves it into the team inbox, and it leaves your list until they reply or it comes back. The last line says who last changed it, because the chat and other agents can change it too. + Task opens the same panel empty, with the cursor in the title and Enter to add.</p>
+
+<!-- ───────────────────────── Y1c ───────────────────────── -->
+<h2 id="y1c">Y1c. A ticket opened. The file in Files, with your tasks for it</h2>
+<div class="page" style="height:520px">
+  <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
+  <div class="rail"><div>Home</div><div class="on">Files</div><div>Review</div><div>Ingest</div><div>Team</div><div class="bottom">Settings</div></div>
+  <div class="main">
+    <div class="cols" style="grid-template-columns:220px 1fr 260px;gap:14px">
+      <div><div class="div" style="margin-top:0">tickets</div><div class="entry" style="background:var(--hi)">ATT-014.md</div><div class="entry">ATT-011.md</div><div class="entry">ATT-009.md</div></div>
+      <div class="rx" style="height:420px"><span class="lb">tickets/ATT-014.md</span><b style="font-size:15px">Retry rule for the scheduler</b><br><span class="note">status: in progress · assignee: chris · target: 2026-10-01</span><br><br><b>What and Why</b><br>The scheduler retries a failed booking every 5 s forever…<br><br><b>How You Would Know It Worked</b><br>…</div>
+      <div><div class="div" style="margin-top:0">your tasks · 2<span class="sp"></span><a>+ Task</a></div>
+        <div class="tk" style="grid-template-columns:18px 1fr 40px"><span class="cb"></span><span class="tx"><b>Update the retry test</b><span>Wed</span></span><span></span></div>
+        <div class="tk" style="grid-template-columns:18px 1fr 40px;color:var(--soft)"><span class="cb on"></span><span class="tx"><b style="font-weight:400;text-decoration:line-through">Read retry.ts</b><span>done Mon</span></span><span></span></div>
+        <div class="div">wiki pages that cite it</div><div class="entry">Scheduling.md</div><div class="entry">Decisions.md</div>
+      </div>
+    </div>
+  </div>
+</div>
+<p class="note">A ticket row on Your day opens the ticket file in Files. The right column lists your tasks linked to it, with + Task to add one already linked, and the wiki pages that cite the ticket id. The ticket itself is edited as a file.</p>
+
+<!-- ───────────────────────── Y storage ───────────────────────── -->
+<h2 id="ystore">Y. Where it lives, the tools, and what goes from the task board</h2>
+<table>
+<tr><th>Part</th><th>Stored in</th><th>Shared</th></tr>
+<tr><td>Tickets</td><td>The team's repos, <code>tickets/&lt;ID&gt;.md</code>, read from the index. Ken does not write them</td><td>Yes, through git, as today</td></tr>
+<tr><td>Other</td><td><code>.ken-workspace/tasks/</code>, one markdown file per task: frontmatter <code>title, target, repeat, links, from, status</code> and the description as the body</td><td>No. Local to this machine</td></tr>
+<tr><td>A task from a teammate</td><td>Arrives through the team inbox repo; Accept copies it into <code>.ken-workspace/tasks/</code> with <code>from:</code></td><td>Its accept and done go back to the sender through the inbox</td></tr>
+</table>
+<table>
+<tr><th>MCP tool</th><th>Does</th></tr>
+<tr><td><code>task_create</code></td><td>Adds a task: title, and optionally target date, description, repeat, links</td></tr>
+<tr><td><code>task_update</code></td><td>Changes any of those fields, or marks it done or open</td></tr>
+<tr><td><code>task_list</code></td><td>Lists your tasks, open by default, with filters for target before, linked to a ticket, and done</td></tr>
+<tr><td><code>ticket_list</code></td><td>Lists the team's tickets from the index, assigned to you by default. Read-only</td></tr>
+</table>
+<table>
+<tr><th>Task board feature</th><th>In Your day</th></tr>
+<tr><td>Kanban columns (backlog, todo, doing, review, done)</td><td>Gone. A task is open or done; older files with other statuses read as open</td></tr>
+<tr><td>Goals and progress</td><td>Gone. A ticket groups tasks instead</td></tr>
+<tr><td>Drag-and-drop, the daily board, rollover prompt, daily plan cards</td><td>Gone</td></tr>
+<tr><td>Per-repo task homes (<code>&lt;repo&gt;/.ken/tasks/</code>)</td><td>Gone. A task links to a repo instead</td></tr>
+<tr><td>AI tasks, <code>task_claim</code></td><td>Gone</td></tr>
+<tr><td>The Tasks rail item and screen</td><td>Gone. Your day is Home</td></tr>
+<tr><td>Team inbox (the family repo) and its tray</td><td>Kept. Accept puts the task in Other; the tray stays for messages</td></tr>
+<tr><td>The <code>kenTasks</code> and <code>kenFamilies</code> flags</td><td>Removed. Your day is always on; the team inbox is on once an inbox repo is set up on Team</td></tr>
+</table>
+<p class="note">"You" is the git user name and email on this machine, matched against a ticket's <code>assignee</code>. A team whose tickets use short names sets the mapping once on Team.</p>
+
+<!-- ───────────────────────── moves ───────────────────────── -->
+<h2 id="moves">What moves, for H1</h2>
+<table>
+<tr><th>On Home today</th><th>In H1</th></tr>
+<tr><td>Today's digest, for the focused repo</td><td>One digest for the team, all repos in one paragraph</td></tr>
+<tr><td>Across ATT, a paragraph per repo</td><td>Folded into the team digest</td></tr>
+<tr><td>On your board</td><td>Rows of kind board in the one list</td></tr>
+<tr><td>Waiting on you (ingest runs, blocked runs, Review count)</td><td>Rows of kind confirm, stale, moved, gap; the rest as a count that opens Review</td></tr>
+<tr><td>Needs a look (failed files)</td><td>Rows of kind failed</td></tr>
+<tr><td>Scope picker and search box</td><td>Removed. Ctrl K in the title bar; the team switcher sets scope</td></tr>
+<tr><td>Recent files, focused repo</td><td>Recent files across the team, with the repo on each</td></tr>
+<tr><td>Repos strip</td><td>Removed. Team has the table</td></tr>
+<tr><td>Not shown</td><td>Index health, three figures, opens Team</td></tr>
+</table>
+<p class="note">Build work for H1: the digest prompt takes the team's repos instead of one; one list query that joins review items, ingest proposals, drift, failed files and board items for the team's project ids; recent files across those ids; index health from the counts Team already reads. HomeSearch, ScopePicker, MembersStrip and WorkspaceDigestCard leave Home.</p>
+</body>
+</html>

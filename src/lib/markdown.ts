@@ -13,13 +13,15 @@ export function renderMarkdown(md: string): string {
       "tbody", "tr", "th", "td", "hr",
     ],
     ALLOWED_ATTR: ["href"],
+    // DOMPurify default URIs, plus ken:// so a cited source stays a link.
+    ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|ken):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
   });
 }
 
 // Search snippets carry only the backend's <mark> highlight tags. Escape the
 // whole string, then re-allow just <mark>/</mark> — the result is fed to Svelte
 // {@html}, so every other tag (script, img onerror, …) must stay inert. This is
-// the single XSS boundary shared by HomeSearch and SearchOverlay; fix it once.
+// the single XSS boundary used by SearchOverlay; fix it once.
 export function renderSearchSnippet(snippet: string): string {
   return snippet
     .replaceAll("&", "&amp;")

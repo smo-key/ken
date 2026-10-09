@@ -17,7 +17,10 @@
   import Telescope from "@lucide/svelte/icons/telescope";
   import Terminal from "@lucide/svelte/icons/terminal";
   import X from "@lucide/svelte/icons/x";
+  import Layers from "@lucide/svelte/icons/layers";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { toast } from "../lib/toast.svelte";
   import ResearchModal from "../research/ResearchModal.svelte";
   import ChatResizer from "./ChatResizer.svelte";
   import { app } from "../lib/app.svelte";
@@ -40,6 +43,9 @@
         icon: row.pinned ? PinOff : Pin,
         onSelect: () => void chats.pin(row.id, !row.pinned),
       },
+      ...(row.kind === "user"
+        ? [{ label: "Send to Ingest", icon: Layers, onSelect: () => void sendToIngest(row) }]
+        : []),
       "separator",
       {
         label: "Archive",
@@ -47,6 +53,18 @@
         onSelect: () => void chats.archive(row.id),
       },
     ]);
+  }
+
+  // The whole chat, the person's and Ken's turns, into the team wiki's Raw/.
+  async function sendToIngest(row: ChatRow) {
+    const projectId = app.focused;
+    if (!projectId) return;
+    try {
+      await api.ingestAddChat(scope.team, projectId, row.id, null);
+      toast.show(`"${row.title}" is in Ingest. Ken reads it now.`);
+    } catch (err) {
+      toast.error("Could not send the chat to Ingest", err);
+    }
   }
 
   function kindIcon(kind: ChatRow["kind"]) {
@@ -365,8 +383,8 @@
      defers to it so the drawer holds that fixed width beside the main content. */
   .drawer {
     flex: 0 0 auto;
-    border-left: 1px solid var(--border);
-    background: var(--sunken-2);
+    border-left: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -374,7 +392,7 @@
   }
   .drawer.overlay {
     position: absolute;
-    top: 52px;
+    top: 56px;
     right: 0;
     bottom: 0;
     z-index: 40;
@@ -643,8 +661,10 @@
     font-size: 11.5px;
     color: var(--ink-secondary);
     border: 1px solid var(--border);
-    background: transparent;
-    padding: 4px 6px;
+    background-color: transparent;
+    background-position: right 5px center;
+    background-size: 11px;
+    padding: 4px 20px 4px 7px;
     border-radius: 7px;
     max-width: 110px;
   }

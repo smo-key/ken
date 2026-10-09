@@ -1,6 +1,13 @@
 //! Project lifecycle: `.ken/project.json` inside the project folder is the
 //! shared, text-only source of truth. Unknown fields are preserved on
 //! rewrite so newer Ken versions (or teammates' configs) aren't clobbered.
+//!
+//! A repo Ken must leave untouched (a code or reference repo: Ken never
+//! commits into it, and it should gain no file from Ken) keeps the same
+//! config in Ken's app data instead, keyed by its folder
+//! ([`outside_config_path`]); [`Project::create_outside`] makes one, and
+//! [`Project::open`] and [`Project::save`] find it when the repo has no
+//! `.ken/project.json` of its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,10 +55,32 @@ pub struct ProjectConfig {
     /// (everything is included).
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// Per-project feature-flag overrides; bool values keyed by flag name.
+    /// Absent map means no overrides. Older Kens that don't know this field
+    /// carry it through the `extra` flatten below.
+    #[serde(default)]
+    pub features: serde_json::Map<String, serde_json::Value>,
     /// Fields written by newer versions or other capabilities survive a
     /// round-trip through this one.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ProjectConfig {
+    /// Short display symbol (1-3 characters or an emoji), rendered
+    /// top-left on every board card carrying this project (design D12,
+    /// `ken-pipeline`). Lives in `extra`, not a typed field — per OPEN-2,
+    /// this keeps `project.json` round-tripping through older Ken
+    /// untouched; there is no schema change to make.
+    pub fn symbol(&self) -> Option<&str> {
+        self.extra.get("symbol").and_then(|v| v.as_str())
+    }
+
+    /// Optional display colour paired with `symbol`. Same `extra`-only
+    /// treatment as `symbol` — see OPEN-2.
+    pub fn color(&self) -> Option<&str> {
+        self.extra.get("color").and_then(|v| v.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +93,34 @@ pub fn config_path(root: &Path) -> PathBuf {
     root.join(CONFIG_DIR).join(CONFIG_FILE)
 }
 
+/// Where a repo that gets no file from Ken keeps its config: Ken's app data,
+/// `project-configs/<hash of the folder>.json`. None when the app-data
+/// folder cannot be found.
+pub fn outside_config_path(root: &Path) -> Option<PathBuf> {
+    let canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let key = canon.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase().replace('\\', "/");
+    let hash = twox_hash::XxHash64::oneshot(0x4B45_4E43_4647, key.as_bytes());
+    crate::registry::default_base_dir().ok().map(|b| b.join("project-configs").join(format!("{hash:016x}.json")))
+}
+
+/// The config file a project uses: its own `.ken/project.json`, else the
+/// one kept for it in app data, when either exists.
+pub fn existing_config(root: &Path) -> Option<PathBuf> {
+    let inside = config_path(root);
+    if inside.exists() {
+        return Some(inside);
+    }
+    outside_config_path(root).filter(|p| p.exists())
+}
+
+fn write_config(path: &Path, config: &ProjectConfig) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    }
+    let json = serde_json::to_string_pretty(config).map_err(|e| Error::Other(e.to_string()))?;
+    fs::write(path, json + "\n").map_err(|e| Error::io(path, e))
+}
+
 impl Project {
     /// Create a new project in an existing folder. If the folder already has
     /// a `.ken/project.json` (e.g. cloned from a teammate), it is adopted
@@ -72,13 +129,14 @@ impl Project {
         if !root.is_dir() {
             return Err(Error::ProjectMissing(root.to_path_buf()));
         }
-        if config_path(root).exists() {
+        if existing_config(root).is_some() {
             return Project::open(root);
         }
         let config = ProjectConfig {
             name: name.to_string(),
             id: Uuid::new_v4(),
             excluded: Vec::new(),
+            features: serde_json::Map::new(),
             extra: serde_json::Map::new(),
         };
         let project = Project {
@@ -89,9 +147,37 @@ impl Project {
         Ok(project)
     }
 
-    /// Open a folder that already contains `.ken/project.json`.
+    /// Make a project whose config lives in Ken's app data, not in the repo:
+    /// the repo gains no `.ken/`. A repo that already has its own
+    /// `.ken/project.json` (a teammate's, say) is adopted unchanged.
+    pub fn create_outside(root: &Path, name: &str) -> Result<Project> {
+        if !root.is_dir() {
+            return Err(Error::ProjectMissing(root.to_path_buf()));
+        }
+        if existing_config(root).is_some() {
+            return Project::open(root);
+        }
+        let path = outside_config_path(root).ok_or_else(|| Error::Other("Ken's app-data folder was not found".into()))?;
+        let config = ProjectConfig {
+            name: name.to_string(),
+            id: Uuid::new_v4(),
+            excluded: Vec::new(),
+            features: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+        };
+        write_config(&path, &config)?;
+        Ok(Project { root: root.to_path_buf(), config })
+    }
+
+    /// Whether this project's config lives in app data, outside the repo.
+    pub fn is_outside(&self) -> bool {
+        !config_path(&self.root).exists() && outside_config_path(&self.root).is_some_and(|p| p.exists())
+    }
+
+    /// Open a folder that has a `.ken/project.json`, or a config kept for it
+    /// in app data.
     pub fn open(root: &Path) -> Result<Project> {
-        let path = config_path(root);
+        let path = existing_config(root).unwrap_or_else(|| config_path(root));
         let raw = fs::read_to_string(&path).map_err(|e| {
             if !root.is_dir() {
                 Error::ProjectMissing(root.to_path_buf())
@@ -111,12 +197,13 @@ impl Project {
     }
 
     pub fn save(&self) -> Result<()> {
-        let dir = self.root.join(CONFIG_DIR);
-        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
-        let path = config_path(&self.root);
-        let json = serde_json::to_string_pretty(&self.config)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        fs::write(&path, json + "\n").map_err(|e| Error::io(&path, e))
+        // Kept in app data: stay there, so the repo still gains no file.
+        if self.is_outside() {
+            if let Some(path) = outside_config_path(&self.root) {
+                return write_config(&path, &self.config);
+            }
+        }
+        write_config(&config_path(&self.root), &self.config)
     }
 
     /// Is a project-relative path inside an excluded folder?
@@ -126,6 +213,35 @@ impl Project {
             let ex = ex.trim_matches('/');
             !ex.is_empty() && (rel == ex || rel.starts_with(&format!("{ex}/")))
         })
+    }
+
+    /// Load and parse this project's `.kenignore` (project root, not
+    /// `.ken/`) into rules per kenignore design D6/D1. Missing file reads as
+    /// empty rules, not an error — most projects won't have one. This is the
+    /// "user rule set" tier in D2's precedence order; callers combine it with
+    /// any built-in rule sets (task 1.3) via `kenignore::classify`'s
+    /// `rule_sets` slice, user rules last so they can override built-ins.
+    ///
+    /// A workspace member also takes the lines of its workspace's own
+    /// `.kenignore` (the one setup writes, beside `.ken-workspace/`) that
+    /// reach inside it: `member/path` lines, and patterns with no folder in
+    /// them (`*.log`). They come first, so the member's own file overrides.
+    pub fn kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
+        let path = self.root.join(".kenignore");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let mut rules = self.workspace_kenignore_rules();
+        rules.extend(crate::kenignore::parse(&text));
+        rules
+    }
+
+    fn workspace_kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
+        let Some(ws) = self.root.ancestors().skip(1).take(3).find(|a| a.join(crate::workspace::CONFIG_DIR).is_dir()) else {
+            return Vec::new();
+        };
+        let Ok(text) = fs::read_to_string(ws.join(".kenignore")) else { return Vec::new() };
+        let Ok(member) = self.root.strip_prefix(ws) else { return Vec::new() };
+        let member = member.to_string_lossy().replace('\\', "/");
+        crate::kenignore::parse(&crate::kenignore::lines_for_member(&text, &member))
     }
 
     /// Rename the project, rewriting `.ken/project.json`. The invalid-name
@@ -143,11 +259,34 @@ impl Project {
         self.save()
     }
 
+    /// Effective exclusion set (project-profiler D3): user `excluded` ∪ the
+    /// stored profile's `excludes`, additive only — a profile exclude never
+    /// replaces or removes a user entry. `profiler_enabled` is the caller's
+    /// already-resolved `profiler` flag value (see `features::effective_flag`);
+    /// this method has no `AppSettings` access of its own, so passing `false`
+    /// reproduces plain `excluded`-only behavior exactly, which is how
+    /// flag-off inertness holds even when a profile file is present on disk
+    /// (spec: "flag off is inert").
+    pub fn effective_excluded(&self, profiler_enabled: bool) -> Vec<String> {
+        let mut set = self.config.excluded.clone();
+        if profiler_enabled {
+            let profile = crate::profiler::ProjectProfile::load(&self.root);
+            for ex in profile.excludes {
+                if !set.iter().any(|e| e == &ex) {
+                    set.push(ex);
+                }
+            }
+        }
+        set
+    }
+
     /// Resolve a project-relative path, refusing anything that escapes the
     /// project root (`..`, absolute paths).
     pub fn resolve(&self, rel_path: &str) -> Result<PathBuf> {
         let rel = Path::new(rel_path);
-        if rel.is_absolute()
+        // has_root() rather than is_absolute(): on Windows "/etc/passwd" is
+        // rooted but not absolute, yet join() would still escape the project.
+        if rel.has_root()
             || rel
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -193,12 +332,61 @@ mod tests {
         let mut v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         v["ingestRunner"] = "hidden-tui".into();
+        // A newer Ken also wrote a features map, including a flag this build
+        // doesn't recognize by name. It lives in the typed `features` field but
+        // must still survive a save round-trip unchanged.
+        v["features"] = serde_json::json!({ "semanticIndex": true, "futureFlag": true });
         fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
 
         let mut reopened = Project::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.config.features.get("semanticIndex").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            reopened.config.features.get("futureFlag").and_then(|x| x.as_bool()),
+            Some(true)
+        );
         reopened.set_excluded(vec!["archive".into()]).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("ingestRunner"), "extra field lost: {raw}");
+        assert!(raw.contains("futureFlag"), "features map lost: {raw}");
+        drop(p);
+    }
+
+    #[test]
+    fn symbol_and_color_read_from_extra_when_present() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.extra.insert("symbol".into(), "SR".into());
+        p.config.extra.insert("color".into(), "#5566ee".into());
+        assert_eq!(p.config.symbol(), Some("SR"));
+        assert_eq!(p.config.color(), Some("#5566ee"));
+    }
+
+    #[test]
+    fn symbol_and_color_absent_when_not_set() {
+        let dir = tempdir().unwrap();
+        let p = Project::create(dir.path(), "X").unwrap();
+        assert_eq!(p.config.symbol(), None);
+        assert_eq!(p.config.color(), None);
+    }
+
+    #[test]
+    fn symbol_survives_roundtrip_via_extra() {
+        let dir = tempdir().unwrap();
+        let path = config_path(dir.path());
+        let p = Project::create(dir.path(), "X").unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["symbol"] = "SR".into();
+        fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        let reopened = Project::open(dir.path()).unwrap();
+        assert_eq!(reopened.config.symbol(), Some("SR"));
+        reopened.save().unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"symbol\""), "symbol lost: {raw}");
         drop(p);
     }
 
@@ -211,6 +399,38 @@ mod tests {
         assert!(p.is_excluded("archive"));
         assert!(!p.is_excluded("archive-2/notes.md"));
         assert!(!p.is_excluded("notes/archive.md"));
+    }
+
+    #[test]
+    fn effective_excluded_unions_profile_excludes_only_when_enabled() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.excluded = vec!["archive".into()];
+
+        // No profile file yet: enabled or not, effective set is just user excluded.
+        assert_eq!(p.effective_excluded(true), vec!["archive".to_string()]);
+        assert_eq!(p.effective_excluded(false), vec!["archive".to_string()]);
+
+        let mut profile = crate::profiler::ProjectProfile::default();
+        profile.excludes = vec!["target/".to_string()];
+        profile.save(&p.root).unwrap();
+
+        // Flag off: the profile file is not read at all (spec: flag off is inert).
+        assert_eq!(p.effective_excluded(false), vec!["archive".to_string()]);
+        // Flag on: additive union, user entry first.
+        assert_eq!(p.effective_excluded(true), vec!["archive".to_string(), "target/".to_string()]);
+    }
+
+    #[test]
+    fn effective_excluded_never_duplicates_an_overlapping_entry() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.excluded = vec!["target/".to_string()];
+        let mut profile = crate::profiler::ProjectProfile::default();
+        profile.excludes = vec!["target/".to_string()];
+        profile.save(&p.root).unwrap();
+
+        assert_eq!(p.effective_excluded(true), vec!["target/".to_string()]);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! The available models are a small, curated [`catalog`] rather than a runtime
 //! discovery of the upstream repo: each entry carries a [`ModelCategory`]
-//! (Transcription / Language), a [`ModelTier`] (Recommended / Advanced), a
+//! (Transcription / Language / Embedding), a [`ModelTier`] (Recommended /
+//! Advanced), a
 //! Settings blurb, and its download identity ([`ModelSpec`]). The recommended
 //! transcription model doubles as the offline fallback and the model the
 //! transcript feature gates on. A per-category choice is persisted machine-wide
@@ -29,18 +30,23 @@ pub const RECOMMENDED_FILE: &str = transcript::MODEL_FILE;
 /// The recommended model's known size, used only for the offline gate/display
 /// and as the no-`Content-Length` verification floor; real downloads verify
 /// against the server's advertised length. Approximate is fine here.
-pub const RECOMMENDED_BYTES: u64 = 147_951_465;
+pub const RECOMMENDED_BYTES: u64 = 147_964_211;
 
 /// The direct download URL for one model file in the repo.
 pub fn resolve_url(file: &str) -> String {
     format!("https://huggingface.co/{REPO}/resolve/main/{file}")
 }
 
-/// The advanced transcription model — Whisper Large v3 Turbo.
-pub const WHISPER_LARGE_TURBO_FILE: &str = "ggml-large-v3-turbo.bin";
-/// Display/offline-floor size only (~1.6 GB); real downloads verify against the
+/// Whisper Small (English), q5_1: more accurate than Base, still fine on a CPU.
+pub const WHISPER_SMALL_EN_FILE: &str = "ggml-small.en-q5_1.bin";
+/// Display/offline-floor size only; real downloads verify against the
 /// server's Content-Length.
-pub const WHISPER_LARGE_TURBO_BYTES: u64 = 1_624_555_275;
+pub const WHISPER_SMALL_EN_BYTES: u64 = 190_085_487;
+
+/// Whisper Large v3 Turbo, q5_0: the most accurate, about 100 languages, a
+/// third the size of the fp16 file.
+pub const WHISPER_LARGE_TURBO_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
+pub const WHISPER_LARGE_TURBO_BYTES: u64 = 574_041_195;
 
 // ---------- Language models (spec §1 / §10 "Answers & Map") ----------
 
@@ -56,6 +62,43 @@ pub const LANG_4B_BYTES: u64 = 2_497_281_120;
 pub const LANG_8B_FILE: &str = "Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_URL: &str = "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_BYTES: u64 = 5_027_783_488;
+
+// ---------- Embedding model (semantic search) ----------
+
+/// The semantic-search embedding model: nomic-embed-text v1.5, Q8_0 GGUF
+/// (~140 MB, 768-dim). Small enough that a single curated entry suffices —
+/// no Advanced tier.
+pub const EMBED_FILE: &str = "nomic-embed-text-v1.5.Q8_0.gguf";
+pub const EMBED_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf";
+pub const EMBED_BYTES: u64 = 146_146_432;
+
+/// The stronger embedding model: Qwen3 Embedding 0.6B, Q8_0 GGUF (~640 MB,
+/// 1024-dim, Apache-2.0), from Qwen's own repo.
+pub const QWEN3_EMBED_FILE: &str = "Qwen3-Embedding-0.6B-Q8_0.gguf";
+pub const QWEN3_EMBED_URL: &str = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf";
+pub const QWEN3_EMBED_BYTES: u64 = 639_150_592;
+
+fn qwen3_embedding_spec() -> ModelSpec {
+    ModelSpec {
+        id: QWEN3_EMBED_FILE.to_string(),
+        name: "Qwen3 Embedding 0.6B".to_string(),
+        file: QWEN3_EMBED_FILE.to_string(),
+        url: QWEN3_EMBED_URL.to_string(),
+        expected_bytes: QWEN3_EMBED_BYTES,
+        recommended: false,
+    }
+}
+
+fn embedding_spec() -> ModelSpec {
+    ModelSpec {
+        id: EMBED_FILE.to_string(),
+        name: "Nomic Embed v1.5".to_string(),
+        file: EMBED_FILE.to_string(),
+        url: EMBED_URL.to_string(),
+        expected_bytes: EMBED_BYTES,
+        recommended: true,
+    }
+}
 
 fn lang_recommended_spec() -> ModelSpec {
     ModelSpec {
@@ -97,13 +140,27 @@ pub struct ModelSpec {
 pub enum ModelCategory {
     Transcription,
     Language,
+    Embedding,
 }
 
-/// The two tiers offered per category: the safe default and the heavier option.
+/// Where a model sits in its category, as Settings names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTier {
+    Light,
     Recommended,
     Advanced,
+    Best,
+}
+
+impl ModelTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelTier::Light => "light",
+            ModelTier::Recommended => "recommended",
+            ModelTier::Advanced => "advanced",
+            ModelTier::Best => "best",
+        }
+    }
 }
 
 /// One curated, downloadable model with its category, tier, and Settings blurb.
@@ -113,6 +170,8 @@ pub struct CatalogEntry {
     pub category: ModelCategory,
     pub tier: ModelTier,
     pub blurb: &'static str,
+    /// The languages it handles, as a person says them.
+    pub languages: &'static str,
     pub spec: ModelSpec,
 }
 
@@ -127,64 +186,105 @@ fn spec(file: &str, name: &str, bytes: u64, recommended: bool) -> ModelSpec {
     }
 }
 
-/// The transcription pair. Recommended = Whisper Base (English); Advanced =
-/// Whisper Large v3 Turbo.
+/// The transcription models: Base (English, the default), Small (English,
+/// more accurate) and Large v3 Turbo (most accurate, about 100 languages).
 fn transcription_catalog() -> Vec<CatalogEntry> {
     vec![
         CatalogEntry {
             category: ModelCategory::Transcription,
             tier: ModelTier::Recommended,
-            blurb: "fast, accurate for meetings",
+            blurb: "Fast. Good for meetings in English.",
+            languages: "English",
             spec: spec(RECOMMENDED_FILE, "Whisper Base (English)", RECOMMENDED_BYTES, true),
         },
         CatalogEntry {
             category: ModelCategory::Transcription,
             tier: ModelTier::Advanced,
-            blurb: "best accuracy, understands more languages, slower",
+            blurb: "More accurate in English. Slower on a CPU.",
+            languages: "English",
+            spec: spec(WHISPER_SMALL_EN_FILE, "Whisper Small (English)", WHISPER_SMALL_EN_BYTES, false),
+        },
+        CatalogEntry {
+            category: ModelCategory::Transcription,
+            tier: ModelTier::Best,
+            blurb: "Most accurate, and detects the language. Best with a graphics card.",
+            languages: "About 100 languages",
             spec: spec(WHISPER_LARGE_TURBO_FILE, "Whisper Large v3 Turbo", WHISPER_LARGE_TURBO_BYTES, false),
         },
     ]
 }
 
-/// The curated "Answers & Map" language models (spec §1 / §10) — the seam
-/// `catalog()` concatenates. Recommended = Qwen3 4B (instant); Advanced =
-/// Qwen3 8B (smarter, heavier).
-fn language_catalog() -> Vec<CatalogEntry> {
+/// The on-device language models, kept for the local engine behind
+/// `LOCAL_GENERATION` (off): Claude writes, extracts and answers, so these
+/// are not offered in Settings ([`catalog`] leaves them out). A file already
+/// downloaded is still found by [`selected_model_path`] and can be removed.
+pub fn language_catalog() -> Vec<CatalogEntry> {
     vec![
         CatalogEntry {
             category: ModelCategory::Language,
             tier: ModelTier::Recommended,
-            blurb: "instant answers, builds your map",
+            blurb: "Not used: Claude builds the map.",
+            languages: "",
             spec: lang_recommended_spec(),
         },
         CatalogEntry {
             category: ModelCategory::Language,
             tier: ModelTier::Advanced,
-            blurb: "smarter answers, needs more memory",
+            blurb: "Not used: Claude builds the map.",
+            languages: "",
             spec: lang_advanced_spec(),
         },
     ]
 }
 
-/// Every curated model, in display order (Transcription, then Language).
+/// The search-by-meaning models: Nomic (the default, English, small) and
+/// Qwen3 Embedding (stronger, code and about 100 languages). Switching
+/// re-reads every file for meaning once.
+fn embedding_catalog() -> Vec<CatalogEntry> {
+    vec![
+        CatalogEntry {
+            category: ModelCategory::Embedding,
+            tier: ModelTier::Recommended,
+            blurb: "Small and fast. Good for English documents.",
+            languages: "English",
+            spec: embedding_spec(),
+        },
+        CatalogEntry {
+            category: ModelCategory::Embedding,
+            tier: ModelTier::Best,
+            blurb: "Finds more, especially in code. Best with a graphics card.",
+            languages: "About 100 languages",
+            spec: qwen3_embedding_spec(),
+        },
+    ]
+}
+
+/// Every model Settings offers, in display order (Transcription, Embedding).
 pub fn catalog() -> Vec<CatalogEntry> {
     let mut entries = transcription_catalog();
+    entries.extend(embedding_catalog());
+    entries
+}
+
+/// Every model Ken knows, offered or not (the unused language models too).
+fn known() -> Vec<CatalogEntry> {
+    let mut entries = catalog();
     entries.extend(language_catalog());
     entries
 }
 
 /// The specs in one category, in catalog order.
 pub fn category_specs(category: ModelCategory) -> Vec<ModelSpec> {
-    catalog()
+    known()
         .into_iter()
         .filter(|e| e.category == category)
         .map(|e| e.spec)
         .collect()
 }
 
-/// Locate a spec by its file-name id across the whole catalog.
+/// Locate a spec by its file-name id across every known model.
 pub fn find_spec(id: &str) -> Option<ModelSpec> {
-    catalog().into_iter().map(|e| e.spec).find(|s| s.id == id)
+    known().into_iter().map(|e| e.spec).find(|s| s.id == id)
 }
 
 /// The recommended transcription model — the offline fallback and the model the
@@ -274,6 +374,8 @@ pub struct ModelSelection {
     pub transcription: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub embedding: Option<String>,
 }
 
 fn selection_path(base_dir: &Path) -> PathBuf {
@@ -301,6 +403,7 @@ impl ModelSelection {
         match category {
             ModelCategory::Transcription => self.transcription.as_deref(),
             ModelCategory::Language => self.language.as_deref(),
+            ModelCategory::Embedding => self.embedding.as_deref(),
         }
     }
 
@@ -308,6 +411,7 @@ impl ModelSelection {
         match category {
             ModelCategory::Transcription => self.transcription = Some(id.to_string()),
             ModelCategory::Language => self.language = Some(id.to_string()),
+            ModelCategory::Embedding => self.embedding = Some(id.to_string()),
         }
     }
 }
@@ -556,37 +660,30 @@ mod tests {
             .iter()
             .filter(|e| e.category == ModelCategory::Transcription)
             .collect();
-        assert_eq!(trans.len(), 2, "one recommended + one advanced transcription model");
+        assert_eq!(trans.len(), 3, "Base, Small and Large v3 Turbo");
         let rec = trans.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
         assert_eq!(rec.spec.file, "ggml-base.en.bin");
         assert_eq!(rec.spec.name, "Whisper Base (English)");
-        assert_eq!(rec.spec.expected_bytes, 147_951_465);
+        assert_eq!(rec.spec.expected_bytes, 147_964_211);
         assert!(rec.spec.recommended);
-        let adv = trans.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
-        assert_eq!(adv.spec.file, "ggml-large-v3-turbo.bin");
-        assert_eq!(adv.spec.name, "Whisper Large v3 Turbo");
-        assert!(!adv.spec.recommended);
-        // Blurbs are the exact Settings copy.
-        assert_eq!(rec.blurb, "fast, accurate for meetings");
-        assert_eq!(adv.blurb, "best accuracy, understands more languages, slower");
+        let small = trans.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
+        assert_eq!(small.spec.file, "ggml-small.en-q5_1.bin");
+        let best = trans.iter().find(|e| e.tier == ModelTier::Best).unwrap();
+        assert_eq!(best.spec.file, "ggml-large-v3-turbo-q5_0.bin");
+        assert_eq!(best.spec.name, "Whisper Large v3 Turbo");
+        assert!(!best.spec.recommended);
+        assert_eq!(best.languages, "About 100 languages");
+        assert_eq!(rec.languages, "English");
     }
 
     #[test]
-    fn language_catalog_has_qwen3_4b_and_8b() {
-        let lang: Vec<_> = catalog()
-            .into_iter()
-            .filter(|e| e.category == ModelCategory::Language)
-            .collect();
+    fn language_models_are_known_but_not_offered() {
+        assert!(catalog().iter().all(|e| e.category != ModelCategory::Language), "Claude builds the map");
+        let lang = language_catalog();
         assert_eq!(lang.len(), 2);
         let rec = lang.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
         assert_eq!(rec.spec.file, "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
-        assert_eq!(rec.spec.expected_bytes, 2_497_281_120);
-        assert!(rec.spec.url.starts_with("https://huggingface.co/unsloth/"));
-        assert_eq!(rec.blurb, "instant answers, builds your map");
-        let adv = lang.iter().find(|e| e.tier == ModelTier::Advanced).unwrap();
-        assert_eq!(adv.spec.file, "Qwen3-8B-Q4_K_M.gguf");
-        assert_eq!(adv.spec.expected_bytes, 5_027_783_488);
-        assert_eq!(adv.blurb, "smarter answers, needs more memory");
+        assert!(find_spec("Qwen3-8B-Q4_K_M.gguf").is_some(), "a downloaded file can still be removed");
 
         // With no selection.json in a fresh base_dir, selected(Language) defaults
         // to the recommended 4B; nothing installed → no loadable path.
@@ -602,6 +699,52 @@ mod tests {
     }
 
     #[test]
+    fn embedding_catalog_has_nomic_by_default_and_qwen3_as_best() {
+        let embed: Vec<_> = catalog()
+            .into_iter()
+            .filter(|e| e.category == ModelCategory::Embedding)
+            .collect();
+        assert_eq!(embed.len(), 2);
+        let entry = embed.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();
+        assert_eq!(entry.spec.file, "nomic-embed-text-v1.5.Q8_0.gguf");
+        assert_eq!(entry.spec.name, "Nomic Embed v1.5");
+        assert_eq!(entry.spec.expected_bytes, 146_146_432);
+        assert!(entry.spec.url.starts_with("https://huggingface.co/nomic-ai/"));
+        assert!(entry.spec.recommended, "selected() requires a recommended entry per category");
+        let best = embed.iter().find(|e| e.tier == ModelTier::Best).unwrap();
+        assert_eq!(best.spec.file, "Qwen3-Embedding-0.6B-Q8_0.gguf");
+        assert!(best.spec.url.starts_with("https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/"));
+        assert_eq!(crate::embedder::profile_for_file(&best.spec.file), crate::embedder::QWEN3);
+
+        // Fresh base_dir: selected() falls back to the recommended nomic entry;
+        // nothing installed → no loadable path.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            selected(dir.path(), ModelCategory::Embedding).file,
+            entry.spec.file
+        );
+        assert_eq!(selected_model_path(dir.path(), ModelCategory::Embedding), None);
+    }
+
+    #[test]
+    fn model_selection_embedding_field_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        set_selected(base, ModelCategory::Embedding, "nomic-embed-text-v1.5.Q8_0.gguf").unwrap();
+        let loaded = ModelSelection::load(base);
+        assert_eq!(loaded.embedding.as_deref(), Some("nomic-embed-text-v1.5.Q8_0.gguf"));
+        // Older selection.json without the field still parses (serde default).
+        std::fs::write(
+            base.join("models").join("selection.json"),
+            r#"{"transcription":"ggml-base.en.bin"}"#,
+        )
+        .unwrap();
+        let loaded = ModelSelection::load(base);
+        assert_eq!(loaded.transcription.as_deref(), Some("ggml-base.en.bin"));
+        assert_eq!(loaded.embedding, None);
+    }
+
+    #[test]
     fn recommended_still_resolves_to_base_english() {
         let r = recommended();
         assert_eq!(r.file, "ggml-base.en.bin");
@@ -611,7 +754,7 @@ mod tests {
 
     #[test]
     fn find_spec_locates_catalog_models_and_rejects_unknown() {
-        assert_eq!(find_spec("ggml-large-v3-turbo.bin").unwrap().name, "Whisper Large v3 Turbo");
+        assert_eq!(find_spec("ggml-large-v3-turbo-q5_0.bin").unwrap().name, "Whisper Large v3 Turbo");
         assert!(find_spec("ggml-nonsense.bin").is_none());
     }
 
@@ -622,8 +765,8 @@ mod tests {
         // No selection saved → the category's Recommended.
         assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-base.en.bin");
         // A valid choice persists and is returned.
-        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
-        assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-large-v3-turbo.bin");
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo-q5_0.bin").unwrap();
+        assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-large-v3-turbo-q5_0.bin");
         // An unknown persisted id degrades back to Recommended (never a broken spec).
         set_selected(base, ModelCategory::Transcription, "ggml-bogus.bin").unwrap();
         assert_eq!(selected(base, ModelCategory::Transcription).file, "ggml-base.en.bin");
@@ -637,7 +780,7 @@ mod tests {
         assert!(selected_model_path(base, ModelCategory::Transcription).is_none());
 
         // Install the ADVANCED model only, but leave the selection at Recommended.
-        let adv = find_spec("ggml-large-v3-turbo.bin").unwrap();
+        let adv = find_spec("ggml-large-v3-turbo-q5_0.bin").unwrap();
         let p = target_path(base, &adv);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"weights").unwrap();
@@ -645,7 +788,7 @@ mod tests {
         assert_eq!(selected_model_path(base, ModelCategory::Transcription), Some(p.clone()));
 
         // Now select the installed advanced model → its path.
-        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo-q5_0.bin").unwrap();
         assert_eq!(selected_model_path(base, ModelCategory::Transcription), Some(p));
     }
 
@@ -653,9 +796,9 @@ mod tests {
     fn model_selection_roundtrips_and_defaults_on_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo.bin").unwrap();
+        set_selected(base, ModelCategory::Transcription, "ggml-large-v3-turbo-q5_0.bin").unwrap();
         let loaded = ModelSelection::load(base);
-        assert_eq!(loaded.transcription.as_deref(), Some("ggml-large-v3-turbo.bin"));
+        assert_eq!(loaded.transcription.as_deref(), Some("ggml-large-v3-turbo-q5_0.bin"));
         // Corrupt file → defaults, never an error.
         std::fs::write(base.join("models").join("selection.json"), "{ not json").unwrap();
         assert_eq!(ModelSelection::load(base), ModelSelection::default());

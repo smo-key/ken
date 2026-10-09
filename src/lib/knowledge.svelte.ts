@@ -2,6 +2,8 @@
 // model, whether a manual Deep rebuild is running, incremental coverage, and
 // whether the local model is available to keep extracting.
 import { api, type KnowledgeModel } from "./api";
+import { forFocused } from "./app.svelte";
+import { claudeInstallHelp } from "./platform";
 
 class KnowledgeStore {
   model = $state<KnowledgeModel | null>(null);
@@ -34,7 +36,7 @@ class KnowledgeStore {
     return { analyzed: m.analyzed, total: m.total, failed };
   }
 
-  /** The local model can't extract right now — show the plain notice. */
+  /** Nothing can map right now (Claude Code missing) — show the plain notice. */
   get llmPaused(): boolean {
     return (
       this.model?.llmStatus === "notInstalled" ||
@@ -44,10 +46,10 @@ class KnowledgeStore {
 
   get llmNotice(): string {
     if (this.model?.llmStatus === "error") {
-      return "Ken's on-device model hit a snag — mapping is paused. Open Settings to check the model.";
+      return "Mapping hit a snag with Claude Code. Try Deep rebuild, or run `claude` once to check it signs in.";
     }
     // notInstalled
-    return "Ken maps your project on your Mac. Choose the on-device model in Settings to begin.";
+    return `Ken builds the map with Claude Code. ${claudeInstallHelp()}`;
   }
 
   /** Call on screen mount: subscribe once, re-read every visit. */
@@ -55,6 +57,7 @@ class KnowledgeStore {
     if (!this.initDone) {
       this.initDone = true;
       await api.onKnowledgeModelState((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.state === "building") {
           this.building = true;
           this.error = null;

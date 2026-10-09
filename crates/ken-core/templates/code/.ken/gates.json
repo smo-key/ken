@@ -1,0 +1,25 @@
+{
+  "_note": "What each gate runs in this repo. G2 and close-out read this. Commands run unpiped; the exit code is the result, never a lane's report. A gate that cannot run counts as failed, never as absent.",
+  "gates": {
+    "G2": {
+      "_note": "Two suites. The fast suite runs after every build and fix lane, on demand in a session, and when a person in session mode marks the change ready. It runs inside a time budget measured in this repo. A case that pushes it over the budget moves to the full suite. The budget is not raised. The full suite runs once, on the version that merges, on every route.",
+      "fast": {
+        "tests": "{{the ticket's Spec cases - only the ones its acceptance calls for. Each checks a result the story promises. A case whose result depends on real files (a loader, a parser, a catalog) runs on the real files. A case fed data made up for the test passes whatever the code does with the real ones}}",
+        "smoke": "{{the standing smoke set - the app starts, the main screens open, saved work reads back}}",
+        "typecheck": "{{typecheck command}}",
+        "lint": "{{lint command - lean: run and resolve, never folded into Builder}}",
+        "budget": "{{time the fast suite may take, measured in this repo}}"
+      },
+      "full": {
+        "tests": "{{the full test suite, including the cases moved out of the fast suite}}"
+      },
+      "docs": "{{docs CI - replaces both suites on a docs-only write surface}}"
+    },
+    "G2s": {
+      "tokens": "{{token-mirror check - parses the implementation against the token file, and the token file against the board. Design routes only, never the Spec cases}}"
+    },
+    "G4l": {
+      "live": "{{how to run the thing for real}}"
+    }
+  }
+}

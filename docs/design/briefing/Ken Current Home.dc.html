@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Oregano&display=swap" rel="stylesheet">
+<style>html,body{margin:0;height:100%;background:#EBE8E0}body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#211E19;-webkit-font-smoothing:antialiased;font-size:14px;line-height:1.6}a{color:#8A5A44;text-decoration:none}a:hover{color:#6F4534;text-decoration:underline}button{font-family:inherit;cursor:pointer}</style>
+</helmet>
+<div data-screen-label="Current Home" style="width:1280px;height:800px;display:flex;flex-direction:column;background:#F6F4EF;overflow:hidden;position:relative">
+  <header style="flex:none;height:52px;display:flex;align-items:center;gap:16px;padding:0 18px;border-bottom:1px solid #E4E0D7;background:#EFECE4">
+    <div style="width:62px;flex:none;display:flex;gap:8px">
+      <span style="width:12px;height:12px;border-radius:6px;background:#FF5F57"></span><span style="width:12px;height:12px;border-radius:6px;background:#FEBC2E"></span><span style="width:12px;height:12px;border-radius:6px;background:#28C840"></span>
+    </div>
+    <span style="width:22px;height:22px;border-radius:6px;font-size:14px;display:inline-flex;align-items:center;justify-content:center;background:#211E19;color:#F6F4EF;flex:none;font-family:Oregano,cursive;line-height:1">K</span>
+    <button style="display:flex;align-items:center;gap:8px;height:32px;padding:0 11px;border-radius:8px;border:1px solid #D8D3C8;background:#FDFCFA;font-size:13px;font-weight:600;color:#211E19;flex:none;box-shadow:0 1px 2px rgba(33,30,25,.04)">
+      <span style="width:20px;height:20px;border-radius:6px;background:#211E19;color:#F6F4EF;display:flex;align-items:center;justify-content:center;font-family:'Source Serif 4',serif;font-size:11px">N</span>Northside Ops
+      <span style="width:6px;height:6px;border-radius:3px;background:#5A7A5E"></span>
+      <span style="width:14px;height:14px;background:#8B857A;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/chevron-down.svg) center/contain no-repeat"></span>
+    </button>
+    <button style="flex:1;max-width:560px;margin:0 auto;height:34px;border:1px solid #D8D3C8;border-radius:9px;background:#FDFCFA;display:flex;align-items:center;gap:9px;padding:0 14px;box-shadow:0 1px 3px rgba(33,30,25,.06);font-size:13px">
+      <span style="width:14px;height:14px;background:#8B857A;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat;flex:none"></span>
+      <span style="color:#8B857A;flex:1;text-align:left">Search Northside Ops…</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#8B857A;border:1px solid #E4E0D7;border-radius:4px;padding:1px 5px;background:#F6F4EF">⌘K</span>
+    </button>
+    <button style="flex:none;display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 11px;border-radius:8px;border:1px solid rgba(138,90,68,.35);background:rgba(138,90,68,.08);color:#6F4534;font-size:12.5px;font-weight:600">
+      <span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/messages-square.svg) center/contain no-repeat"></span>Chats
+      <span style="width:7px;height:7px;border-radius:4px;background:#A8742C"></span>
+    </button>
+  </header>
+  <div style="display:flex;flex:1;min-height:0">
+    <nav style="width:64px;flex:none;border-right:1px solid #E4E0D7;display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:6px">
+      <sc-for list="{{ nav }}" as="n" hint-placeholder-count="8">
+        <button style="width:44px;height:42px;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:{{ n.color }};background:{{ n.bg }};font-weight:{{ n.weight }};font-size:9px;position:relative;border:none">
+          <span style="width:16px;height:16px;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>{{ n.label }}
+          <sc-if value="{{ n.count }}"><span style="position:absolute;top:2px;right:2px;display:inline-flex;align-items:center;justify-content:center;min-width:15px;height:15px;padding:0 3px;border-radius:8px;background:#A34D3F;color:#FDFCFA;font-size:9px;font-weight:700;border:1.5px solid #F6F4EF;box-sizing:border-box">{{ n.count }}</span></sc-if>
+          <sc-if value="{{ n.dot }}"><span style="position:absolute;top:3px;right:5px;width:7px;height:7px;border-radius:4px;background:#8A5A44;border:1.5px solid #F6F4EF"></span></sc-if>
+        </button>
+      </sc-for>
+      <button style="margin-top:auto;width:44px;height:42px;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:#8B857A;font-size:9px;border:none;background:transparent">
+        <span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/settings.svg) center/contain no-repeat"></span>Settings
+      </button>
+    </nav>
+    <main style="flex:1;min-width:0;overflow-y:auto;padding:36px 44px 56px">
+      <div style="max-width:860px;margin:0 auto">
+        <header style="display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid #E4E0D7">
+          <h1 style="margin:0;font-family:'Source Serif 4',serif;font-size:26px;font-weight:500;letter-spacing:-.01em">Your day</h1>
+          <span style="font-size:11.5px;color:#57524A;border:1px solid #E4E0D7;border-radius:5px;padding:1px 8px;background:#EFECE4">Northside Ops</span>
+          <span style="flex:1"></span>
+          <button style="height:28px;padding:0 12px;border-radius:7px;font-size:12px;font-weight:500;border:1px solid #D8D3C8;background:#FDFCFA;color:#211E19">+ Task</button>
+          <button style="height:28px;padding:0 12px;border-radius:7px;font-size:12px;font-weight:500;border:1px solid transparent;background:transparent;color:#57524A">Share</button>
+        </header>
+        <section style="margin-top:20px">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+            <span style="font-size:12.5px;font-weight:600;color:#57524A">Thursday, October 1</span>
+            <span style="font-size:11px;color:#57524A;border:1px solid #E4E0D7;border-radius:5px;padding:1px 8px;background:#EFECE4">7:02 AM</span>
+          </div>
+          <div style="font-family:'Source Serif 4',serif;font-size:16px;line-height:1.75;max-width:70ch">
+            <p style="margin:0 0 10px">Three things moved overnight. Priya updated the <a href="#">Volunteer Handbook</a> with a new shift-swap rule, which disagrees with the one in <a href="#">Ways of Working</a>. The <a href="#">Q4 Budget</a> now shows the venue deposit as paid.</p>
+            <p style="margin:0">Ken read yesterday's board meeting transcript and filed two decisions and one action for you.</p>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+            <sc-for list="{{ sources }}" as="s" hint-placeholder-count="3"><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#57524A;border:1px solid #E4E0D7;border-radius:5px;padding:1px 8px;background:#EFECE4">{{ s }}</span></sc-for>
+          </div>
+        </section>
+        <section style="margin-top:28px">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;padding-right:16px">
+            <span style="font-size:11px;font-weight:700;color:#8B857A;letter-spacing:.08em;text-transform:uppercase">Tickets · 3</span><span style="flex:1"></span>
+            <span style="width:110px;text-align:right;font-size:10.5px;color:#8B857A">state</span><span style="width:64px;text-align:right;font-size:10.5px;color:#8B857A">target</span>
+          </div>
+          <div style="background:#FDFCFA;border:1px solid #E4E0D7;border-radius:12px;box-shadow:0 1px 3px rgba(33,30,25,.06);overflow:hidden">
+            <sc-for list="{{ tickets }}" as="t" hint-placeholder-count="3">
+              <div style="display:flex;align-items:center;gap:12px;min-height:52px;padding:8px 16px;box-sizing:border-box;border-top:{{ t.border }}">
+                <span style="width:72px;flex:none;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#6F4534;text-decoration:underline;text-decoration-color:rgba(138,90,68,.4);text-underline-offset:2px">{{ t.id }}</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px"><span style="font-size:13.5px;font-weight:500">{{ t.title }}</span><span style="font-size:11.5px;color:#8B857A">{{ t.detail }}</span></span>
+                <span style="width:110px;text-align:right"><span style="font-size:11px;color:#57524A;border:1px solid #E4E0D7;border-radius:5px;padding:1px 8px;background:#EFECE4">{{ t.state }}</span></span>
+                <span style="width:64px;text-align:right;font-size:12px;color:{{ t.dueColor }}">{{ t.due }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </section>
+        <section style="margin-top:28px">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;padding-right:16px">
+            <span style="font-size:11px;font-weight:700;color:#8B857A;letter-spacing:.08em;text-transform:uppercase">Other · 4</span><span style="flex:1"></span>
+            <span style="width:64px;text-align:right;font-size:10.5px;color:#8B857A">target</span><span style="width:96px"></span>
+          </div>
+          <div style="background:#FDFCFA;border:1px solid #E4E0D7;border-radius:12px;box-shadow:0 1px 3px rgba(33,30,25,.06);overflow:hidden">
+            <sc-for list="{{ tasks }}" as="t" hint-placeholder-count="4">
+              <div style="display:flex;align-items:center;gap:12px;min-height:52px;padding:8px 16px;box-sizing:border-box;border-top:{{ t.border }}">
+                <span style="flex:none;width:16px;height:16px;border-radius:4px;border:1.5px solid {{ t.cbBorder }};border-style:{{ t.cbStyle }};background:{{ t.cbBg }};box-sizing:border-box"></span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px"><span style="font-size:13.5px;font-weight:{{ t.weight }};color:{{ t.color }};text-decoration:{{ t.deco }}">{{ t.title }}</span><span style="font-size:11.5px;color:#8B857A">{{ t.detail }}</span></span>
+                <span style="width:64px;text-align:right;font-size:12px;color:{{ t.dueColor }}">{{ t.due }}</span>
+                <span style="width:96px;display:flex;justify-content:flex-end"><sc-if value="{{ t.inbox }}"><button style="height:28px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:500;border:1px solid #D8D3C8;background:#FDFCFA;color:#211E19">Accept ▾</button></sc-if></span>
+              </div>
+            </sc-for>
+          </div>
+        </section>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+          <section style="margin-top:28px">
+            <div style="margin-bottom:8px"><span style="font-size:11px;font-weight:700;color:#8B857A;letter-spacing:.08em;text-transform:uppercase">Recent files</span></div>
+            <div style="background:#FDFCFA;border:1px solid #E4E0D7;border-radius:12px;box-shadow:0 1px 3px rgba(33,30,25,.06);overflow:hidden">
+              <sc-for list="{{ recents }}" as="r" hint-placeholder-count="4">
+                <div style="display:flex;align-items:center;gap:10px;min-height:40px;padding:8px 16px;box-sizing:border-box;border-top:{{ r.border }}">
+                  <span style="width:16px;height:16px;flex:none;background:{{ r.color }};mask:url({{ r.icon }}) center/contain no-repeat"></span>
+                  <span style="flex:1;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.name }}</span>
+                  <span style="font-size:11px;color:#57524A;border:1px solid #E4E0D7;border-radius:5px;padding:1px 8px;background:#EFECE4">{{ r.repo }}</span>
+                  <span style="font-size:11.5px;color:#8B857A">{{ r.at }}</span>
+                </div>
+              </sc-for>
+            </div>
+          </section>
+          <section style="margin-top:28px">
+            <div style="display:flex;margin-bottom:8px"><span style="font-size:11px;font-weight:700;color:#8B857A;letter-spacing:.08em;text-transform:uppercase">Index health</span><span style="flex:1"></span><span style="font-size:12px;color:#8A5A44">Team</span></div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);background:#FDFCFA;border:1px solid #E4E0D7;border-radius:12px;box-shadow:0 1px 3px rgba(33,30,25,.06)">
+              <div style="display:flex;flex-direction:column;gap:2px;padding:12px 16px"><b style="font-size:18px;font-weight:600">4 / 4</b><span style="font-size:11.5px;color:#8B857A">repos indexed</span></div>
+              <div style="display:flex;flex-direction:column;gap:2px;padding:12px 16px;border-left:1px solid #E4E0D7"><b style="font-size:18px;font-weight:600">12</b><span style="font-size:11.5px;color:#8B857A">files queued</span></div>
+              <div style="display:flex;flex-direction:column;gap:2px;padding:12px 16px;border-left:1px solid #E4E0D7"><b style="font-size:18px;font-weight:600;color:#A34D3F">1</b><span style="font-size:11.5px;color:#8B857A">failed</span></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:800}}">
+class Component extends DCLogic {
+  renderVals() {
+    const I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    const nav = [["home","layout-grid","Home"],["files","files","Files",0,true],["review","square-check","Review",3],["ingests","layers","Ingest",1],["team","users-round","Team"],["map","network","Map"],["timeline","clock","Timeline"],["record","mic","Record"]]
+      .map(([k,i,l,c,d],ix)=>({label:l,icon:I(i),count:c||0,dot:!!d,color:ix===0?"#6F4534":"#8B857A",bg:ix===0?"rgba(138,90,68,.12)":"transparent",weight:ix===0?600:400}));
+    const b = i => i ? "1px solid #E4E0D7" : "none";
+    const tickets = [
+      {id:"OPS-142",title:"Confirm venue insurance for the November gala",detail:"events · from Dana",state:"in progress",due:"Fri",dueColor:"#57524A"},
+      {id:"OPS-139",title:"Update the donor thank-you template",detail:"comms · from Priya",state:"review",due:"Oct 8",dueColor:"#57524A"},
+      {id:"OPS-131",title:"Move the shift rota to the new sheet",detail:"volunteers",state:"blocked",due:"2d late",dueColor:"#A34D3F"}
+    ].map((t,i)=>({...t,border:b(i)}));
+    const tasks = [
+      {title:"Call Marcus about the catering quote",detail:"from Board meeting 30 Sep",due:"Today"},
+      {title:"Send Priya feedback on the handbook",detail:"handbook",due:"Tomorrow"},
+      {title:"Review grant draft section 3",detail:"from Dana · grants",due:"Oct 6",inbox:true},
+      {title:"Book a room for Tuesday standup",detail:"ops",due:"Mon",done:true}
+    ].map((t,i)=>({...t,border:b(i),inbox:!!t.inbox,cbBorder:t.done?"#8A5A44":"#D8D3C8",cbBg:t.done?"#8A5A44":"#FDFCFA",cbStyle:t.inbox?"dashed":"solid",weight:t.done?400:500,color:t.done?"#8B857A":"#211E19",deco:t.done?"line-through":"none",dueColor:t.done?"#8B857A":"#57524A"}));
+    const recents = [
+      ["Volunteer Handbook.docx","file-text","#3F5E8C","handbook","12m ago"],
+      ["Q4 Budget.xlsx","file-spreadsheet","#47614B","finance","1h ago"],
+      ["Board meeting notes.md","file-text","#57524A","governance","3h ago"],
+      ["Grant draft v4.pdf","file-type","#A34D3F","grants","yesterday"]
+    ].map(([name,ic,color,repo,at],i)=>({name,icon:I(ic),color,repo,at,border:b(i)}));
+    return { nav, tickets, tasks, recents, sources:["Volunteer Handbook.docx","Q4 Budget.xlsx","board-2025-09-30.vtt"] };
+  }
+}
+</script>
+</body>
+</html>

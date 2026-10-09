@@ -1,5 +1,27 @@
-// Live recording state (Svelte 5 runes). One recorder at a time.
-import { api, type AudioDevice, type ModelStatus, type PermissionStatus, type RecordPhase } from "./api";
+// Live recording state (Svelte 5 runes). One recorder at a time. Record is a
+// way to add a source on Ingest: the transcript goes to the team wiki's Raw/
+// and is read at once. The title bar shows a running take from any screen.
+import {
+  api,
+  type AudioDevice,
+  type ModelStatus,
+  type PermissionStatus,
+  type RecordPhase,
+  type RecordSupport,
+} from "./api";
+
+/** A transcript-progress path that belongs to a recording, not a video:
+ *  the older `Recordings/` folder, or `<date> Recording.md` in Raw/. */
+export function isRecordingPath(relPath: string): boolean {
+  return relPath.startsWith("Recordings/") || /(^|\/)[^/]*Recording\.md$/.test(relPath);
+}
+
+/** "3:12" for 192 000 ms. */
+export function recordClock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(s / 60);
+  return `${m}:${(s % 60).toString().padStart(2, "0")}`;
+}
 
 class RecordStore {
   phase = $state<RecordPhase>("idle");
@@ -14,7 +36,11 @@ class RecordStore {
   screenPerm = $state<PermissionStatus>("notDetermined");
   micSettingsUrl = $state("");
   screenSettingsUrl = $state("");
-  storage = $state<"transcript" | "audio" | "both">("both");
+  /** What this machine can capture; null until the first read. */
+  support = $state<RecordSupport | null>(null);
+  /** The transcript only, unless the person keeps the audio too (in Ken's
+   *  app data, never in a repo). */
+  storage = $state<"transcript" | "audio" | "both">("transcript");
   transcribing = $state(false);
   /** 0–100 while the post-stop transcription runs; null until the first sample. */
   transcribePct = $state<number | null>(null);
@@ -28,6 +54,7 @@ class RecordStore {
   private clock: ReturnType<typeof setInterval> | null = null;
   private baseElapsed = 0;
   private baseAt = 0;
+  private listening = false;
 
   get recording() {
     return this.phase === "recording" || this.phase === "paused";
@@ -38,11 +65,34 @@ class RecordStore {
     return this.modelStatus?.installed ?? false;
   }
 
+  /** The microphone can be captured here (assumed until record_support says). */
+  get micSupported() {
+    return this.support?.mic ?? true;
+  }
+
+  /** The system audio can be captured here (assumed until record_support says). */
+  get systemSupported() {
+    return this.support?.system ?? true;
+  }
+
+  /** Read what the machine can do again (the Record panel, each time it
+   *  opens), and follow the recorder's events. */
   async init() {
     this.devices = await api.recordInputDevices().catch(() => []);
     if (!this.deviceId && this.devices[0]) this.deviceId = this.devices[0].id;
+    this.support = await api.recordSupport().catch(() => this.support);
+    if (!this.systemSupported && !this.recording) this.systemOn = false;
+    if (!this.micSupported && !this.recording) this.micOn = false;
     await this.refreshPermissions();
     await this.refreshModelStatus();
+    await this.listen();
+  }
+
+  /** Follow the recorder's events, once: the shell does this at start so the
+   *  title bar shows a take from any screen. Reads nothing from the machine. */
+  async listen() {
+    if (this.listening) return;
+    this.listening = true;
     // A download finishing (100% sample, emitted only after a verified install)
     // flips readiness so the gate clears without a manual refresh.
     await api.onModelDownloadProgress((ev) => {
@@ -81,9 +131,9 @@ class RecordStore {
       if (this.storage !== "audio") this.transcribing = true;
     });
     await api.onTranscriptProgress((ev) => {
-      // Recording docs land under Recordings/; that prefix keeps a concurrent
-      // video transcription from driving this bar.
-      if (this.transcribing && ev.relPath.startsWith("Recordings/")) {
+      // The transcript lands in the team wiki, which need not be the focused
+      // repo, so the path decides; a video transcription never drives this bar.
+      if (this.transcribing && isRecordingPath(ev.relPath)) {
         this.transcribePct = ev.pct;
       }
     });
@@ -123,18 +173,18 @@ class RecordStore {
     this.clock = null;
   }
 
-  async start() {
+  /** Start a take for `team`; its transcript goes to that team wiki's Raw/. */
+  async start(team: string | null = null) {
     this.error = null;
     this.savedPath = null;
     // Up-front gate: without the transcription model on disk the recording would
     // only fail after Stop, wasting the take. Refuse and let the UI prompt the
     // download instead.
     if (!this.modelReady) {
-      this.error =
-        "Download a transcription model below before recording, so Ken can make a transcript.";
+      this.error = "Download a transcription model first, so Ken can make a transcript.";
       return;
     }
-    await api.recordStart(this.micOn, this.systemOn, this.deviceId).catch((e) => {
+    await api.recordStart(this.micOn, this.systemOn, this.deviceId, team).catch((e) => {
       this.error = String(e);
     });
     await this.refreshPermissions();

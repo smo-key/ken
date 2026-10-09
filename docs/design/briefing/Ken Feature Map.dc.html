@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>html,body{margin:0;background:oklch(0.975 0.005 85)}body{font-family:"Hanken Grotesk",system-ui,sans-serif;color:oklch(0.23 0.01 60);-webkit-font-smoothing:antialiased}a{color:oklch(0.45 0.09 175);text-decoration:none}a:hover{text-decoration:underline}</style>
+</helmet>
+<div style="max-width:980px;margin:0 auto;padding:56px 32px 80px;display:flex;flex-direction:column;gap:48px">
+  <header style="display:flex;flex-direction:column;gap:10px">
+    <span style="font-size:12px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:oklch(0.5 0.01 60)">Ken · Feature map · knowledge-layer branch</span>
+    <h1 style="margin:0;font-family:Newsreader,serif;font-size:40px;font-weight:500;letter-spacing:-.015em;line-height:1.1">From eleven places to five</h1>
+    <p style="margin:0;font-size:16px;line-height:1.6;color:oklch(0.4 0.01 60);max-width:66ch;text-wrap:pretty">Today, things that need a decision from you show up in five places: Home, Review, Ingest, the Families tray and Chats. I read each screen's source, sorted the features by the job they do, and propose a structure where each job has one home.</p>
+  </header>
+
+  <section style="display:flex;flex-direction:column;gap:16px">
+    <h2 style="margin:0;font-size:20px;font-weight:600">What each area does today</h2>
+    <div style="display:flex;flex-direction:column;border-top:1px solid oklch(0.9 0.008 80)">
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) 170px;gap:20px;padding:10px 0;border-bottom:1px solid oklch(0.9 0.008 80);font-size:12px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:oklch(0.55 0.01 60)"><span>Area</span><span>What it holds</span><span>Job</span></div>
+      <sc-for list="{{ today }}" as="r" hint-placeholder-count="10">
+        <div style="display:grid;grid-template-columns:150px minmax(0,1fr) 170px;gap:20px;padding:14px 0;border-bottom:1px solid oklch(0.92 0.006 80);align-items:baseline">
+          <span style="display:flex;flex-direction:column;gap:2px"><span style="font-size:15px;font-weight:600">{{ r.name }}</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:oklch(0.58 0.01 60)">{{ r.file }}</span></span>
+          <span style="font-size:14px;line-height:1.55;color:oklch(0.35 0.01 60);text-wrap:pretty">{{ r.what }}</span>
+          <span style="justify-self:start;font-size:12.5px;font-weight:600;padding:3px 10px;border-radius:12px;background:{{ r.bg }};color:{{ r.fg }}">{{ r.job }}</span>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <section style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px">
+    <div style="grid-column:1/-1;display:flex;flex-direction:column;gap:8px">
+      <h2 style="margin:0;font-size:20px;font-weight:600">Ingest and Review: different jobs, one overlap</h2>
+      <p style="margin:0;font-size:15px;line-height:1.6;color:oklch(0.4 0.01 60);max-width:70ch;text-wrap:pretty">They aren't the same, but the app makes them feel like they are. Ingest brings new material in and shows what Ken did with it. Review is where Ken asks you to decide something. The overlap: everything an ingest is waiting on (rulings, tickets, held page edits) shows up in both places, and the Ingest badge counts the same items Review does (<span style="font-family:'JetBrains Mono',monospace;font-size:13px">sourcesWaiting(review.items)</span>).</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px;padding:20px;border-radius:14px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.91 0.007 80)">
+      <span style="font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:oklch(0.45 0.09 175)">Ingest · bring knowledge in</span>
+      <ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.65;color:oklch(0.32 0.01 60)">
+        <li>Drop a transcript, recording, document or notes</li>
+        <li>Ken reads it into a dated note</li>
+        <li>Shows the summary, takeaways, what it overturns and contradictions</li>
+        <li>Lists what Ken wrote (page edits, ideas, escalations, tasks), each with Open and Undo</li>
+        <li>Seen / Undo all / Read it again</li>
+      </ul>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px;padding:20px;border-radius:14px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.91 0.007 80)">
+      <span style="font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:oklch(0.5 0.12 65)">Review · decide</span>
+      <ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.65;color:oklch(0.32 0.01 60)">
+        <li>Proposed page changes and stale documents</li>
+        <li>Files Ken couldn't read</li>
+        <li>Edit and sync conflicts (keep mine, use theirs, accept Ken's merge)</li>
+        <li><b style="font-weight:600">Ingest waits: rulings, tickets, held edits</b> (also on Ingest)</li>
+        <li>Approve, discard, run now, ignore this file</li>
+      </ul>
+    </div>
+  </section>
+
+  <section style="display:flex;flex-direction:column;gap:16px">
+    <h2 style="margin:0;font-size:20px;font-weight:600">Proposed structure</h2>
+    <div style="display:grid;grid-template-columns:minmax(0,1fr) 40px minmax(0,1.35fr);gap:16px;align-items:start">
+      <div style="display:flex;flex-direction:column;gap:6px;padding:18px;border-radius:14px;border:1px dashed oklch(0.85 0.01 80)">
+        <span style="font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:oklch(0.55 0.01 60);padding-bottom:6px">Today · 11 entry points</span>
+        <sc-for list="{{ before }}" as="b" hint-placeholder-count="11"><span style="font-size:14px;color:oklch(0.4 0.01 60);padding:3px 0">{{ b }}</span></sc-for>
+      </div>
+      <div style="align-self:center;display:flex;justify-content:center"><span style="width:20px;height:20px;background:oklch(0.55 0.01 60);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/arrow-right.svg) center/contain no-repeat"></span></div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <sc-for list="{{ after }}" as="a" hint-placeholder-count="6">
+          <div style="display:flex;gap:14px;padding:16px 18px;border-radius:14px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.91 0.007 80)">
+            <span style="width:34px;height:34px;flex:none;border-radius:9px;background:oklch(0.93 0.03 175);display:flex;align-items:center;justify-content:center"><span style="width:17px;height:17px;background:oklch(0.4 0.08 175);mask:url({{ a.icon }}) center/contain no-repeat"></span></span>
+            <span style="display:flex;flex-direction:column;gap:4px;min-width:0">
+              <span style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap"><span style="font-size:15.5px;font-weight:600">{{ a.name }}</span><span style="font-size:12.5px;color:oklch(0.5 0.01 60)">{{ a.merges }}</span></span>
+              <span style="font-size:14px;line-height:1.55;color:oklch(0.38 0.01 60);text-wrap:pretty">{{ a.why }}</span>
+            </span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <section style="display:flex;flex-direction:column;gap:14px">
+    <h2 style="margin:0;font-size:20px;font-weight:600">The Inbox, in detail</h2>
+    <p style="margin:0;font-size:15px;line-height:1.6;color:oklch(0.4 0.01 60);max-width:70ch;text-wrap:pretty">One list of everything waiting on you. Each item says who it's from, so a teammate's request never gets mixed up with a sync conflict. Home's "Needs you" shows the top of this list, and the sidebar count is this list's count. No item lives in two places.</p>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px">
+      <sc-for list="{{ inbox }}" as="g" hint-placeholder-count="3">
+        <div style="display:flex;flex-direction:column;gap:8px;padding:18px;border-radius:14px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.91 0.007 80)">
+          <span style="font-size:14.5px;font-weight:600">{{ g.name }}</span>
+          <span style="font-size:13px;color:oklch(0.5 0.01 60)">{{ g.was }}</span>
+          <ul style="margin:0;padding-left:18px;font-size:13.5px;line-height:1.6;color:oklch(0.32 0.01 60)"><sc-for list="{{ g.items }}" as="i"><li>{{ i }}</li></sc-for></ul>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <section style="display:flex;flex-direction:column;gap:12px;padding:24px;border-radius:14px;background:oklch(0.955 0.012 175)">
+    <h2 style="margin:0;font-size:18px;font-weight:600">For you to confirm before I build</h2>
+    <ol style="margin:0;padding-left:20px;font-size:15px;line-height:1.7;color:oklch(0.28 0.01 60)">
+      <li>Merge Review and the Families tray into one <b style="font-weight:600">Inbox</b>, filtered by who it's from: People / Ken / Sync.</li>
+      <li>Ingest stops counting the Inbox's items. It shows progress and its waits inline, and they resolve in both places at once.</li>
+      <li>Record moves inside Ingest as "Record a meeting". When you stop, the saved transcript goes straight into the ingest queue. Today it's only saved as a file, so this is a new step.</li>
+      <li>Map and Timeline become two views of one <b style="font-weight:600">Explore</b> screen.</li>
+      <li>Team (repos, ignore list, sweep, rules, templates) moves into Settings as <b style="font-weight:600">Team library</b>. Settings gets a left sub-nav.</li>
+    </ol>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    const J = {
+      see:["See my day","oklch(0.93 0.03 175)","oklch(0.38 0.08 175)"],
+      decide:["Decide","oklch(0.94 0.05 75)","oklch(0.45 0.1 60)"],
+      add:["Add knowledge","oklch(0.93 0.03 255)","oklch(0.42 0.1 255)"],
+      explore:["Explore","oklch(0.94 0.02 300)","oklch(0.42 0.08 300)"],
+      setup:["Set up","oklch(0.93 0.006 80)","oklch(0.4 0.01 60)"]
+    };
+    const today = [
+      ["Home","HomeScreen.svelte","Digest, tickets, tasks (teammate tasks wait for Accept / Not mine / Reply), recent files, index health.","see"],
+      ["Review","ReviewScreen.svelte","Proposed page changes, stale docs, unreadable files, edit conflicts, plus every ingest's waits.","decide"],
+      ["Families tray","FamilyTray.svelte","Messages, tasks and notifications from teammates. Accept, push back, dismiss, send.","decide"],
+      ["Chats","ChatDrawer.svelte","Claude chats and terminal. Questions Ken asks you mid-chat show as an amber dot.","decide"],
+      ["Ingest","IngestView.svelte","Drop files, Ken reads them, shows takeaways and what it wrote. Its waits repeat Review's.","add"],
+      ["Record","RecordScreen.svelte","Record mic (Me) and system audio (Them), transcribed on-device. Saves a transcript, audio or both as a file you open in Files. It does not go through Ingest today.","add"],
+      ["Files","FilesScreen.svelte","File tree and editor for docs, sheets, PDFs and video.","see"],
+      ["Map","MapScreen.svelte","Graph of people, projects and documents.","explore"],
+      ["Timeline","TimelineScreen.svelte","Stream of events you can filter, with a \u201cview as of\u201d date.","explore"],
+      ["Team","TeamScreen.svelte","Repos, index depth, drift and gaps, wiki sweep, rules, templates.","setup"],
+      ["Settings","SettingsScreen.svelte","MCP server, sync, inference, global ingest rules and more (54 KB of UI).","setup"]
+    ].map(([name,file,what,j])=>({name,file,what,job:J[j][0],bg:J[j][1],fg:J[j][2]}));
+    const before = ["Home","Files","Review","Ingest","Team","Map","Timeline","Record","Families (tray)","Chats (title bar)","Settings"];
+    const after = [
+      {icon:I("house"),name:"Home",merges:"unchanged",why:"Your morning briefing: digest, your list and the top of the Inbox. Index health becomes a one-line status."},
+      {icon:I("inbox"),name:"Inbox",merges:"Review + Families + teammate tasks",why:"Every decision in one queue, filtered by who it's from. Replaces three badges with one count."},
+      {icon:I("folder-open"),name:"Files",merges:"unchanged",why:"Browse and edit. Recent files lives here and on Home."},
+      {icon:I("file-input"),name:"Ingest",merges:"Ingest + Record",why:"Add a file or record a meeting (the transcript is ingested when you stop, which is new). Each source shows progress, a summary, and panels for pages updated, contradictions, next steps and what waits."},
+      {icon:I("compass"),name:"Explore",merges:"Map + Timeline",why:"Two views of the same knowledge, switched with a toggle. Search scopes to both."},
+      {icon:I("sparkles"),name:"Ask Ken",merges:"Chats, docked",why:"Opens as a panel on any screen. Its questions also land in the Inbox."},
+      {icon:I("settings"),name:"Settings",merges:"Settings + Team",why:"Sub-nav: General, Team library, Sync, AI, Agents (MCP), Ingest rules."}
+    ];
+    const inbox = [
+      {name:"From people",was:"was the Families tray + Home's Accept",items:["Tasks: Accept / Not mine / Reply","Messages and notifications","Send a message or task"]},
+      {name:"From Ken",was:"was Review + ingest waits + chat questions",items:["Rulings, tickets, held page edits","Stale docs and proposals","Questions Ken asked in a chat"]},
+      {name:"Sync & files",was:"was Review",items:["Edit conflicts and conflict copies","Files Ken couldn't read","Ignore this file"]}
+    ];
+    return { today, before, after, inbox };
+  }
+}
+</script>
+</body>
+</html>

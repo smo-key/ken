@@ -1,9 +1,9 @@
 //! Native OCR: extract text and bounding boxes from images and from the pages
-//! of PDFs. The heavy lifting is Apple's Vision framework, which lives entirely
-//! in the macOS backend (`mac.rs`) behind the small, platform-agnostic surface
-//! declared here. Non-macOS targets get a stub so the crate still builds
-//! everywhere (and with `--no-default-features`), mirroring how `record` gates
-//! its native capture behind `#[cfg(target_os = "macos")] pub mod mac;`.
+//! of PDFs, with what the OS ships: Apple's Vision framework on macOS
+//! (`mac.rs`), Windows.Media.Ocr and Windows.Data.Pdf on Windows (`win.rs`).
+//! Both sit behind the small, platform-agnostic surface declared here. Other
+//! targets get a stub and [`available`] says false, so nothing is queued for
+//! OCR there.
 //!
 //! Coordinates: every [`OcrRegion::bbox`] is normalized to the unit square and
 //! uses a **top-left** origin (x grows right, y grows down) — already flipped
@@ -14,6 +14,60 @@ use anyhow::Result;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(windows)]
+pub mod win;
+
+/// The engine that reads text on this OS, stamped in each index (see
+/// `Db::requeue_ocr_for_engine`) so files marked done before it existed are
+/// read again once.
+#[cfg(target_os = "macos")]
+pub const ENGINE: &str = "vision";
+#[cfg(windows)]
+pub const ENGINE: &str = "winrt";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const ENGINE: &str = "none";
+
+/// The engine an index with no stamp was read by: on macOS, Vision (OCR was
+/// always there); elsewhere nothing was read.
+pub const ENGINE_BEFORE_STAMP: Option<&str> = if cfg!(target_os = "macos") { Some(ENGINE) } else { None };
+
+/// Whether this machine can OCR at all: always on macOS, on Windows when an
+/// OCR language is installed (it comes with the display language), never
+/// elsewhere. Worked out once per process. Scanning queues images and scanned
+/// PDFs only when this is true, and the background download of online-only
+/// images waits on it too.
+pub fn available() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = tests::FORCED.with(|f| f.get()) {
+            return forced;
+        }
+    }
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(detect)
+}
+
+fn detect() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(windows)]
+    {
+        win::available()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
+}
+
+/// Prepare the calling thread for OCR calls (on Windows, join WinRT's
+/// multithreaded apartment). The OCR worker calls it once at its start.
+pub fn init_worker_thread() {
+    #[cfg(windows)]
+    win::init_thread();
+}
 
 /// One line of recognized text with its location on the page.
 ///
@@ -39,7 +93,11 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<Vec<OcrRegion>> {
     {
         mac::ocr_image_bytes(bytes)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        win::ocr_image_bytes(bytes)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = bytes;
         Ok(Vec::new())
@@ -57,7 +115,11 @@ pub fn ocr_pdf_bytes(bytes: &[u8], max_pages: usize) -> Result<Vec<OcrRegion>> {
     {
         mac::ocr_pdf_bytes(bytes, max_pages)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        win::ocr_pdf_bytes(bytes, max_pages)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (bytes, max_pages);
         Ok(Vec::new())
@@ -67,13 +129,36 @@ pub fn ocr_pdf_bytes(bytes: &[u8], max_pages: usize) -> Result<Vec<OcrRegion>> {
 /// Convert a Vision bounding box (normalized, **bottom-left** origin) to this
 /// module's normalized **top-left** origin form. Pure and platform-free so the
 /// y-flip is unit-testable without any Vision call: `y_topleft = 1 - y - h`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn to_top_left(x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
     [x, 1.0 - y - h, w, h]
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// What [`available`] answers on this test thread. Unit tests see an
+        /// OCR backend by default, so the queueing logic is tested on every
+        /// OS; a test that needs none sets `Some(false)` with [`force`].
+        pub(crate) static FORCED: Cell<Option<bool>> = const { Cell::new(Some(true)) };
+    }
+
+    /// Make [`available`] answer `on` on the calling test thread.
+    pub(crate) fn force(on: bool) {
+        FORCED.with(|f| f.set(Some(on)));
+    }
+
+    #[test]
+    fn forcing_availability_is_per_thread() {
+        force(false);
+        assert!(!available());
+        assert!(std::thread::spawn(available).join().unwrap(), "other threads keep the default");
+        force(true);
+        assert!(available());
+    }
 
     #[test]
     fn y_axis_is_flipped_to_top_left_origin() {
@@ -108,8 +193,9 @@ mod tests {
         let _ = ocr_pdf_bytes(&[], 1);
     }
 
-    /// Real OCR of an embedded PNG. Ignored on non-macOS (no Vision). Even on
-    /// macOS this is marked `#[ignore]` because it needs a text-bearing PNG
+    /// Real OCR of an embedded PNG with Vision. On Windows the real engine is
+    /// exercised by `win::tests`, which builds its own text-bearing PDF. Even
+    /// on macOS this is marked `#[ignore]` because it needs a text-bearing PNG
     /// fixture and hits the live Vision engine; run it by hand with a fixture:
     ///
     /// ```ignore

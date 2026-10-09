@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500&family=Hanken+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>html,body{margin:0;background:#E9E8E4}body{font-family:"Hanken Grotesk",system-ui,sans-serif;color:#2A2824;-webkit-font-smoothing:antialiased}a{color:oklch(0.45 0.09 175);text-decoration:none}a:hover{text-decoration:underline}</style>
+</helmet>
+<section style="padding:48px;display:flex;flex-direction:column;gap:28px">
+  <div style="display:flex;flex-direction:column;gap:8px;max-width:1000px">
+    <h1 style="margin:0;font-family:Newsreader,serif;font-size:36px;font-weight:500">Home, before and after</h1>
+    <p style="margin:0;font-size:15px;line-height:1.6;color:#55524C">Both are live. The right one is the <a href="Ken App.dc.html">prototype</a>; click around inside it. Tokens and components are in the <a href="Ken Design System.dc.html">design system</a>, and the reasoning for the new structure is in the <a href="Ken Feature Map.dc.html">feature map</a>.</p>
+  </div>
+  <div style="display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start">
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <span style="font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#6B6862">Before · knowledge-layer today</span>
+      <iframe src="Ken Current Home.dc.html" style="width:1280px;height:800px;border:none;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.12);background:#F6F4EF"></iframe>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <span style="font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:oklch(0.45 0.09 175)">After · Briefing</span>
+      <iframe src="Ken App.dc.html" style="width:1280px;height:800px;border:none;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.12);background:#F7F6F2"></iframe>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;max-width:2600px">
+    <sc-for list="{{ changes }}" as="c" hint-placeholder-count="8">
+      <div style="display:flex;flex-direction:column;gap:6px;padding:16px 18px;border-radius:12px;background:#FBFAF7;border:1px solid #DEDCD6">
+        <span style="font-size:15px;font-weight:600">{{ c.t }}</span>
+        <span style="font-size:13px;color:#8A877F"><s>{{ c.before }}</s></span>
+        <span style="font-size:14px;line-height:1.5;color:#3A3833">{{ c.after }}</span>
+      </div>
+    </sc-for>
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const changes = [
+      ["Navigation","9-icon rail with 9px labels, Families tray, Chats in the title bar","Labeled sidebar with 5 places plus Settings. Collapses to icons."],
+      ["What needs me","Spread across Review badge, Ingest badge, Families tray, chat dot and Accept buttons","One Inbox. Home shows its top four with the primary action inline."],
+      ["Hierarchy","\u201cYour day\u201d h1, digest at 16px, then four equal sections","Greeting + 18px serif digest lead. Your list is second, Needs you sits in its own column."],
+      ["Tickets vs tasks","Two separate tables with different columns","One list. Square check for tickets, round for tasks, dashed for not yet accepted."],
+      ["Index health","Three-stat card","One line under the ingest progress. Failures link straight to the file."],
+      ["Ingest","No progress shown, waits duplicated in Review","Progress with steps, summary, and tiles for pages updated, contradictions, next steps and waits."],
+      ["Chat","Overlay drawer","Ask Ken docks beside any screen. Its questions also land in the Inbox."],
+      ["Color","Clay used for active, links, buttons and badges, red count badges","Teal for actions, amber only for needs you, red only for failures. Full dark theme."]
+    ].map(([t,before,after]) => ({ t, before, after }));
+    return { changes };
+  }
+}
+</script>
+</body>
+</html>

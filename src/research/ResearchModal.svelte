@@ -152,10 +152,13 @@
     color: var(--ink);
     border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: var(--surface);
+    background-color: var(--surface);
     padding: 8px 12px;
     outline: none;
     resize: vertical;
+  }
+  select {
+    padding-right: 30px;
   }
   .mono-input {
     font-family: var(--font-mono);

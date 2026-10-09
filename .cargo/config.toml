@@ -6,5 +6,20 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 
+#
+# On Windows the C runtime is linked in statically (+crt-static), so Ken
+# starts on a PC without the Visual C++ redistributable (MSVCP140.dll,
+# VCRUNTIME140.dll). The vulkan-1.dll import is delay-loaded instead
+# (src-tauri/build.rs).
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE", "-C", "target-feature=+crt-static"]
+
+# The C/C++ that whisper.cpp and llama.cpp build through CMake must use the
+# same static runtime (/MT) as the Rust code: both build scripts pass CMAKE_*
+# variables on to CMake, and whisper.cpp's old cmake_minimum_required needs
+# policy CMP0091 for CMAKE_MSVC_RUNTIME_LIBRARY to apply. Nothing here has an
+# effect off MSVC.
+[env]
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+CMAKE_POLICY_DEFAULT_CMP0091 = "NEW"
+LLAMA_STATIC_CRT = "1"

@@ -2,7 +2,18 @@
 import {
   api,
   type ChatRow,
+  type EditProposal,
 } from "./api";
+
+/** A stored edit message's proposal, or null when it is not one. */
+export function parseEditProposal(content: string): EditProposal | null {
+  try {
+    const p = JSON.parse(content) as EditProposal;
+    return typeof p.base === "string" && typeof p.proposed === "string" ? p : null;
+  } catch {
+    return null;
+  }
+}
 import {
   dropPending,
   nextTempId,
@@ -11,7 +22,8 @@ import {
   type TranscriptEntry,
 } from "./chatEcho";
 import { parseQuestionPayload } from "./chatQuestion";
-import { app } from "./app.svelte";
+import { app, forFocused } from "./app.svelte";
+import { scope } from "./scope.svelte";
 
 class ChatsStore {
   open = $state(false);
@@ -21,6 +33,8 @@ class ChatsStore {
   /** chat id currently in terminal mode (at most one). */
   terminalId = $state<string | null>(null);
   sendError = $state<string | null>(null);
+  /** The reply streaming into the open chat, until the whole of it lands. */
+  draft = $state<string>("");
 
   get active(): ChatRow | null {
     return this.rows.find((r) => r.id === this.activeId) ?? null;
@@ -35,8 +49,15 @@ class ChatsStore {
     return this.rows;
   }
 
+  private listening = false;
+
+  /** The drawer calls this each time it opens: the listeners are added
+   *  once (twice would stream every reply twice), the list read each time. */
   async init() {
+    if (this.listening) return this.refresh();
+    this.listening = true;
     await api.onChatUpdated((row) => {
+      if (!this.ours(row.project_id)) return;
       const i = this.rows.findIndex((r) => r.id === row.id);
       if (row.archived) {
         if (i >= 0) this.rows = this.rows.toSpliced(i, 1);
@@ -50,10 +71,19 @@ class ChatsStore {
       if (i >= 0) this.rows = this.rows.toSpliced(i, 1, row);
       else this.rows = [row, ...this.rows];
       this.resort();
+      // A turn that ended (or broke) leaves nothing streaming.
+      if (row.id === this.activeId && row.status !== "working") this.draft = "";
+    });
+    await api.onChatDelta((d) => {
+      if (!this.ours(d.project_id)) return;
+      if (d.chatId === this.activeId) this.draft += d.text;
     });
     await api.onChatMessage((msg) => {
+      if (!this.ours(msg.project_id)) return;
       if (msg.chatId === this.activeId) {
         this.transcript = reconcile(this.transcript, msg);
+        // The whole reply replaces what streamed of it.
+        if (msg.role === "assistant") this.draft = "";
       }
     });
     await this.refresh();
@@ -66,8 +96,18 @@ class ChatsStore {
     });
   }
 
+  /** The repo the listed chats belong to. Opening a citation in another
+   *  repo moves the focus; the chat open here goes on in its own repo. */
+  private projectId: string | null = null;
+
+  private ours(projectId: string | null | undefined): boolean {
+    const mine = this.projectId ?? app.focused;
+    return !projectId || !mine || projectId === mine || forFocused(projectId);
+  }
+
   async refresh() {
     if (!(await api.currentProject().catch(() => null))) return;
+    this.projectId = app.focused;
     this.rows = await api.listChats();
     if (this.activeId && !this.rows.some((r) => r.id === this.activeId)) {
       this.activeId = this.rows[0]?.id ?? null;
@@ -79,6 +119,7 @@ class ChatsStore {
       await this.exitTerminal();
     }
     this.activeId = id;
+    this.draft = "";
     this.transcript = await api.chatTranscript(id).catch(() => []);
     // Ingest and research sessions open straight into the terminal —
     // that's where they live.
@@ -110,14 +151,23 @@ class ChatsStore {
     // plus which one is focused.
     const openFiles = app.fileTabs.map((t) => t.path);
     const focusedFile = app.openFile;
+    // Working from the moment it is sent: the backend's own status follows,
+    // and its "done" or "error" ends it.
+    this.setStatus(chatId, "working");
     try {
-      await api.sendChatMessage(chatId, text, openFiles, focusedFile);
+      await api.sendChatMessage(chatId, text, openFiles, focusedFile, scope.chatScope);
     } catch (e) {
       // The send failed: pull the pending echo and show why, so the message
       // doesn't sit there looking sent.
       this.transcript = dropPending(this.transcript, tempId);
       this.sendError = String(e);
+      this.setStatus(chatId, "error");
     }
+  }
+
+  private setStatus(chatId: string, status: ChatRow["status"]) {
+    const i = this.rows.findIndex((r) => r.id === chatId);
+    if (i >= 0) this.rows = this.rows.toSpliced(i, 1, { ...this.rows[i], status });
   }
 
   /** Answer a pending AskUserQuestion card. Merges the answers into the local
@@ -145,6 +195,54 @@ class ChatsStore {
       const j = this.transcript.findIndex((m) => m.id === messageId);
       if (j >= 0) this.transcript = this.transcript.toSpliced(j, 1, before);
       this.sendError = String(e);
+    }
+  }
+
+  /** Edits in the open chat still waiting for a decision, newest last. */
+  get pendingEdits(): { messageId: number; proposal: EditProposal }[] {
+    const out: { messageId: number; proposal: EditProposal }[] = [];
+    for (const m of this.transcript) {
+      if (m.role !== "edit") continue;
+      const p = parseEditProposal(m.content);
+      if (p && !p.decision) out.push({ messageId: m.id, proposal: p });
+    }
+    return out;
+  }
+
+  /** The waiting edit to a file, if any (the editor shows it over the page). */
+  pendingEditFor(relPath: string): { messageId: number; proposal: EditProposal } | null {
+    return this.pendingEdits.find((e) => e.proposal.relPath === relPath) ?? null;
+  }
+
+  /** Answer an edit: every change accepted, none, or some (Ken writes the
+   *  accepted ones and tells Claude which it left out). Flips the card at
+   *  once; the backend re-emits it with the decision it recorded. */
+  async answerEdit(
+    messageId: number,
+    decision: "accepted" | "declined" | "partial",
+    merged: string | null,
+    declinedChanges: string[],
+  ) {
+    if (!this.activeId) return;
+    this.sendError = null;
+    const chatId = this.activeId;
+    const i = this.transcript.findIndex((m) => m.id === messageId);
+    if (i < 0) return;
+    const before = this.transcript[i];
+    const p = parseEditProposal(before.content);
+    if (p) {
+      this.transcript = this.transcript.toSpliced(i, 1, {
+        ...before,
+        content: JSON.stringify({ ...p, decision }),
+      });
+    }
+    try {
+      await api.answerEditProposal(chatId, messageId, decision, merged, declinedChanges);
+    } catch (e) {
+      const j = this.transcript.findIndex((m) => m.id === messageId);
+      if (j >= 0) this.transcript = this.transcript.toSpliced(j, 1, before);
+      this.sendError = String(e);
+      throw e;
     }
   }
 

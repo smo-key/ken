@@ -108,6 +108,73 @@ What the index saw in the last 24 hours:\n"
     p
 }
 
+/// The team digest's quiet fallback: nothing in any repo, nothing of mine.
+pub const QUIET_TEAM_DIGEST: &str = "A quiet day: nothing new in the team's repos since yesterday.";
+
+/// How many changed paths one repo contributes to the team prompt.
+const MAX_TEAM_FILES_PER_REPO: usize = 10;
+
+/// Nothing to say for the whole team.
+pub fn team_is_quiet(repos: &[(String, DigestSources)], mine: &[String]) -> bool {
+    mine.is_empty() && repos.iter().all(|(_, s)| s.is_quiet())
+}
+
+/// The team digest prompt (Your day): one paragraph across every repo of
+/// the team, run from the folder that holds the repos so every path is
+/// `<repo>/<path>`. `mine` is what the user has on today (their open
+/// tickets and tasks, one line each), so the paragraph can lead with it.
+pub fn compose_team_digest_prompt(team: &str, repos: &[(String, DigestSources)], mine: &[String]) -> String {
+    let mut p = format!(
+        "You are Ken, writing the morning digest for the team \"{team}\": one \
+paragraph across all of its repos.\n\n\
+Write ONE plain, concrete paragraph (at most 120 words): what changed in the \
+last day across the repos, what is waiting on the user, and which of their \
+tickets or tasks are due. Dry and to the point: no greeting, no exclamation \
+marks, no headings, no lists. You may use **bold** for the few things that \
+matter most. You may read files below this folder if a path needs more \
+context; never modify anything.\n\n\
+After the paragraph, on its own final line, write exactly:\n\
+SOURCES: repo/path1, repo/path2\n\
+naming up to 5 of the paths below the digest draws on, each as \
+<repo>/<path> (omit the line if none apply).\n"
+    );
+
+    p.push_str("\nOn the user's plate today:\n");
+    if mine.is_empty() {
+        p.push_str("- nothing listed\n");
+    }
+    for line in mine {
+        p.push_str(&format!("- {line}\n"));
+    }
+
+    for (repo, s) in repos {
+        p.push_str(&format!("\nRepo {repo}:\n"));
+        if s.is_quiet() {
+            p.push_str("- nothing new\n");
+            continue;
+        }
+        for path in s.changed_files.iter().take(MAX_TEAM_FILES_PER_REPO) {
+            p.push_str(&format!("- changed: {repo}/{path}\n"));
+        }
+        if s.changed_files.len() > MAX_TEAM_FILES_PER_REPO {
+            p.push_str(&format!(
+                "- …and {} more changed\n",
+                s.changed_files.len() - MAX_TEAM_FILES_PER_REPO
+            ));
+        }
+        for run in &s.finished_runs {
+            match &run.summary {
+                Some(sum) => p.push_str(&format!("- ingest {}: {} — {}\n", run.slug, run.status, sum)),
+                None => p.push_str(&format!("- ingest {}: {}\n", run.slug, run.status)),
+            }
+        }
+        for title in &s.waiting {
+            p.push_str(&format!("- waiting on the user: {title}\n"));
+        }
+    }
+    p
+}
+
 /// A digest (or quick answer) split into prose and source paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDigest {
@@ -225,6 +292,22 @@ mod tests {
         assert!(prompt.contains("- notes/f19.md"));
         assert!(!prompt.contains("- notes/f20.md"));
         assert!(prompt.contains("…and 10 more"));
+    }
+
+    #[test]
+    fn team_prompt_names_every_repo_with_repo_relative_paths() {
+        let db = seeded();
+        let s = gather(&db, 500).unwrap();
+        let repos = vec![("att-opmodel".to_string(), s), ("Project Docs".to_string(), DigestSources::default())];
+        let mine = vec!["ticket ATT-014 Retry rule (in progress), target 2026-10-02".to_string()];
+        let prompt = compose_team_digest_prompt("ATT", &repos, &mine);
+        assert!(prompt.contains("\"ATT\""));
+        assert!(prompt.contains("SOURCES: repo/path1"));
+        assert!(prompt.contains("- changed: att-opmodel/notes/fresh.md"));
+        assert!(prompt.contains("Repo Project Docs:\n- nothing new"));
+        assert!(prompt.contains("- ticket ATT-014"));
+        assert!(!team_is_quiet(&repos, &mine));
+        assert!(team_is_quiet(&[("a".into(), DigestSources::default())], &[]));
     }
 
     #[test]

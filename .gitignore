@@ -11,3 +11,6 @@ src-tauri/binaries/
 # Impeccable design-hook local state
 .impeccable/hook.cache.json
 .impeccable/config.local.json
+
+# Ken's own project file when Ken indexes this repo
+/.ken/

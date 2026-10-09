@@ -1,19 +1,23 @@
-/* Ken — Paper & Ink design tokens (docs/design/design-tokens.md) */
-@import "@fontsource/source-serif-4/400.css";
-@import "@fontsource/source-serif-4/500.css";
-@import "@fontsource/source-serif-4/600.css";
-@import "@fontsource/ibm-plex-mono/400.css";
-@import "@fontsource/ibm-plex-mono/500.css";
+/* Ken — the Briefing design system (docs/design/briefing/Ken Design System.dc.html).
+   Calm by default, clear about what needs you: a teal accent for actions, amber
+   only for "needs you", one component set, no text under 11px.
+   Newsreader for what you read, Hanken Grotesk for what you operate,
+   JetBrains Mono for ids, paths and the terminal, Oregano for the K only. */
+@import "@fontsource/newsreader/400.css";
+@import "@fontsource/newsreader/500.css";
+@import "@fontsource/newsreader/400-italic.css";
+@import "@fontsource/hanken-grotesk/400.css";
+@import "@fontsource/hanken-grotesk/500.css";
+@import "@fontsource/hanken-grotesk/600.css";
+@import "@fontsource/hanken-grotesk/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
 @import "@fontsource/oregano/400.css";
 /* Metric-compatible stand-ins for the Office fonts decks name but that ship with
    neither macOS nor Office's own install: Carlito for Calibri, Arimo for Arial,
    Tinos for Times New Roman. Identical advance widths, so a .pptx/.docx preview
    wraps where PowerPoint wraps instead of at a fallback's wider metrics.
-   Bold/italic are needed because decks use them and a synthesized face has
-   different metrics again. Latin and latin-ext only: a Tauri bundle ships every
-   subset it imports whether or not a deck ever needs it, and the full set costs
-   ~4 MB for scripts these faces are rarely asked to render. Other scripts fall
-   back as they did before. */
+   Latin and latin-ext only, to keep the bundle small. */
 @import "@fontsource/carlito/latin-400.css";
 @import "@fontsource/carlito/latin-400-italic.css";
 @import "@fontsource/carlito/latin-700.css";
@@ -34,97 +38,120 @@
 @import "@fontsource/tinos/latin-ext-700.css";
 
 :root {
-  /* neutrals — paper */
-  --paper: #f6f4ef;
-  --surface: #fdfcfa;
-  --sunken: #efece4;
-  --sunken-2: #fbfaf6;
-  --border: #e4e0d7;
-  --border-strong: #d8d3c8;
-  --window: #ebe8e0;
+  color-scheme: light;
 
-  /* neutrals — ink */
-  --ink: #211e19;
-  --ink-secondary: #57524a;
-  --ink-tertiary: #8b857a;
+  /* surfaces */
+  --bg: oklch(0.975 0.005 85);
+  --panel: oklch(0.955 0.006 85);
+  --rail: oklch(0.965 0.006 85);
+  --surface: oklch(0.995 0.002 85);
+  --line: oklch(0.91 0.007 80);
+  --line-soft: oklch(0.93 0.006 80);
+  --line-strong: oklch(0.86 0.01 80);
+
+  /* ink */
+  --ink: oklch(0.23 0.01 60);
+  --ink-2: oklch(0.4 0.01 60);
+  --ink-3: oklch(0.55 0.01 60);
+
+  /* meaning */
+  --accent: oklch(0.48 0.09 175);
+  --accent-ink: oklch(0.4 0.08 175);
+  --accent-soft: oklch(0.93 0.03 175);
+  --on-accent: #fff;
+  /* Marks drawn inside native controls; an SVG in a url() can't read tokens. */
+  --mark-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%2377726c' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+  --mark-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+  --mark-dash: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M4.5 8h7'/%3E%3C/svg%3E");
+  --attn: oklch(0.68 0.13 70);
+  --attn-ink: oklch(0.45 0.1 60);
+  --attn-soft: oklch(0.94 0.05 75);
+  --ok: oklch(0.55 0.11 155);
+  --ok-soft: oklch(0.94 0.04 155);
+  --danger: oklch(0.52 0.15 28);
+  --danger-soft: oklch(0.95 0.03 28);
+  --info: oklch(0.48 0.1 255);
+
+  /* elevation: borders first; shadows only for what floats */
+  --shadow-1: 0 1px 2px rgba(30, 25, 20, 0.05);
+  --shadow-pop: 0 16px 48px rgba(30, 25, 20, 0.18);
+  --scrim: rgba(30, 25, 20, 0.2);
+
+  /* the terminal */
   --terminal-bg: #1c1916;
   --terminal-text: #c9c3b7;
-  --terminal-prompt: #b08968;
+  --terminal-prompt: #8fc7bb;
   --terminal-dim: #6b655c;
   --terminal-warn: #d9a441;
 
-  /* accent & status */
-  --accent: #8a5a44;
-  --accent-hover: #7a4e3a;
-  --accent-deep: #6f4534;
-  --needs-input: #a8742c;
-  --needs-input-text: #8a5e20;
-  --healthy: #5a7a5e;
-  --healthy-text: #47614b;
-  --danger: #a34d3f;
-  --match-highlight: rgba(217, 164, 65, 0.25);
-
-  /* surfaces & marks that need to flip with the theme */
-  --scrim: rgba(33, 30, 25, 0.18);
-  --rule-line: rgba(33, 30, 25, 0.045);
-  --selection-bg: #e8dccb;
-  --file-doc: #3f5e8c;
-
   /* type */
-  --font-serif: "Source Serif 4", Georgia, serif;
-  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-serif: "Newsreader", Georgia, serif;
+  --font-sans: "Hanken Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
   --font-script: "Oregano", cursive;
 
-  /* shape & elevation */
+  /* shape: 6 chips, 8 controls, 12 cards, 16 overlays */
+  --radius-chip: 6px;
   --radius-control: 8px;
   --radius-card: 12px;
-  --radius-overlay: 14px;
-  --shadow-card: 0 1px 3px rgba(33, 30, 25, 0.06);
-  --shadow-control: 0 1px 2px rgba(33, 30, 25, 0.04);
-  --shadow-overlay: 0 24px 64px rgba(33, 30, 25, 0.3);
-  --shadow-drawer: -12px 0 32px rgba(33, 30, 25, 0.14);
+  --radius-overlay: 16px;
+
+  /* the earlier names, kept as aliases so every component follows the system */
+  --paper: var(--bg);
+  --sunken: var(--panel);
+  --sunken-2: var(--rail);
+  --border: var(--line);
+  --border-strong: var(--line-strong);
+  --window: var(--panel);
+  --ink-secondary: var(--ink-2);
+  --ink-tertiary: var(--ink-3);
+  --accent-hover: color-mix(in oklch, var(--accent) 88%, black);
+  --accent-deep: var(--accent-ink);
+  --needs-input: var(--attn);
+  --needs-input-text: var(--attn-ink);
+  --healthy: var(--ok);
+  --healthy-text: var(--ok);
+  --match-highlight: color-mix(in oklch, var(--attn) 28%, transparent);
+  --rule-line: color-mix(in oklch, var(--ink) 5%, transparent);
+  --selection-bg: var(--accent-soft);
+  --file-doc: var(--info);
+  --shadow-card: var(--shadow-1);
+  --shadow-control: none;
+  --shadow-overlay: var(--shadow-pop);
+  --shadow-drawer: var(--shadow-pop);
 }
 
-/* Warm dark theme — same "Paper & Ink" character, inverted. All token names
-   match :root so components pick these up automatically. */
 :root[data-theme="dark"] {
-  /* neutrals — paper (deep warm brown-black ground) */
-  --paper: #191713;
-  --surface: #221f1a;
-  --sunken: #2b2721;
-  --sunken-2: #1f1c17;
-  --border: #332e27;
-  --border-strong: #423b32;
-  --window: #141210;
-
-  /* neutrals — ink (warm off-white) */
-  --ink: #ece7dd;
-  --ink-secondary: #b3aa9c;
-  --ink-tertiary: #7d766a;
-
-  /* accent & status — lightened for contrast on the dark ground */
-  --accent: #c08a6e;
-  --accent-hover: #cd977c;
-  --accent-deep: #d8ad94;
-  --needs-input: #cf9f52;
-  --needs-input-text: #e0bd85;
-  --healthy: #7ba07f;
-  --healthy-text: #9cc0a0;
-  --danger: #cf8577;
-  --match-highlight: rgba(217, 164, 65, 0.32);
-
-  /* surfaces & marks */
-  --scrim: rgba(0, 0, 0, 0.55);
-  --rule-line: rgba(255, 255, 255, 0.05);
-  --selection-bg: #463a29;
-  --file-doc: #9db4d6;
-
-  /* elevation — heavier on dark */
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
-  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.6);
-  --shadow-drawer: -12px 0 32px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+  --bg: oklch(0.19 0.008 70);
+  --panel: oklch(0.165 0.008 70);
+  --rail: oklch(0.21 0.008 70);
+  --surface: oklch(0.225 0.009 70);
+  --line: oklch(0.3 0.01 70);
+  --line-soft: oklch(0.27 0.01 70);
+  --line-strong: oklch(0.36 0.01 70);
+  --ink: oklch(0.94 0.008 85);
+  --ink-2: oklch(0.78 0.01 80);
+  --ink-3: oklch(0.64 0.01 75);
+  --accent: oklch(0.72 0.1 175);
+  --accent-ink: oklch(0.8 0.09 175);
+  --accent-soft: oklch(0.3 0.04 175);
+  --on-accent: oklch(0.18 0.02 175);
+  --mark-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23999189' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+  --mark-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23102422' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+  --mark-dash: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23102422' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M4.5 8h7'/%3E%3C/svg%3E");
+  --attn: oklch(0.8 0.13 80);
+  --attn-ink: oklch(0.85 0.11 80);
+  --attn-soft: oklch(0.32 0.05 75);
+  --ok: oklch(0.72 0.12 155);
+  --ok-soft: oklch(0.3 0.04 155);
+  --danger: oklch(0.72 0.14 30);
+  --danger-soft: oklch(0.3 0.05 28);
+  --info: oklch(0.75 0.09 255);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.5);
+  --scrim: rgba(0, 0, 0, 0.5);
+  --accent-hover: color-mix(in oklch, var(--accent) 88%, white);
 }
 
 html,
@@ -134,13 +161,13 @@ body {
 }
 
 body {
-  background: var(--paper);
+  background: var(--bg);
   font-family: var(--font-sans);
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.55;
 }
 
 #app {
@@ -148,95 +175,559 @@ body {
 }
 
 a {
-  color: var(--accent);
+  color: var(--accent-ink);
   text-decoration: none;
 }
 a:hover {
-  color: var(--accent-deep);
   text-decoration: underline;
 }
 
 ::selection {
-  background: var(--selection-bg);
+  background: var(--accent-soft);
 }
 
 button {
   font-family: inherit;
   cursor: pointer;
 }
+/* A button a component leaves unstyled reads as part of the page, not the
+   operating system's grey box. Zero specificity: a component's rule wins. */
+:where(button) {
+  background: none;
+  border: none;
+  color: inherit;
+}
 
-/* shared control styles */
-.btn {
-  height: 34px;
-  padding: 0 16px;
-  border-radius: var(--radius-control);
+/* ── Native controls in the design system ─────────────────────
+   Checkboxes, radio buttons and dropdowns are drawn here, not by the
+   operating system, so they look the same on Windows and macOS. A
+   component's own rule still wins; one that sets the `background`
+   shorthand on a select drops the chevron, so they set background-color. */
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: none;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface) center / 12px no-repeat;
+  cursor: pointer;
+  vertical-align: -3px;
+  transition: border-color 0.12s ease-out, background-color 0.12s ease-out;
+}
+input[type="radio"] {
+  border-radius: 50%;
+}
+input[type="checkbox"]:hover:not(:disabled),
+input[type="radio"]:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+  border-color: var(--accent);
+  background-color: var(--accent);
+  background-image: var(--mark-check);
+}
+input[type="checkbox"]:indeterminate {
+  background-image: var(--mark-dash);
+}
+input[type="radio"]:checked {
+  border-color: var(--accent);
+  background-image: radial-gradient(circle, var(--accent) 0 3.5px, transparent 4px);
+}
+input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input[type="checkbox"]:disabled,
+input[type="radio"]:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  font: inherit;
   font-size: 13px;
-  font-weight: 500;
-  border: 1px solid var(--border-strong);
+  line-height: 1.3;
+  color: var(--ink);
+  background-color: var(--surface);
+  background-image: var(--mark-chevron);
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-control);
+  padding: 7px 28px 7px 10px;
+  cursor: pointer;
+  outline: none;
+}
+select:hover:not(:disabled) {
+  border-color: var(--ink-3);
+}
+select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+select:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+option {
   background: var(--surface);
   color: var(--ink);
-  box-shadow: var(--shadow-control);
 }
-.btn:hover {
-  background: var(--paper);
+
+/* ── Type ─────────────────────────────────────────────────── */
+.t-display {
+  font-family: var(--font-serif);
+  font-size: 34px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
 }
-.btn-primary {
-  border-color: var(--accent-deep);
-  background: var(--accent);
-  color: var(--surface);
+.t-title {
+  font-family: var(--font-serif);
+  font-size: 28px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.t-lead {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  line-height: 1.6;
+}
+.t-heading {
+  font-size: 15px;
   font-weight: 600;
 }
-.btn-primary:hover {
-  background: var(--accent-hover);
+.t-small {
+  font-size: 12.5px;
+  color: var(--ink-3);
 }
-.btn-ghost {
-  border-color: transparent;
-  background: transparent;
-  color: var(--ink-secondary);
-  box-shadow: none;
-}
-.btn-ghost:hover {
-  background: var(--sunken);
-  color: var(--ink);
-}
-.btn-small {
-  height: 28px;
-  padding: 0 12px;
-  border-radius: 7px;
-  font-size: 12px;
-}
-
-.overline {
+/* The 11px label. ("overline" is its earlier name.) */
+.overline,
+.t-label {
   font-size: 11px;
-  font-weight: 700;
-  color: var(--ink-tertiary);
-  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--ink-3);
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
-
 .mono {
   font-family: var(--font-mono);
 }
 
+/* ── Buttons: 28 small, 34 default, 40 large. One primary per group, first.
+      Destructive actions are never primary. ────────────────────────────── */
+.btn {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: var(--radius-control);
+  font-size: 13.5px;
+  font-weight: 500;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: var(--bg);
+}
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--accent);
+}
+.btn-primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+.btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-2);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--panel);
+  color: var(--ink);
+}
+.btn-danger {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+  font-weight: 600;
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+/* A text button in the accent: "Add task", "Open Inbox". */
+.btn-link {
+  border: none;
+  background: transparent;
+  color: var(--accent-ink);
+  font-weight: 600;
+  padding: 0 8px;
+}
+.btn-link:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+.btn-small {
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 7px;
+  font-size: 12.5px;
+}
+.btn-large {
+  height: 40px;
+  padding: 0 18px;
+  border-radius: 9px;
+  font-size: 14px;
+}
+
+/* ── Badges and status. Amber means waiting on you and nothing else; red is
+      for failures; a status pill always carries a word. ──────────────────── */
+.count {
+  font-size: 11.5px;
+  font-weight: 700;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border-radius: 10px;
+  background: var(--attn-soft);
+  color: var(--attn-ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.k-pill {
+  font-size: 12px;
+  font-weight: 600;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  background: var(--panel);
+  color: var(--ink-2);
+}
+.k-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 3px;
+  background: currentColor;
+}
+.k-pill.attn {
+  background: var(--attn-soft);
+  color: var(--attn-ink);
+}
+.k-pill.attn::before {
+  background: var(--attn);
+}
+.k-pill.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.k-pill.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.k-pill.accent {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.k-pill.accent::before {
+  background: var(--accent);
+}
+/* A tag: a state ("in progress"), a topic. */
+.chip {
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--panel);
+  border-radius: var(--radius-chip);
+  padding: 2px 8px;
+  white-space: nowrap;
+  border: none;
+}
+/* A file or a path, in mono with a hairline. */
+.chip.mono,
+.filechip {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 1px 7px;
+}
+.dot-new {
+  width: 7px;
+  height: 7px;
+  border-radius: 4px;
+  background: var(--accent);
+  flex: none;
+}
+
+/* ── Inputs ──────────────────────────────────────────────── */
+.input,
+.textarea {
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-control);
+  padding: 0 12px;
+  height: 36px;
+  box-sizing: border-box;
+  outline: none;
+}
+.textarea {
+  height: auto;
+  min-height: 64px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.5;
+}
+.input:focus,
+.textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--ink-3);
+}
+
+/* ── Navigation: a segmented switch and underline tabs ──────── */
+.k-segmented {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--panel);
+  gap: 2px;
+}
+.k-segmented > button {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.k-segmented > button.on {
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+  color: var(--ink);
+}
+.k-tabs {
+  display: flex;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.k-tabs > button {
+  padding: 6px 0;
+  border: none;
+  background: none;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+.k-tabs > button.on {
+  font-weight: 600;
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+
+/* ── Surfaces ────────────────────────────────────────────── */
+.k-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+}
+/* The "needs you" unit: kind, then who it's from, a title, one line of
+   context, at most two actions. */
+.k-action {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.k-action .kind {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.k-action .title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.k-action .short {
+  font-size: 12.5px;
+  color: var(--ink-3);
+  line-height: 1.45;
+}
+.k-action .acts {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+.k-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px;
+  border-radius: var(--radius-card);
+}
+.k-empty .head {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 500;
+}
+.k-empty .body {
+  font-size: 13.5px;
+  color: var(--ink-2);
+  line-height: 1.55;
+}
+.k-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+.k-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.6s ease-out;
+}
+
+/* ── List rows: tickets are square, tasks are round ──────── */
+.k-check {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border-radius: 9px;
+  border: 1.5px solid var(--line-strong);
+  background: transparent;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--on-accent);
+}
+.k-check.square {
+  border-radius: 5px;
+}
+.k-check.on {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.k-check.pending {
+  border-style: dashed;
+  border-color: var(--attn);
+}
+.k-check:hover:not(.on) {
+  border-color: var(--accent);
+}
+
+/* Scrollbars in the theme, not the operating system's. WebView2 (Windows)
+   and WebKit (macOS) both take the ::-webkit-scrollbar rules. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklch, var(--ink-3) 35%, transparent);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklch, var(--ink-3) 60%, transparent);
+}
+::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* A [[wiki link]], or a repo's name in code, in the Markdown editor
+   (decorations, so global). Only links take the accent; code is ink. */
+.ken-repolink,
+.ken-wikilink {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--accent) 45%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 .kbd {
   font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--ink-tertiary);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 5px;
-  background: var(--paper);
+  font-size: 11px;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 6px;
+  background: transparent;
 }
 
 /* Find-in-document highlights. Global because they are applied imperatively to
    DOM the previews own (<mark>), to Milkdown's inline decorations (<span>), and
    to CSV cell inputs — none of which a component's scoped CSS can reach. */
 .ken-find {
-  background: color-mix(in srgb, var(--needs-input) 32%, transparent);
+  background: color-mix(in oklch, var(--attn) 32%, transparent);
   color: inherit;
   border-radius: 2px;
 }
 .ken-find-current {
-  background: color-mix(in srgb, var(--accent) 42%, transparent);
+  background: color-mix(in oklch, var(--accent) 42%, transparent);
   box-shadow: 0 0 0 1px var(--accent);
 }

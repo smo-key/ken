@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Oregano&display=swap" rel="stylesheet">
+<style>
+:root{--bg:oklch(0.975 0.005 85);--panel:oklch(0.955 0.006 85);--rail:oklch(0.965 0.006 85);--surface:oklch(0.995 0.002 85);--line:oklch(0.91 0.007 80);--line-soft:oklch(0.93 0.006 80);--line-strong:oklch(0.86 0.01 80);--ink:oklch(0.23 0.01 60);--ink-2:oklch(0.4 0.01 60);--ink-3:oklch(0.55 0.01 60);--accent:oklch(0.48 0.09 175);--accent-ink:oklch(0.4 0.08 175);--accent-soft:oklch(0.93 0.03 175);--on-accent:#fff;--attn:oklch(0.68 0.13 70);--attn-ink:oklch(0.45 0.1 60);--attn-soft:oklch(0.94 0.05 75);--ok:oklch(0.55 0.11 155);--ok-soft:oklch(0.94 0.04 155);--danger:oklch(0.52 0.15 28);--danger-soft:oklch(0.95 0.03 28);--info:oklch(0.48 0.1 255);--shadow-1:0 1px 2px rgba(30,25,20,.05);--shadow-pop:0 16px 48px rgba(30,25,20,.18);--scrim:rgba(30,25,20,.2)}
+:root[data-theme=dark]{--bg:oklch(0.19 0.008 70);--panel:oklch(0.165 0.008 70);--rail:oklch(0.21 0.008 70);--surface:oklch(0.225 0.009 70);--line:oklch(0.3 0.01 70);--line-soft:oklch(0.27 0.01 70);--line-strong:oklch(0.36 0.01 70);--ink:oklch(0.94 0.008 85);--ink-2:oklch(0.78 0.01 80);--ink-3:oklch(0.64 0.01 75);--accent:oklch(0.72 0.1 175);--accent-ink:oklch(0.8 0.09 175);--accent-soft:oklch(0.3 0.04 175);--on-accent:oklch(0.18 0.02 175);--attn:oklch(0.8 0.13 80);--attn-ink:oklch(0.85 0.11 80);--attn-soft:oklch(0.32 0.05 75);--ok:oklch(0.72 0.12 155);--ok-soft:oklch(0.3 0.04 155);--danger:oklch(0.72 0.14 30);--danger-soft:oklch(0.3 0.05 28);--info:oklch(0.75 0.09 255);--shadow-1:0 1px 2px rgba(0,0,0,.3);--shadow-pop:0 16px 48px rgba(0,0,0,.5);--scrim:rgba(0,0,0,.5)}
+html,body{margin:0;height:100%;background:var(--bg)}body{font-family:"Hanken Grotesk",system-ui,sans-serif;color:var(--ink);-webkit-font-smoothing:antialiased;overflow:hidden}a{color:var(--accent-ink);text-decoration:none}a:hover{text-decoration:underline}button{font-family:inherit;cursor:pointer}
+</style>
+</helmet>
+<div data-screen-label="Ken App" style="height:100vh;min-width:1100px;display:flex;background:var(--bg);color:var(--ink);overflow:hidden;position:relative">
+
+  <aside style="width:{{ sideW }};flex:none;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:14px 10px;gap:2px;box-sizing:border-box;transition:width .18s ease-out;overflow:hidden">
+    <div style="display:flex;gap:7px;padding:2px 6px 14px"><span style="width:12px;height:12px;border-radius:6px;background:#FF5F57;flex:none"></span><span style="width:12px;height:12px;border-radius:6px;background:#FEBC2E;flex:none"></span><span style="width:12px;height:12px;border-radius:6px;background:#28C840;flex:none"></span></div>
+    <button onClick="{{ goSettingsTeam }}" title="Switch team" style="display:flex;align-items:center;gap:10px;padding:7px;border-radius:10px;border:1px solid var(--line);background:var(--surface);text-align:left;margin-bottom:12px;color:var(--ink)">
+      <span style="width:30px;height:30px;border-radius:8px;background:var(--ink);color:var(--bg);display:flex;align-items:center;justify-content:center;font-family:Oregano,cursive;font-size:19px;flex:none">K</span>
+      <sc-if value="{{ expanded }}" hint-placeholder-val="{{ true }}">
+        <span style="flex:1;min-width:0;display:flex;flex-direction:column;white-space:nowrap"><span style="font-size:13.5px;font-weight:600">Northside Ops</span><span style="font-size:11.5px;color:var(--ok);display:flex;align-items:center;gap:5px"><span style="width:6px;height:6px;border-radius:3px;background:var(--ok)"></span>Synced 2m ago</span></span>
+        <span style="width:14px;height:14px;flex:none;background:var(--ink-3);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/chevrons-up-down.svg) center/contain no-repeat"></span>
+      </sc-if>
+    </button>
+    <sc-for list="{{ nav }}" as="n" hint-placeholder-count="5">
+      <button onClick="{{ n.go }}" title="{{ n.label }}" style="display:flex;align-items:center;gap:10px;height:36px;padding:0 11px;border-radius:8px;border:none;background:{{ n.bg }};color:{{ n.color }};font-size:13.5px;font-weight:{{ n.weight }};text-align:left;position:relative;white-space:nowrap" style-hover="background:var(--line-soft)">
+        <span style="width:17px;height:17px;flex:none;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>
+        <sc-if value="{{ expanded }}" hint-placeholder-val="{{ true }}"><span style="flex:1">{{ n.label }}</span></sc-if>
+        <sc-if value="{{ n.count }}"><span style="font-size:11.5px;font-weight:700;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:var(--attn-soft);color:var(--attn-ink);display:inline-flex;align-items:center;justify-content:center;position:{{ n.badgePos }};top:2px;right:2px">{{ n.count }}</span></sc-if>
+        <sc-if value="{{ n.note }}"><sc-if value="{{ expanded }}"><span style="font-size:11.5px;color:var(--accent-ink);font-variant-numeric:tabular-nums">{{ n.note }}</span></sc-if></sc-if>
+        <sc-if value="{{ n.dot }}"><span style="width:7px;height:7px;border-radius:4px;background:var(--accent);position:{{ n.badgePos }};top:6px;right:8px"></span></sc-if>
+      </button>
+    </sc-for>
+    <div style="flex:1"></div>
+    <button onClick="{{ goSettings }}" title="Settings" style="display:flex;align-items:center;gap:10px;height:36px;padding:0 11px;border-radius:8px;border:none;background:{{ setBg }};color:{{ setColor }};font-size:13.5px;font-weight:500;white-space:nowrap" style-hover="background:var(--line-soft)"><span style="width:17px;height:17px;flex:none;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/settings.svg) center/contain no-repeat"></span><sc-if value="{{ expanded }}" hint-placeholder-val="{{ true }}">Settings</sc-if></button>
+    <button onClick="{{ toggleSide }}" title="{{ collapseLabel }}" style="display:flex;align-items:center;gap:10px;height:36px;padding:0 11px;border-radius:8px;border:none;background:transparent;color:var(--ink-3);font-size:13px;white-space:nowrap" style-hover="background:var(--line-soft)"><span style="width:17px;height:17px;flex:none;background:currentColor;mask:url({{ collapseIcon }}) center/contain no-repeat"></span><sc-if value="{{ expanded }}" hint-placeholder-val="{{ true }}">Collapse</sc-if></button>
+  </aside>
+
+  <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+    <header style="height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 24px;border-bottom:1px solid var(--line-soft)">
+      <button onClick="{{ openSearch }}" style="flex:1;max-width:520px;height:36px;border-radius:10px;border:1px solid var(--line);background:var(--surface);display:flex;align-items:center;gap:10px;padding:0 12px;font-size:13.5px;color:var(--ink-3)" style-hover="border-color:var(--line-strong)">
+        <span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1;text-align:left">Search or ask Northside Ops…</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:5px;padding:1px 6px">⌘K</span>
+      </button>
+      <span style="flex:1"></span>
+      <button title="Restart Ken to update to v0.9.0" style="flex:none;white-space:nowrap;height:32px;display:flex;align-items:center;gap:7px;padding:0 12px;border-radius:9px;border:1px solid var(--line);background:var(--surface);font-size:13px;color:var(--ink-2)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/refresh-cw.svg) center/contain no-repeat"></span>Update ready</button>
+      <button onClick="{{ toggleAsk }}" style="flex:none;white-space:nowrap;height:32px;display:flex;align-items:center;gap:8px;padding:0 12px;border-radius:9px;border:1px solid var(--accent);background:{{ askBg }};color:{{ askColor }};font-size:13px;font-weight:600"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/sparkles.svg) center/contain no-repeat"></span>Ask Ken<sc-if value="{{ chatPending }}"><span style="width:7px;height:7px;border-radius:4px;background:var(--attn)"></span></sc-if></button>
+    </header>
+
+    <div style="flex:1;min-height:0;display:flex">
+      <div style="flex:1;min-width:0;display:flex;min-height:0">
+
+        <!-- HOME -->
+        <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
+          <div data-screen-label="Home" style="flex:1;min-width:0;display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,26vw,380px);min-height:0">
+            <main style="padding:clamp(24px,3vw,44px) clamp(24px,4vw,64px) 48px;overflow-y:auto;display:flex;flex-direction:column;align-items:center;gap:28px">
+              <div style="display:flex;flex-direction:column;gap:12px;width:100%;max-width:880px">
+                <h1 style="margin:0;font-family:Newsreader,serif;font-size:34px;font-weight:500;letter-spacing:-.015em;line-height:1.1">Good morning, Sam</h1>
+                <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-3);white-space:nowrap"><span>Thursday, October 1</span><span>·</span><span>Digest at 7:02 AM · 3 sources</span><span style="flex:1"></span><button onClick="{{ share }}" style="height:28px;padding:0 10px;border-radius:8px;border:1px solid var(--line);background:transparent;font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:6px"><span style="width:13px;height:13px;background:currentColor;mask:url({{ shareIcon }}) center/contain no-repeat"></span>{{ shareLabel }}</button></div>
+                <div style="font-family:Newsreader,serif;font-size:clamp(18px,1.25vw,20px);line-height:1.6;text-wrap:pretty;max-width:68ch">
+                  <p style="margin:0 0 10px">Three things moved overnight. Priya updated the <a href="#" onClick="{{ goFiles }}">Volunteer Handbook</a> with a new shift-swap rule, which disagrees with the one in <a href="#" onClick="{{ goFiles }}">Ways of Working</a>. The <a href="#" onClick="{{ goFiles }}">Q4 Budget</a> now shows the venue deposit as paid.</p>
+                  <p style="margin:0">Ken read yesterday's board meeting and filed two decisions and one action for you. <a href="#" onClick="{{ goIngestBoard }}">See what changed</a>.</p>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap"><sc-for list="{{ sources }}" as="s" hint-placeholder-count="3"><button onClick="{{ goFiles }}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;background:transparent" style-hover="border-color:var(--accent)">{{ s }}</button></sc-for></div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:8px;width:100%;max-width:880px">
+                <div style="display:flex;align-items:center;gap:10px">
+                  <h2 style="margin:0;font-size:15px;font-weight:600">Your list</h2>
+                  <span style="font-size:13px;color:var(--ink-3)">{{ listSummary }}</span>
+                  <span style="flex:1"></span>
+                  <button onClick="{{ addTask }}" style="height:28px;padding:0 10px;border-radius:8px;border:none;background:transparent;font-size:13px;font-weight:600;color:var(--accent-ink);display:flex;align-items:center;gap:5px" style-hover="background:var(--accent-soft)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span>Add task</button>
+                </div>
+                <div style="display:flex;flex-direction:column;border-top:1px solid var(--line)">
+                  <sc-for list="{{ list }}" as="t" hint-placeholder-count="6">
+                    <div style="display:flex;align-items:center;gap:12px;min-height:44px;border-bottom:1px solid var(--line-soft)">
+                      <button onClick="{{ t.toggle }}" aria-label="Mark done" style="width:18px;height:18px;flex:none;padding:0;border-radius:{{ t.cbRadius }};border:1.5px solid {{ t.cbBorder }};background:{{ t.cbBg }};box-sizing:border-box;display:flex;align-items:center;justify-content:center" style-hover="border-color:var(--accent)"><sc-if value="{{ t.done }}"><span style="width:11px;height:11px;background:var(--on-accent);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span></sc-if></button>
+                      <span style="flex:1;min-width:0;display:flex;align-items:baseline;gap:8px">
+                        <sc-if value="{{ t.id }}"><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent-ink)">{{ t.id }}</span></sc-if>
+                        <span style="font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ t.color }};text-decoration:{{ t.deco }}">{{ t.title }}</span>
+                        <span style="font-size:12.5px;color:var(--ink-3);white-space:nowrap">{{ t.detail }}</span>
+                      </span>
+                      <sc-if value="{{ t.state }}"><span style="font-size:12px;color:var(--ink-2);background:var(--panel);border-radius:6px;padding:2px 8px">{{ t.state }}</span></sc-if>
+                      <span style="width:62px;text-align:right;font-size:12.5px;font-variant-numeric:tabular-nums;color:{{ t.dueColor }};font-weight:{{ t.dueWeight }}">{{ t.due }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:10px;width:100%;max-width:880px">
+                <div style="display:flex;align-items:center"><h2 style="margin:0;font-size:15px;font-weight:600">Picked up where you left off</h2><span style="flex:1"></span><button onClick="{{ goFiles }}" style="border:none;background:none;font-size:13px;font-weight:600;color:var(--accent-ink)">All files</button></div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px">
+                  <sc-for list="{{ recents }}" as="r" hint-placeholder-count="4">
+                    <button onClick="{{ goFiles }}" style="display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:12px;border-radius:10px;background:var(--surface);border:1px solid var(--line-soft);text-align:left;color:var(--ink);min-width:0" style-hover="border-color:var(--line-strong)">
+                      <span style="width:18px;height:18px;background:{{ r.color }};mask:url({{ r.icon }}) center/contain no-repeat"></span>
+                      <span style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">{{ r.name }}</span>
+                      <span style="font-size:12px;color:var(--ink-3)">{{ r.repo }} · {{ r.at }}</span>
+                    </button>
+                  </sc-for>
+                </div>
+              </div>
+            </main>
+            <aside style="border-left:1px solid var(--line-soft);background:var(--rail);padding:24px 18px;display:flex;flex-direction:column;gap:10px;overflow-y:auto">
+              <div style="display:flex;align-items:center;gap:8px"><h2 style="margin:0;font-size:15px;font-weight:600">Needs you</h2><sc-if value="{{ openCount }}"><span style="font-size:12px;font-weight:700;padding:1px 8px;border-radius:10px;background:var(--attn-soft);color:var(--attn-ink)">{{ openCount }}</span></sc-if><span style="flex:1"></span><button onClick="{{ goInbox }}" style="border:none;background:none;font-size:13px;font-weight:600;color:var(--accent-ink)">Open Inbox</button></div>
+              <sc-for list="{{ homeNeeds }}" as="n" hint-placeholder-count="4">
+                <div style="display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+                  <div style="display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;color:{{ n.kindColor }};text-transform:uppercase;letter-spacing:.05em"><span style="width:14px;height:14px;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>{{ n.kind }} · {{ n.from }}</div>
+                  <button onClick="{{ n.open }}" style="border:none;background:none;padding:0;text-align:left;font-size:14px;font-weight:600;line-height:1.35;color:var(--ink);text-wrap:pretty">{{ n.title }}</button>
+                  <div style="font-size:12.5px;color:var(--ink-3);line-height:1.45">{{ n.short }}</div>
+                  <div style="display:flex;gap:6px;margin-top:2px">
+                    <button onClick="{{ n.primaryGo }}" style="height:28px;padding:0 11px;border-radius:7px;border:none;background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600">{{ n.primary }}</button>
+                    <button onClick="{{ n.open }}" style="height:28px;padding:0 11px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--ink-2);font-size:12.5px">Details</button>
+                  </div>
+                </div>
+              </sc-for>
+              <sc-if value="{{ noNeeds }}"><div style="padding:16px;border-radius:12px;background:var(--surface);border:1px solid var(--line);display:flex;flex-direction:column;gap:4px"><span style="font-family:Newsreader,serif;font-size:17px;font-weight:500">Nothing waiting on you</span><span style="font-size:13px;color:var(--ink-2);line-height:1.5">When a teammate sends you something, or Ken needs a decision, it shows up here.</span></div></sc-if>
+              <button onClick="{{ goIngestTown }}" style="display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:12px;border:1px dashed var(--line-strong);background:transparent;text-align:left;color:var(--ink);margin-top:4px">
+                <div style="display:flex;align-items:center;gap:8px;font-size:13px;width:100%"><b style="font-weight:600">{{ readVerb }}</b><span style="color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Volunteer town hall.m4a</span><span style="flex:1"></span><span style="font-variant-numeric:tabular-nums;color:var(--ink-3)">{{ pct }}%</span></div>
+                <div style="height:4px;width:100%;border-radius:2px;background:var(--line-soft)"><div style="width:{{ pctW }};height:100%;border-radius:2px;background:var(--accent);transition:width .6s ease-out"></div></div>
+                <div style="font-size:12px;color:var(--ink-3)">All 4 folders indexed · 12 queued · <span style="color:var(--danger)">1 couldn't be read</span></div>
+              </button>
+            </aside>
+          </div>
+        </sc-if>
+
+        <!-- INBOX -->
+        <sc-if value="{{ isInbox }}">
+          <div data-screen-label="Inbox" style="flex:1;min-width:0;display:flex;min-height:0">
+            <div style="width:360px;flex:none;border-right:1px solid var(--line-soft);display:flex;flex-direction:column;min-height:0">
+              <div style="padding:24px 20px 0;display:flex;flex-direction:column;gap:14px">
+                <div style="display:flex;align-items:baseline;gap:10px"><h1 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500">Inbox</h1><span style="font-size:13.5px;color:var(--ink-3)">{{ openCount }} waiting</span><span style="flex:1"></span><button style="height:28px;padding:0 10px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--ink-2);font-size:12.5px;display:flex;align-items:center;gap:5px"><span style="width:13px;height:13px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/send.svg) center/contain no-repeat"></span>Send</button></div>
+                <div style="display:flex;gap:16px;border-bottom:1px solid var(--line)">
+                  <sc-for list="{{ filters }}" as="f" hint-placeholder-count="4"><button onClick="{{ f.go }}" style="padding:6px 0;border:none;background:none;font-size:13.5px;font-weight:{{ f.weight }};color:{{ f.color }};border-bottom:2px solid {{ f.line }};margin-bottom:-1px;white-space:nowrap">{{ f.label }}</button></sc-for>
+                </div>
+              </div>
+              <div style="flex:1;overflow-y:auto;padding:10px 10px 20px;display:flex;flex-direction:column;gap:2px">
+                <sc-for list="{{ inboxOpen }}" as="it" hint-placeholder-count="6">
+                  <button onClick="{{ it.select }}" style="display:flex;gap:11px;padding:11px 10px;border-radius:9px;border:none;background:{{ it.selBg }};text-align:left;color:var(--ink)" style-hover="background:var(--line-soft)">
+                    <span style="width:28px;height:28px;flex:none;border-radius:8px;background:{{ it.tint }};display:flex;align-items:center;justify-content:center"><span style="width:14px;height:14px;background:{{ it.kindColor }};mask:url({{ it.icon }}) center/contain no-repeat"></span></span>
+                    <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px"><span style="font-size:13.5px;font-weight:600;line-height:1.35;text-wrap:pretty">{{ it.title }}</span><span style="font-size:12px;color:var(--ink-3)">{{ it.kind }} · {{ it.from }} · {{ it.when }}</span></span>
+                  </button>
+                </sc-for>
+                <sc-if value="{{ inboxEmpty }}"><div style="padding:24px 10px;font-size:13.5px;color:var(--ink-3);line-height:1.5">Nothing here. Items you've dealt with are under Done.</div></sc-if>
+                <sc-if value="{{ doneCount }}">
+                  <div style="padding:16px 10px 6px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Done · {{ doneCount }}</div>
+                  <sc-for list="{{ inboxDone }}" as="it"><button onClick="{{ it.select }}" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;border:none;background:{{ it.selBg }};text-align:left;color:var(--ink-3);font-size:13px"><span style="width:14px;height:14px;flex:none;background:var(--ok);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span><span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ it.title }}</span></button></sc-for>
+                </sc-if>
+              </div>
+            </div>
+            <main style="flex:1;min-width:0;overflow-y:auto;padding:32px 40px">
+              <sc-if value="{{ sel }}">
+                <div style="max-width:680px;display:flex;flex-direction:column;gap:18px">
+                  <div style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:{{ sel.kindColor }}"><span style="width:15px;height:15px;background:currentColor;mask:url({{ sel.icon }}) center/contain no-repeat"></span>{{ sel.kind }}</div>
+                  <h1 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500;line-height:1.2;text-wrap:pretty">{{ sel.title }}</h1>
+                  <div style="font-size:13px;color:var(--ink-3)">From {{ sel.from }} · {{ sel.when }} · {{ sel.where }}</div>
+                  <p style="margin:0;font-size:15px;line-height:1.65;color:var(--ink-2);text-wrap:pretty">{{ sel.body }}</p>
+                  <sc-if value="{{ sel.quote }}"><blockquote style="margin:0;padding:14px 18px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-family:Newsreader,serif;font-size:17px;line-height:1.55">{{ sel.quote }}</blockquote></sc-if>
+                  <sc-if value="{{ sel.compare }}">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                      <sc-for list="{{ sel.compare }}" as="c"><div style="display:flex;flex-direction:column;gap:6px;padding:14px 16px;border-radius:10px;background:var(--surface);border:1px solid var(--line)"><span style="font-size:12px;font-weight:600;color:var(--ink-3)">{{ c.label }}</span><span style="font-size:14px;line-height:1.55">{{ c.text }}</span><span style="font-size:12px;color:var(--ink-3)">{{ c.meta }}</span></div></sc-for>
+                    </div>
+                  </sc-if>
+                  <sc-if value="{{ sel.diff }}">
+                    <div style="display:flex;flex-direction:column;border-radius:10px;border:1px solid var(--line);overflow:hidden;background:var(--surface)">
+                      <sc-for list="{{ sel.diff }}" as="d"><div style="display:flex;gap:10px;padding:7px 14px;font-size:13.5px;line-height:1.5;background:{{ d.bg }};color:{{ d.color }};text-decoration:{{ d.deco }}"><span style="width:12px;flex:none;font-family:'JetBrains Mono',monospace">{{ d.sign }}</span>{{ d.text }}</div></sc-for>
+                    </div>
+                  </sc-if>
+                  <sc-if value="{{ selOpen }}">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;padding-top:4px">
+                      <sc-for list="{{ selActions }}" as="a"><button onClick="{{ a.go }}" style="height:34px;padding:0 14px;border-radius:8px;border:{{ a.border }};background:{{ a.bg }};color:{{ a.color }};font-size:13.5px;font-weight:{{ a.weight }}">{{ a.label }}</button></sc-for>
+                      <span style="flex:1"></span>
+                      <sc-if value="{{ sel.file }}"><button onClick="{{ resolveSel }}" title="Silence this file's issues (only for you)" style="height:34px;padding:0 12px;border-radius:8px;border:none;background:transparent;color:var(--ink-3);font-size:13px;display:flex;align-items:center;gap:6px"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/bell-off.svg) center/contain no-repeat"></span>Ignore this file</button></sc-if>
+                    </div>
+                  </sc-if>
+                  <sc-if value="{{ selDone }}"><div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-size:13.5px;font-weight:600"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span>{{ selDoneNote }}<span style="flex:1"></span><button onClick="{{ undoSel }}" style="border:none;background:none;color:var(--ok);font-size:13px;font-weight:600;text-decoration:underline">Undo</button></div></sc-if>
+                </div>
+              </sc-if>
+            </main>
+          </div>
+        </sc-if>
+
+        <!-- INGEST -->
+        <sc-if value="{{ isIngest }}">
+          <div data-screen-label="Ingest" style="flex:1;min-width:0;display:flex;min-height:0">
+            <div style="width:clamp(240px,20vw,300px);flex:none;border-right:1px solid var(--line-soft);display:flex;flex-direction:column;gap:14px;padding:24px 14px;overflow-y:auto;box-sizing:border-box">
+              <h1 style="margin:0;font-family:Newsreader,serif;font-size:28px;font-weight:500;padding:0 4px">Ingest</h1>
+              <div style="display:flex;flex-direction:column;gap:6px">
+                <button style="display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;border-radius:9px;border:1.5px dashed var(--line-strong);background:var(--surface);text-align:left;color:var(--ink);white-space:nowrap" style-hover="border-color:var(--accent)"><span style="width:16px;height:16px;flex:none;background:var(--accent-ink);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/file-up.svg) center/contain no-repeat"></span><span style="font-size:13.5px;font-weight:600">Add a file</span><span style="font-size:12px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis">or drop it here</span></button>
+                <button style="display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;border-radius:9px;border:1px solid var(--line);background:var(--surface);text-align:left;color:var(--ink);white-space:nowrap" style-hover="border-color:var(--line-strong)"><span style="width:10px;height:10px;flex:none;border-radius:5px;background:var(--danger);margin:0 3px"></span><span style="font-size:13.5px;font-weight:600">Record a meeting</span></button>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <div style="padding:6px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">In progress · 2</div>
+                <sc-for list="{{ queue }}" as="q" hint-placeholder-count="2">
+                  <button onClick="{{ q.select }}" style="display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:9px;border:none;background:{{ q.selBg }};text-align:left;color:var(--ink)" style-hover="background:var(--line-soft)">
+                    <span style="display:flex;align-items:center;gap:8px;width:100%"><span style="width:15px;height:15px;flex:none;background:{{ q.color }};mask:url({{ q.icon }}) center/contain no-repeat"></span><span style="flex:1;min-width:0;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ q.name }}</span><span style="font-size:12px;color:var(--ink-3);font-variant-numeric:tabular-nums">{{ q.status }}</span></span>
+                    <span style="height:3px;width:100%;border-radius:2px;background:var(--line-soft)"><span style="display:block;width:{{ q.w }};height:100%;border-radius:2px;background:var(--accent);transition:width .6s ease-out"></span></span>
+                  </button>
+                </sc-for>
+                <div style="padding:14px 6px 6px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Ingested</div>
+                <sc-for list="{{ ingested }}" as="s" hint-placeholder-count="3">
+                  <button onClick="{{ s.select }}" style="display:flex;gap:10px;padding:10px;border-radius:9px;border:none;background:{{ s.selBg }};text-align:left;color:var(--ink)" style-hover="background:var(--line-soft)">
+                    <span style="width:15px;height:15px;flex:none;margin-top:2px;background:{{ s.color }};mask:url({{ s.icon }}) center/contain no-repeat"></span>
+                    <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px"><span style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.title }}</span><span style="font-size:12px;color:var(--ink-3)">{{ s.line }}</span></span>
+                    <sc-if value="{{ s.waits }}"><span style="flex:none;font-size:11.5px;font-weight:700;height:20px;padding:0 7px;border-radius:10px;background:var(--attn-soft);color:var(--attn-ink);display:flex;align-items:center;white-space:nowrap">{{ s.waits }}</span></sc-if>
+                  </button>
+                </sc-for>
+              </div>
+            </div>
+            <main style="flex:1;min-width:0;overflow-y:auto;padding:clamp(24px,3vw,40px) clamp(24px,4vw,56px) 56px;display:flex;flex-direction:column;align-items:center">
+              <div style="width:100%;max-width:1040px;display:flex;flex-direction:column;gap:28px">
+                <div style="display:flex;align-items:flex-end;gap:20px;flex-wrap:wrap">
+                  <div style="flex:1;min-width:280px;display:flex;flex-direction:column;gap:8px">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><sc-for list="{{ src.chips }}" as="c"><span style="font-size:12px;color:var(--ink-2);background:var(--panel);border-radius:6px;padding:2px 8px;white-space:nowrap">{{ c }}</span></sc-for></div>
+                    <h1 style="margin:0;font-family:Newsreader,serif;font-size:32px;font-weight:500;line-height:1.15">{{ src.title }}</h1>
+                    <div style="font-size:13px;color:var(--ink-3)">{{ src.meta }}</div>
+                  </div>
+                  <sc-if value="{{ src.ready }}">
+                    <div style="display:flex;gap:8px;flex:none">
+                      <button onClick="{{ goFiles }}" style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:13.5px;font-weight:500;white-space:nowrap">Open the note</button>
+                      <button onClick="{{ markSeen }}" style="height:34px;padding:0 14px;border-radius:8px;border:none;background:var(--accent);color:var(--on-accent);font-size:13.5px;font-weight:600;white-space:nowrap">{{ seenLabel }}</button>
+                    </div>
+                  </sc-if>
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:12px;padding:16px 18px;border-radius:12px;background:var(--surface);border:1px solid var(--line)">
+                  <div style="display:flex;align-items:center;gap:10px;font-size:13.5px"><b style="font-weight:600">{{ src.progressLabel }}</b><span style="flex:1"></span><span style="font-variant-numeric:tabular-nums;color:var(--ink-3)">{{ src.pctLabel }}</span></div>
+                  <div style="height:6px;border-radius:3px;background:var(--line-soft)"><div style="width:{{ src.w }};height:100%;border-radius:3px;background:{{ src.barColor }};transition:width .6s ease-out"></div></div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px 24px">
+                    <sc-for list="{{ src.steps }}" as="st"><div style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:{{ st.color }};font-weight:{{ st.weight }};white-space:nowrap"><span style="width:14px;height:14px;flex:none;background:currentColor;mask:url({{ st.icon }}) center/contain no-repeat"></span>{{ st.label }}</div></sc-for>
+                  </div>
+                </div>
+
+                <sc-if value="{{ src.notReady }}">
+                  <div style="display:flex;flex-direction:column;gap:6px;padding:20px;border-radius:12px;background:var(--rail)"><span style="font-family:Newsreader,serif;font-size:19px;font-weight:500">Ken is still reading</span><span style="font-size:14px;color:var(--ink-2);line-height:1.55;max-width:70ch">{{ src.soFar }} The summary, decisions, next steps and page updates appear here when it finishes. You can leave this screen.</span></div>
+                </sc-if>
+
+                <sc-if value="{{ src.ready }}">
+                  <section style="display:flex;flex-direction:column;gap:12px">
+                    <div style="display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:4px;background:var(--attn)"></span><h2 style="margin:0;font-size:16px;font-weight:600">Needs your decision</h2><span style="font-size:13px;color:var(--ink-3)">{{ decLeft }} of {{ decTotal }} left · also in your Inbox</span></div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">
+                      <sc-for list="{{ decisions }}" as="d" hint-placeholder-count="4">
+                        <div style="display:flex;flex-direction:column;gap:6px;padding:14px 16px;border-radius:12px;background:{{ d.bg }};border:1px solid var(--line)">
+                          <div style="display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;color:{{ d.kindColor }};text-transform:uppercase;letter-spacing:.05em"><span style="width:14px;height:14px;background:currentColor;mask:url({{ d.icon }}) center/contain no-repeat"></span>{{ d.kind }}</div>
+                          <div style="font-size:14.5px;font-weight:600;line-height:1.35">{{ d.short }}</div>
+                          <div style="font-size:13px;color:var(--ink-2);line-height:1.5;flex:1">{{ d.detail }}</div>
+                          <sc-if value="{{ d.open }}">
+                            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px"><sc-for list="{{ d.opts }}" as="o"><button onClick="{{ o.go }}" style="height:30px;padding:0 12px;border-radius:7px;border:{{ o.border }};background:{{ o.bg }};color:{{ o.color }};font-size:12.5px;font-weight:600;white-space:nowrap">{{ o.label }}</button></sc-for></div>
+                          </sc-if>
+                          <sc-if value="{{ d.closed }}">
+                            <div style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:13px;font-weight:600;color:var(--ok)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span>{{ d.note }}<span style="flex:1"></span><button onClick="{{ d.undo }}" style="border:none;background:none;padding:0;font-size:12.5px;font-weight:600;color:var(--ink-3);text-decoration:underline">Undo</button></div>
+                          </sc-if>
+                        </div>
+                      </sc-for>
+                    </div>
+                  </section>
+
+                  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:32px;align-items:start">
+                    <section style="display:flex;flex-direction:column;gap:12px">
+                      <h2 style="margin:0;font-size:16px;font-weight:600">Summary</h2>
+                      <p style="margin:0;font-family:Newsreader,serif;font-size:18px;line-height:1.6;text-wrap:pretty">{{ src.summary }}</p>
+                      <ul style="margin:0;padding-left:20px;font-size:14.5px;line-height:1.65;display:flex;flex-direction:column;gap:4px"><sc-for list="{{ src.takeaways }}" as="k"><li>{{ k }}</li></sc-for></ul>
+                      <div style="display:flex;flex-direction:column;gap:4px;padding:12px 14px;border-radius:10px;background:var(--panel)"><span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">What it overturns</span><span style="font-size:14px;line-height:1.55">{{ src.overturns }}</span></div>
+                    </section>
+                    <div style="display:flex;flex-direction:column;gap:28px">
+                      <section style="display:flex;flex-direction:column;gap:4px">
+                        <div style="display:flex;align-items:center;gap:8px;padding-bottom:6px"><h2 style="margin:0;font-size:16px;font-weight:600">Next steps</h2><span style="font-size:13px;color:var(--ink-3)">{{ nextCount }}</span></div>
+                        <sc-for list="{{ nextSteps }}" as="n">
+                          <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line-soft);flex-wrap:wrap">
+                            <span style="flex:1;min-width:180px;display:flex;flex-direction:column;gap:1px"><span style="font-size:14px;font-weight:500;line-height:1.4">{{ n.t }}</span><span style="font-size:12.5px;color:var(--ink-3)">{{ n.d }}</span></span>
+                            <sc-if value="{{ n.open }}"><div style="display:flex;gap:6px;flex:none"><sc-for list="{{ n.acts }}" as="o"><button onClick="{{ o.go }}" style="height:28px;padding:0 10px;border-radius:7px;border:{{ o.border }};background:{{ o.bg }};color:{{ o.color }};font-size:12.5px;font-weight:600;white-space:nowrap">{{ o.label }}</button></sc-for></div></sc-if>
+                            <sc-if value="{{ n.closed }}"><span style="flex:none;display:flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600;color:var(--ok);white-space:nowrap"><span style="width:13px;height:13px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span>{{ n.status }}</span></sc-if>
+                          </div>
+                        </sc-for>
+                      </section>
+                      <section style="display:flex;flex-direction:column;gap:4px">
+                        <div style="display:flex;align-items:center;gap:8px;padding-bottom:6px"><h2 style="margin:0;font-size:16px;font-weight:600">Pages Ken updated</h2><span style="font-size:13px;color:var(--ink-3)">{{ pagesCount }} · each cites the note</span></div>
+                        <sc-for list="{{ pagesUpd }}" as="r">
+                          <div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-top:1px solid var(--line-soft)">
+                            <span style="width:15px;height:15px;flex:none;background:{{ r.c }};mask:url({{ r.icon }}) center/contain no-repeat"></span>
+                            <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px"><span style="font-size:14px;font-weight:500;text-decoration:{{ r.deco }};color:{{ r.color }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.t }}</span><span style="font-size:12.5px;color:var(--ink-3)">{{ r.d }}</span></span>
+                            <sc-if value="{{ r.live }}"><div style="display:flex;gap:4px;flex:none"><button onClick="{{ goFiles }}" style="height:28px;padding:0 10px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--ink-2);font-size:12.5px">Open</button><button onClick="{{ r.undo }}" style="height:28px;padding:0 10px;border-radius:7px;border:none;background:transparent;color:var(--ink-3);font-size:12.5px">Undo</button></div></sc-if>
+                          </div>
+                        </sc-for>
+                      </section>
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:12px;padding-top:16px;border-top:1px solid var(--line-soft)">
+                    <span style="flex:1;font-size:13px;color:var(--ink-3)">Undo all takes back every page edit and puts the source back in Raw.</span>
+                    <button style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--danger);background:transparent;color:var(--danger);font-size:13.5px;font-weight:600;white-space:nowrap">Undo all</button>
+                  </div>
+                </sc-if>
+              </div>
+            </main>
+          </div>
+        </sc-if>
+
+        <!-- FILES -->
+        <sc-if value="{{ isFiles }}">
+          <div data-screen-label="Files" style="flex:1;min-width:0;display:flex;min-height:0">
+            <div style="width:260px;flex:none;border-right:1px solid var(--line-soft);background:var(--rail);padding:16px 10px;display:flex;flex-direction:column;gap:1px;overflow-y:auto;box-sizing:border-box">
+              <div style="display:flex;align-items:center;padding:0 6px 10px"><span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)">Northside Ops</span><span style="flex:1"></span><span style="width:15px;height:15px;background:var(--ink-3);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span></div>
+              <sc-for list="{{ tree }}" as="f" hint-placeholder-count="12">
+                <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px 0 {{ f.pad }};border-radius:7px;background:{{ f.bg }};font-size:13px;font-weight:{{ f.weight }};color:var(--ink)">
+                  <span style="width:15px;height:15px;flex:none;background:{{ f.color }};mask:url({{ f.icon }}) center/contain no-repeat"></span><span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ f.n }}</span><sc-if value="{{ f.dot }}"><span style="width:6px;height:6px;border-radius:3px;background:var(--accent)"></span></sc-if>
+                </div>
+              </sc-for>
+            </div>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+              <div style="height:40px;flex:none;display:flex;align-items:flex-end;gap:2px;padding:0 16px;border-bottom:1px solid var(--line-soft)">
+                <span style="height:34px;padding:0 14px;display:flex;align-items:center;gap:8px;border-radius:8px 8px 0 0;background:var(--surface);border:1px solid var(--line-soft);border-bottom:none;font-size:13px;font-weight:600"><span style="width:14px;height:14px;background:var(--info);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/file-text.svg) center/contain no-repeat"></span>Volunteer Handbook.docx</span>
+                <span style="height:34px;padding:0 14px;display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-3)"><span style="width:14px;height:14px;background:var(--ok);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/file-spreadsheet.svg) center/contain no-repeat"></span>Q4 Budget.xlsx</span>
+              </div>
+              <main style="flex:1;overflow-y:auto;background:var(--surface);padding:40px 48px">
+                <article style="max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:14px">
+                  <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-3)"><span>Handbook › Volunteer Handbook</span><span>·</span><span>Edited by Priya 12m ago</span><span style="flex:1"></span><sc-if value="{{ contraLive }}"><button onClick="{{ toggleContra }}" style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;border:none;background:var(--danger-soft);color:var(--danger);display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><span style="width:6px;height:6px;border-radius:3px;background:var(--danger)"></span>1 contradiction</button></sc-if><sc-if value="{{ contraFixed }}"><span style="font-size:12px;font-weight:600;height:24px;padding:0 9px;border-radius:12px;background:var(--ok-soft);color:var(--ok);display:inline-flex;align-items:center;white-space:nowrap">{{ contraNote }}</span></sc-if></div>
+                  <sc-if value="{{ contraPop }}">
+                    <div style="display:flex;flex-direction:column;gap:12px;padding:16px 18px;border-radius:12px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow-pop)">
+                      <div style="display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--danger)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/git-compare.svg) center/contain no-repeat"></span>Contradiction · found by Ken at 7:02 AM<span style="flex:1"></span><button onClick="{{ toggleContra }}" style="border:none;background:none;width:24px;height:24px;color:var(--ink-3)"><span style="display:block;width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/x.svg) center/contain no-repeat"></span></button></div>
+                      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                        <div style="display:flex;flex-direction:column;gap:4px;padding:12px;border-radius:9px;background:var(--attn-soft)"><span style="font-size:12px;font-weight:600;color:var(--attn-ink)">This page · highlighted</span><span style="font-size:14px">Swaps need at least 48 hours' notice.</span><span style="font-size:12px;color:var(--ink-3)">Priya, 12m ago</span></div>
+                        <div style="display:flex;flex-direction:column;gap:4px;padding:12px;border-radius:9px;background:var(--panel)"><span style="font-size:12px;font-weight:600;color:var(--ink-2)">Ways of Working › Volunteers</span><span style="font-size:14px">Swaps need 24 hours' notice.</span><span style="font-size:12px;color:var(--ink-3)">Last changed in March</span></div>
+                      </div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><button onClick="{{ contraKeepThis }}" style="height:32px;padding:0 13px;border-radius:8px;border:none;background:var(--accent);color:var(--on-accent);font-size:13px;font-weight:600;white-space:nowrap">Keep this page</button><button onClick="{{ contraKeepOther }}" style="height:32px;padding:0 13px;border-radius:8px;border:1px solid var(--line-strong);background:transparent;color:var(--ink);font-size:13px;white-space:nowrap">Keep Ways of Working</button><button onClick="{{ contraAsk }}" style="height:32px;padding:0 12px;border-radius:8px;border:none;background:transparent;color:var(--accent-ink);font-size:13px;font-weight:600;white-space:nowrap">Ask Priya</button><span style="flex:1"></span><span style="font-size:12px;color:var(--ink-3)">Same item as in your Inbox</span></div>
+                    </div>
+                  </sc-if>
+                  <h1 style="margin:0;font-family:Newsreader,serif;font-size:34px;font-weight:500">Volunteer Handbook</h1>
+                  <h2 style="margin:12px 0 0;font-family:Newsreader,serif;font-size:21px;font-weight:500">Swapping a shift</h2>
+                  <p style="margin:0;font-size:15px;line-height:1.75">If you can't make a shift, find a swap through the rota sheet and tell your coordinator. <span onClick="{{ openContra }}" title="Contradicts Ways of Working" style="background:{{ hlBg }};border-bottom:2px solid {{ hlLine }};padding:0 2px;cursor:{{ hlCursor }}">Swaps need at least 48 hours' notice</span> so the coordinator can confirm cover.</p>
+                  <h2 style="margin:12px 0 0;font-family:Newsreader,serif;font-size:21px;font-weight:500">Signing in</h2>
+                  <p style="margin:0;font-size:15px;line-height:1.75">Sign in at the front desk when you arrive and sign out when you leave. Your hours count toward the volunteer recognition scheme.</p>
+                </article>
+              </main>
+            </div>
+          </div>
+        </sc-if>
+
+        <!-- EXPLORE -->
+        <sc-if value="{{ isExplore }}">
+          <div data-screen-label="Explore" style="flex:1;min-width:0;overflow-y:auto;padding:clamp(24px,3vw,40px) clamp(24px,4vw,56px) 56px;display:flex;flex-direction:column;align-items:center">
+            <div style="width:100%;max-width:{{ exploreMax }};display:flex;flex-direction:column;gap:18px">
+              <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+                <h1 style="margin:0;font-family:Newsreader,serif;font-size:30px;font-weight:500">Explore</h1>
+                <div style="display:inline-flex;padding:3px;border-radius:9px;background:var(--panel);gap:2px">
+                  <sc-for list="{{ views }}" as="v"><button onClick="{{ v.go }}" style="height:30px;padding:0 14px;border-radius:7px;border:none;background:{{ v.bg }};box-shadow:{{ v.shadow }};font-size:13px;font-weight:600;color:{{ v.color }};white-space:nowrap;display:flex;align-items:center;gap:6px">{{ v.label }}<sc-if value="{{ v.count }}"><span style="font-size:11px;font-weight:700;padding:0 6px;border-radius:8px;background:var(--attn-soft);color:var(--attn-ink)">{{ v.count }}</span></sc-if></button></sc-for>
+                </div>
+                <span style="flex:1"></span>
+                <button style="height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);font-size:13px;color:var(--ink-2);display:flex;align-items:center;gap:6px;white-space:nowrap"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/history.svg) center/contain no-repeat"></span>View as of…</button>
+              </div>
+
+              <sc-if value="{{ isTimeline }}">
+                <sc-if value="{{ decFilter }}"><p style="margin:0;font-size:14px;line-height:1.55;color:var(--ink-2)">Decisions only. Ken keeps the <a href="#" onClick="{{ goFiles }}">Governance › Decisions log</a> page in step with this list.</p></sc-if>
+                <div style="height:38px;border-radius:9px;border:1px solid var(--line-strong);background:var(--surface);display:flex;align-items:center;gap:9px;padding:0 14px;font-size:13.5px;color:var(--ink-3)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1">Search events…</span><span style="font-size:12px">{{ evShown }} of {{ evTotal }} events</span></div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap"><sc-for list="{{ cats }}" as="c"><button onClick="{{ c.go }}" style="height:28px;padding:0 12px;border-radius:14px;border:1px solid {{ c.border }};background:{{ c.bg }};color:{{ c.color }};font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:6px;white-space:nowrap"><sc-if value="{{ c.dot }}"><span style="width:7px;height:7px;border-radius:4px;background:{{ c.dot }}"></span></sc-if>{{ c.n }}<sc-if value="{{ c.count }}"><span style="font-size:11px;font-weight:700;padding:0 6px;border-radius:8px;background:var(--attn-soft);color:var(--attn-ink)">{{ c.count }}</span></sc-if></button></sc-for></div>
+                <div style="display:flex;flex-direction:column">
+                  <button onClick="{{ toggleFuture }}" style="align-self:flex-start;display:flex;align-items:center;gap:6px;border:none;background:none;padding:4px 0 14px;font-size:13px;font-weight:600;color:var(--ink-2)"><span style="width:14px;height:14px;background:currentColor;mask:url({{ futureIcon }}) center/contain no-repeat"></span>2 upcoming events</button>
+                  <sc-for list="{{ timeline }}" as="e">
+                    <div style="display:flex;gap:16px">
+                      <div style="width:14px;flex:none;display:flex;flex-direction:column;align-items:center"><span style="width:12px;height:12px;border-radius:6px;margin-top:4px;background:{{ e.dotBg }};box-shadow:0 0 0 1.5px {{ e.dotRing }}{{ e.halo }};flex:none"></span><span style="flex:1;width:2px;background:var(--line);margin-top:4px"></span></div>
+                      <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:4px;padding-bottom:20px">
+                        <div style="display:flex;align-items:center;gap:8px"><span style="font-size:12px;font-weight:700;letter-spacing:.05em;color:{{ e.dateColor }}">{{ e.date }}</span><sc-if value="{{ e.cat }}"><span style="font-size:11.5px;font-weight:600;padding:1px 8px;border-radius:8px;background:{{ e.catBg }};color:{{ e.catColor }}">{{ e.cat }}</span></sc-if></div>
+                        <sc-if value="{{ e.text }}"><div style="font-size:14.5px;line-height:1.6;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px"><span>{{ e.text }}</span><sc-if value="{{ e.src }}"><button onClick="{{ goFiles }}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-2);border:1px solid var(--line);border-radius:6px;padding:1px 7px;background:var(--surface)">{{ e.src }}</button></sc-if></div></sc-if>
+                        <sc-if value="{{ e.pending }}"><button onClick="{{ e.go }}" style="align-self:flex-start;height:28px;padding:0 11px;border-radius:7px;border:none;background:var(--attn-soft);color:var(--attn-ink);font-size:12.5px;font-weight:600;white-space:nowrap">Waiting on you · decide</button></sc-if>
+                        <sc-if value="{{ e.by }}"><span style="font-size:12.5px;font-weight:600;color:var(--ok);display:flex;align-items:center;gap:5px"><span style="width:13px;height:13px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span>{{ e.by }}</span></sc-if>
+                      </div>
+                    </div>
+                  </sc-for>
+                </div>
+              </sc-if>
+
+              <sc-if value="{{ isMap }}">
+                <div style="position:relative;height:clamp(460px,62vh,720px);border-radius:14px;background:var(--surface);border:1px solid var(--line);overflow:hidden">
+                  <svg width="100%" height="100%" style="position:absolute;inset:0" preserveAspectRatio="none" viewBox="0 0 100 100"><sc-for list="{{ edges }}" as="e"><line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" stroke="var(--line-strong)" stroke-dasharray="{{ e.dash }}" vector-effect="non-scaling-stroke" style="stroke-width:1.2px"></line></sc-for></svg>
+                  <sc-for list="{{ nodes }}" as="n"><div style="position:absolute;left:{{ n.x }};top:{{ n.y }};transform:translate(-50%,-50%);display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:16px;background:var(--surface);border:1.5px solid {{ n.c }};font-size:13px;font-weight:{{ n.w }};white-space:nowrap;box-shadow:var(--shadow-1)"><span style="width:7px;height:7px;border-radius:4px;background:{{ n.c }}"></span>{{ n.n }}</div></sc-for>
+                  <div style="position:absolute;left:16px;bottom:14px;font-size:12px;color:var(--ink-3)">Dashed line: mentioned together but not linked</div>
+                </div>
+              </sc-if>
+            </div>
+          </div>
+        </sc-if>
+
+        <!-- SETTINGS -->
+        <sc-if value="{{ isSettings }}">
+          <div data-screen-label="Settings" style="flex:1;min-width:0;display:flex;min-height:0">
+            <nav style="width:230px;flex:none;border-right:1px solid var(--line-soft);padding:24px 12px;display:flex;flex-direction:column;gap:2px;box-sizing:border-box">
+              <h1 style="margin:0 0 14px;padding:0 10px;font-family:Newsreader,serif;font-size:28px;font-weight:500">Settings</h1>
+              <sc-for list="{{ secs }}" as="s"><button onClick="{{ s.go }}" style="display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:8px 10px;border-radius:8px;border:none;background:{{ s.bg }};text-align:left;color:{{ s.color }}" style-hover="background:var(--line-soft)"><span style="font-size:13.5px;font-weight:600">{{ s.label }}</span><span style="font-size:12px;color:var(--ink-3)">{{ s.sub }}</span></button></sc-for>
+            </nav>
+            <main style="flex:1;min-width:0;overflow-y:auto;padding:32px 40px">
+              <div style="max-width:720px;display:flex;flex-direction:column;gap:20px">
+                <h2 style="margin:0;font-family:Newsreader,serif;font-size:24px;font-weight:500">{{ secTitle }}</h2>
+                <sc-if value="{{ secGeneral }}">
+                  <div style="display:flex;flex-direction:column;border-radius:12px;border:1px solid var(--line);background:var(--surface)">
+                    <div style="display:flex;align-items:center;gap:16px;padding:16px 18px;border-bottom:1px solid var(--line-soft)"><span style="flex:1;display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:600">Appearance</span><span style="font-size:13px;color:var(--ink-3)">Light or dark. Ken follows it everywhere.</span></span><div style="display:inline-flex;padding:3px;border-radius:9px;background:var(--panel);gap:2px"><button onClick="{{ setLight }}" style="height:28px;padding:0 12px;border-radius:7px;border:none;background:{{ lightBg }};font-size:13px;font-weight:600;color:var(--ink)">Light</button><button onClick="{{ setDark }}" style="height:28px;padding:0 12px;border-radius:7px;border:none;background:{{ darkBg }};font-size:13px;font-weight:600;color:var(--ink)">Dark</button></div></div>
+                    <div style="display:flex;align-items:center;gap:16px;padding:16px 18px;border-bottom:1px solid var(--line-soft)"><span style="flex:1;display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:600">Morning digest</span><span style="font-size:13px;color:var(--ink-3)">Ken writes it at 7:00 AM on weekdays.</span></span><span style="width:36px;height:22px;border-radius:11px;background:var(--accent);position:relative"><span style="position:absolute;right:3px;top:3px;width:16px;height:16px;border-radius:8px;background:var(--on-accent)"></span></span></div>
+                    <div style="display:flex;align-items:center;gap:16px;padding:16px 18px"><span style="flex:1;display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:600">What's new</span><span style="font-size:13px;color:var(--ink-3)">Version 0.9.0 is ready. Restart to update.</span></span><button style="height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--line-strong);background:transparent;font-size:13px;color:var(--ink)">Restart Ken</button></div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ secTeam }}">
+                  <p style="margin:0;font-size:14.5px;line-height:1.6;color:var(--ink-2)">The folders Ken reads for Northside Ops, how deeply it reads each one, and the team's rules and templates.</p>
+                  <div style="display:flex;gap:8px"><button style="height:34px;padding:0 14px;border-radius:8px;border:none;background:var(--accent);color:var(--on-accent);font-size:13.5px;font-weight:600">Add a folder</button><button style="height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:13.5px">Check for changes</button></div>
+                  <div style="display:flex;flex-direction:column;border-radius:12px;border:1px solid var(--line);background:var(--surface)">
+                    <sc-for list="{{ repos }}" as="r"><div style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-top:{{ r.border }}"><span style="width:30px;height:30px;border-radius:8px;background:var(--panel);display:flex;align-items:center;justify-content:center;flex:none"><span style="width:15px;height:15px;background:var(--ink-2);mask:url({{ r.icon }}) center/contain no-repeat"></span></span><span style="flex:1;display:flex;flex-direction:column;gap:1px"><span style="font-size:14px;font-weight:600">{{ r.n }}</span><span style="font-size:12.5px;color:var(--ink-3)">{{ r.d }}</span></span><span style="font-size:12.5px;height:28px;padding:0 10px;border-radius:7px;border:1px solid var(--line);display:flex;align-items:center;gap:6px;color:var(--ink-2)">{{ r.depth }}<span style="width:12px;height:12px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/chevron-down.svg) center/contain no-repeat"></span></span><span style="width:110px;text-align:right;font-size:12.5px;color:{{ r.sc }}">{{ r.status }}</span></div></sc-for>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                    <div style="display:flex;flex-direction:column;gap:8px;padding:16px;border-radius:12px;border:1px solid var(--line);background:var(--surface)"><span style="font-size:14px;font-weight:600">Rules · 4</span><span style="font-size:13.5px;color:var(--accent-ink)">Human edits always win</span><span style="font-size:13.5px;color:var(--accent-ink)">Decisions need a named decider</span><span style="font-size:13px;color:var(--ink-3)">+ Add a rule, as a sentence</span></div>
+                    <div style="display:flex;flex-direction:column;gap:8px;padding:16px;border-radius:12px;border:1px solid var(--line);background:var(--surface)"><span style="font-size:14px;font-weight:600">Weekly check</span><span style="font-size:13.5px;color:var(--ink-2);line-height:1.5">Last run Monday · 86 pages. 3 pages to check against their sources.</span><button onClick="{{ goInbox }}" style="align-self:flex-start;border:none;background:none;padding:0;font-size:13px;font-weight:600;color:var(--accent-ink)">Open Inbox</button></div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ secOther }}"><div style="padding:18px;border-radius:12px;border:1px solid var(--line);background:var(--surface);font-size:14px;line-height:1.6;color:var(--ink-2)">{{ secBlurb }}</div></sc-if>
+              </div>
+            </main>
+          </div>
+        </sc-if>
+      </div>
+
+      <!-- ASK KEN -->
+      <sc-if value="{{ ask }}">
+        <aside data-screen-label="Ask Ken" style="width:360px;flex:none;border-left:1px solid var(--line-soft);background:var(--rail);display:flex;flex-direction:column;min-height:0">
+          <div style="height:48px;flex:none;display:flex;align-items:center;gap:4px;padding:0 10px 0 14px;border-bottom:1px solid var(--line-soft)">
+            <span style="height:30px;padding:0 10px;border-radius:7px;background:var(--surface);border:1px solid var(--line);font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:6px">Budget deposit<sc-if value="{{ chatPending }}"><span style="width:6px;height:6px;border-radius:3px;background:var(--attn)"></span></sc-if></span>
+            <span style="height:30px;padding:0 10px;font-size:12.5px;color:var(--ink-3);display:flex;align-items:center">Grant draft</span>
+            <span style="flex:1"></span>
+            <button title="New chat" style="width:30px;height:30px;border:none;background:none;display:flex;align-items:center;justify-content:center;color:var(--ink-3)"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span></button>
+            <button onClick="{{ toggleAsk }}" title="Close" style="width:30px;height:30px;border:none;background:none;display:flex;align-items:center;justify-content:center;color:var(--ink-3)"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/x.svg) center/contain no-repeat"></span></button>
+          </div>
+          <div style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px">
+            <div style="align-self:flex-end;max-width:85%;padding:9px 12px;border-radius:12px 12px 4px 12px;background:var(--accent-soft);font-size:13.5px;line-height:1.5">Move the venue deposit out of contingency in the Q4 budget.</div>
+            <div style="font-size:13.5px;line-height:1.6">I found the deposit (£2,400) under Contingency in <a href="#" onClick="{{ goFiles }}">Q4 Budget.xlsx</a>. Which line should it go under?</div>
+            <sc-if value="{{ chatPending }}">
+              <div style="display:flex;flex-direction:column;gap:6px">
+                <sc-for list="{{ chatOpts }}" as="o"><button onClick="{{ o.go }}" style="height:36px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:13.5px;text-align:left;padding:0 12px" style-hover="border-color:var(--accent)">{{ o.label }}</button></sc-for>
+              </div>
+            </sc-if>
+            <sc-if value="{{ chatAnswered }}">
+              <div style="align-self:flex-end;padding:9px 12px;border-radius:12px 12px 4px 12px;background:var(--accent-soft);font-size:13.5px">{{ chatAnswer }}</div>
+              <div style="display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-size:13px"><span style="display:flex;align-items:center;gap:6px;font-weight:600"><span style="width:13px;height:13px;background:var(--ok);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/check.svg) center/contain no-repeat"></span>Edited Q4 Budget.xlsx</span><span style="color:var(--ink-3)">Moved £2,400 to {{ chatAnswer }}. Undo from Files.</span></div>
+            </sc-if>
+          </div>
+          <div style="padding:12px 14px 14px;display:flex;flex-direction:column;gap:6px"><div style="min-height:44px;border-radius:10px;border:1px solid var(--line-strong);background:var(--surface);display:flex;align-items:center;padding:0 12px;font-size:13.5px;color:var(--ink-3)">Ask about Northside Ops…</div><span style="font-size:11.5px;color:var(--ink-3)">Type / for the terminal · same chat in both</span></div>
+        </aside>
+      </sc-if>
+    </div>
+  </div>
+
+  <!-- SEARCH -->
+  <sc-if value="{{ search }}">
+    <div onClick="{{ closeSearch }}" style="position:absolute;inset:0;background:var(--scrim);display:flex;justify-content:center;align-items:flex-start;padding-top:96px;z-index:50">
+      <div onClick="{{ stop }}" style="width:640px;border-radius:16px;background:var(--surface);box-shadow:var(--shadow-pop);border:1px solid var(--line);overflow:hidden">
+        <div style="height:54px;display:flex;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid var(--line-soft)"><span style="width:17px;height:17px;background:var(--ink-3);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1;font-size:16px">how much notice for a shift swap</span></div>
+        <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;flex-direction:column;gap:6px;padding:14px 16px;border-radius:12px;background:var(--accent-soft)"><span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--accent-ink)">Ken's answer</span><span style="font-size:14.5px;line-height:1.55">The handbook now says 48 hours, but Ways of Working still says 24. That conflict is waiting in your Inbox.</span><span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink-3)">Volunteer Handbook.docx · Ways of Working.md</span></div>
+          <sc-for list="{{ results }}" as="r"><div style="display:flex;gap:10px;padding:8px 6px"><span style="width:16px;height:16px;flex:none;margin-top:2px;background:{{ r.c }};mask:url({{ r.icon }}) center/contain no-repeat"></span><span style="display:flex;flex-direction:column;gap:2px"><span style="font-size:13.5px;font-weight:600">{{ r.n }}</span><span style="font-size:13px;color:var(--ink-2)">{{ r.s }}</span></span></div></sc-for>
+        </div>
+        <div style="display:flex;gap:16px;padding:10px 18px;border-top:1px solid var(--line-soft);font-size:12px;color:var(--ink-3)"><span>↵ open</span><span>⌘↵ continue in Ask Ken</span><span>esc close</span></div>
+      </div>
+    </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;'light'|'dark'&quot;},&quot;startScreen&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;home&quot;,&quot;inbox&quot;,&quot;files&quot;,&quot;ingest&quot;,&quot;explore&quot;,&quot;settings&quot;],&quot;default&quot;:&quot;home&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;collapsed&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;}}">
+class Component extends DCLogic {
+  state = { screen: this.props.startScreen || "home", dark: this.props.theme === "dark", collapsed: !!this.props.collapsed, ask: false, search: false,
+    done: { b: true }, resolved: {}, notes: {}, filter: "all", sel: "k2", ingestSel: "board", pct: 62, view: "timeline", cat: null, future: false, sec: "team", chatAnswer: null, seen: {}, copied: false, undone: {}, next: {}, contra: false };
+  componentDidMount() {
+    this.apply();
+    this.t = setInterval(() => this.setState(s => s.pct < 97 ? { pct: s.pct + 1 } : null), 1800);
+    this.k = e => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); this.setState(s => ({ search: !s.search })); } else if (e.key === "Escape") this.setState({ search: false }); };
+    window.addEventListener("keydown", this.k);
+  }
+  componentWillUnmount() { clearInterval(this.t); window.removeEventListener("keydown", this.k); }
+  componentDidUpdate(pp) {
+    if (pp.theme !== this.props.theme && this.props.theme) this.setState({ dark: this.props.theme === "dark" });
+    if (pp.collapsed !== this.props.collapsed) this.setState({ collapsed: !!this.props.collapsed });
+    this.apply();
+  }
+  apply() { document.documentElement.dataset.theme = this.state.dark ? "dark" : "light"; }
+
+  items() {
+    const I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    return [
+      { id:"k2", grp:"ken", kind:"Contradiction", icon:I("git-compare"), hue:"danger", from:"Ken", when:"7:02 AM", where:"Handbook", short:"Shift swaps: 48h notice vs. 24h. Pick which one stands.",
+        title:"Handbook disagrees with Ways of Working", body:"Priya's edit to the Volunteer Handbook changed the notice for a shift swap. Ways of Working still has the old rule. Pick the one that stands and Ken updates the other.",
+        compare:[{label:"Volunteer Handbook",text:"Swaps need at least 48 hours' notice.",meta:"Edited by Priya, 12m ago"},{label:"Ways of Working › Volunteers",text:"Swaps need 24 hours' notice.",meta:"Last changed in March"}],
+        actions:["Keep the handbook","Keep Ways of Working","Open both"], doneNote:"Kept. Ken updated the other page." },
+      { id:"k3", grp:"ken", kind:"Ken asked", icon:I("message-circle-question"), hue:"attn", from:"Ask Ken", when:"20m ago", where:"Budget deposit chat", short:"Asked in the Budget deposit chat.",
+        title:"Which budget line for the venue deposit?", body:"Ken is waiting on you to finish a change to the Q4 Budget.", actions:["Answer in Ask Ken"], chat:true, doneNote:"Answered." },
+      { id:"p1", grp:"people", kind:"Task", icon:I("user-round-plus"), hue:"accent", from:"Dana", when:"2h ago", where:"grants", short:"Due Oct 6. Accept to add it to your list.",
+        title:"Review grant draft section 3", body:"Can you read section 3 before Monday? It's the budget narrative, and you know the numbers best.", quote:"Grant draft v4.pdf, section 3: Budget narrative. Due Oct 6.",
+        actions:["Accept","Not mine","Reply"], task:true, doneNote:"Accepted. It's on your list." },
+      { id:"k1", grp:"ken", kind:"Ruling", icon:I("gavel"), hue:"accent", from:"Board meeting", when:"yesterday", where:"Decisions log", short:"From the board meeting. You're the decider.",
+        title:"Adopt the new volunteer sign-in flow", body:"The board agreed in principle. You're named as the decider, so it goes into the decisions log when you accept.", quote:"\u201cWe'll move to QR sign-in at the front desk from November, if Sam signs it off.\u201d Dana, 00:41:12",
+        actions:["Accept as Sam","Drop"], doneNote:"Written to the decisions log." },
+      { id:"k4", grp:"ken", kind:"Held edit", icon:I("file-pen"), hue:"attn", from:"Board meeting", when:"yesterday", where:"Events › Gala", short:"Ken held a change to the gala page.",
+        title:"Update the gala budget cap on Events › Gala", body:"This edit changes a number other pages rely on, so Ken held it for you.",
+        diff:[{sign:"−",text:"Budget cap: £18,000"},{sign:"+",text:"Budget cap: £21,000 (agreed 30 Sep, see note)"}], actions:["Apply the change","Discard"], doneNote:"Applied to Events › Gala." },
+      { id:"k5", grp:"ken", kind:"Contradiction", icon:I("git-compare"), hue:"danger", from:"Board meeting", when:"yesterday", where:"Events › Gala", short:"Transcript says 14 Nov, the page says 21 Nov.",
+        title:"Gala date doesn't match", body:"Dana says 14 November in the board meeting. Events › Gala still says 21 November.", compare:[{label:"Board meeting, 00:12:40",text:"\u201cThe gala's on the 14th now.\u201d",meta:"Dana"},{label:"Events › Gala",text:"Date: 21 November",meta:"Last changed in August"}], actions:["Use 14 Nov","Keep 21 Nov"], doneNote:"Resolved. Events › Gala updated." },
+      { id:"k6", grp:"ken", kind:"Contradiction", icon:I("git-compare"), hue:"danger", from:"Board meeting", when:"yesterday", where:"Ways of Working", short:"QR codes vs. paper sheets.",
+        title:"Sign-in method doesn't match", body:"The board agreed QR sign-in from November. Ways of Working still describes paper sheets.", compare:[{label:"Board meeting",text:"QR sign-in at the front desk from November.",meta:"Pending your ruling"},{label:"Ways of Working › Volunteers",text:"Sign the paper sheet at the front desk.",meta:"Last changed in March"}], actions:["Update Ways of Working","Keep paper sheets"], doneNote:"Resolved." },
+      { id:"p2", grp:"people", kind:"Message", icon:I("message-square"), hue:"accent", from:"Priya", when:"3h ago", where:"handbook", short:"Handbook changes are live.",
+        title:"Handbook changes are live", body:"I've updated the shift-swap section. Shout if anything reads oddly.", actions:["Reply","Dismiss"], doneNote:"Dismissed." },
+      { id:"s1", grp:"sync", kind:"Edit conflict", icon:I("git-merge"), hue:"danger", from:"Sync", when:"1h ago", where:"Q4 Budget.xlsx", short:"You and Marcus both edited the same rows.", file:true,
+        title:"Q4 Budget.xlsx was changed in two places", body:"You and Marcus both edited the catering rows. Ken drafted a merge that keeps both changes.",
+        compare:[{label:"Yours",text:"Catering: £3,200",meta:"Sam, 1h ago"},{label:"Marcus",text:"Catering: £3,450 (incl. drinks)",meta:"Marcus, 50m ago"}], actions:["Accept Ken's merge","Keep mine","Use theirs"], doneNote:"Merged." },
+      { id:"s2", grp:"sync", kind:"Couldn't read", icon:I("file-warning"), hue:"danger", from:"Ken", when:"today", where:"Finance/Receipts", short:"It may be a scan with no text.", file:true,
+        title:"Ken couldn't read scan_0042.pdf", body:"It looks like a scanned image with no text layer. Search won't find what's in it.", actions:["Open in Files"], doneNote:"Ignored for you." }
+    ];
+  }
+
+  renderVals() {
+    const s = this.state, I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    const set = o => () => this.setState(o);
+    const go = screen => e => { e && e.preventDefault && e.preventDefault(); this.setState({ screen, search: false }); };
+    const hueC = h => ({ danger:"var(--danger)", attn:"var(--attn-ink)", accent:"var(--accent-ink)" }[h]);
+    const hueT = h => ({ danger:"var(--danger-soft)", attn:"var(--attn-soft)", accent:"var(--accent-soft)" }[h]);
+    const resolve = (id, note) => this.setState(st => ({ resolved: { ...st.resolved, [id]: true }, notes: { ...st.notes, [id]: note } }));
+    const all = this.items().map(it => ({ ...it, kindColor: hueC(it.hue), tint: hueT(it.hue), quote: it.quote || "", compare: it.compare || null, diff: it.diff ? it.diff.map(d => ({ ...d, bg: d.sign === "+" ? "var(--ok-soft)" : "var(--danger-soft)", color: d.sign === "+" ? "var(--ok)" : "var(--danger)", deco: d.sign === "+" ? "none" : "line-through" })) : null, file: !!it.file }));
+    const open = all.filter(i => !s.resolved[i.id]);
+    const openCount = open.length;
+    const actFor = it => label => () => {
+      if (it.chat) return this.setState({ ask: true });
+      if (label === "Open in Files" || label === "Open both") return this.setState({ screen: "files" });
+      if (label === "Reply") return;
+      resolve(it.id, label === "Not mine" ? "Sent back to Dana." : it.doneNote);
+    };
+
+    // nav
+    const navDef = [["home","house","Home"],["inbox","inbox","Inbox"],["files","folder-open","Files"],["ingest","file-input","Ingest"],["explore","compass","Explore"]];
+    const expanded = !s.collapsed;
+    const nav = navDef.map(([k,i,l]) => { const on = s.screen === k; return { label:l, icon:I(i), go: go(k), count: k === "inbox" ? openCount : 0, dot: k === "files" && !on, note: k === "ingest" && s.pct < 100 ? `${s.pct}%` : "", bg: on ? "var(--accent-soft)" : "transparent", color: on ? "var(--accent-ink)" : "var(--ink-2)", weight: on ? 600 : 500, badgePos: expanded ? "static" : "absolute" }; });
+
+    // home list
+    const raw = [
+      { k:"a", id:"OPS-131", title:"Move the shift rota to the new sheet", detail:"volunteers", state:"blocked", due:"2d late", late:true },
+      { k:"c", title:"Call Marcus about the catering quote", detail:"from the board meeting", due:"Today", today:true },
+      ...(s.resolved.p1 && s.notes.p1 !== "Sent back to Dana." ? [{ k:"g", title:"Review grant draft section 3", detail:"from Dana", due:"Oct 6" }] : []),
+      { k:"d", id:"OPS-142", title:"Confirm venue insurance for the gala", detail:"events", state:"in progress", due:"Fri" },
+      { k:"e", title:"Send Priya feedback on the handbook", detail:"handbook", due:"Tomorrow" },
+      { k:"f", id:"OPS-139", title:"Update the donor thank-you template", detail:"comms", state:"review", due:"Oct 8" },
+      { k:"b", title:"Book a room for Tuesday standup", detail:"ops", due:"Mon" }
+    ];
+    const list = raw.map(t => { const done = !!s.done[t.k]; return { ...t, id: t.id || "", state: t.state || "", done, toggle: () => this.setState(st => ({ done: { ...st.done, [t.k]: !st.done[t.k] } })),
+      cbRadius: t.id ? "5px" : "9px", cbBorder: done ? "var(--accent)" : "var(--line-strong)", cbBg: done ? "var(--accent)" : "transparent",
+      color: done ? "var(--ink-3)" : "var(--ink)", deco: done ? "line-through" : "none", dueWeight: (t.late || t.today) && !done ? 600 : 400,
+      dueColor: done ? "var(--ink-3)" : t.late ? "var(--danger)" : t.today ? "var(--accent-ink)" : "var(--ink-3)" }; });
+    const nT = raw.filter(t => t.id).length, nK = raw.length - nT;
+    const homeNeeds = open.slice(0, 4).map(it => ({ ...it, primary: it.actions[0].replace(" in Ask Ken", ""), primaryGo: actFor(it)(it.actions[0]), open: () => this.setState({ screen: "inbox", sel: it.id, filter: "all" }) }));
+    const recents = [["Volunteer Handbook.docx","file-text","var(--info)","Handbook","12m"],["Q4 Budget.xlsx","file-spreadsheet","var(--ok)","Finance","1h"],["Board meeting notes.md","notebook-text","var(--ink-2)","Governance","3h"],["Grant draft v4.pdf","file-type","var(--danger)","Grants","1d"]].map(([name,ic,color,repo,at]) => ({ name, icon:I(ic), color, repo, at }));
+
+    // inbox
+    const grpCount = g => open.filter(i => g === "all" || i.grp === g).length;
+    const filters = [["all","All"],["people","People"],["ken","Ken"],["sync","Sync & files"]].map(([k,l]) => ({ label: `${l} · ${grpCount(k)}`, go: set({ filter: k }), weight: s.filter === k ? 600 : 500, color: s.filter === k ? "var(--ink)" : "var(--ink-3)", line: s.filter === k ? "var(--ink)" : "transparent" }));
+    const withSel = i => ({ ...i, select: set({ sel: i.id }), selBg: s.sel === i.id ? "var(--accent-soft)" : "transparent" });
+    const inboxOpen = open.filter(i => s.filter === "all" || i.grp === s.filter).map(withSel);
+    const inboxDone = all.filter(i => s.resolved[i.id]).map(withSel);
+    const sel = all.find(i => i.id === s.sel) || null;
+    const selOpen = sel && !s.resolved[sel.id];
+    const selActions = sel ? sel.actions.map((l, ix) => ({ label: l, go: actFor(sel)(l), bg: ix === 0 ? "var(--accent)" : "var(--surface)", color: ix === 0 ? "var(--on-accent)" : "var(--ink)", border: ix === 0 ? "none" : "1px solid var(--line-strong)", weight: ix === 0 ? 600 : 500 })) : [];
+
+    // ingest
+    const pct = s.pct;
+    const stepsFor = (n) => ["Filed in Raw","Transcribed","Read","Pages written","Ready"].map((l, i) => ({ label: l, icon: I(i < n ? "circle-check" : i === n ? "loader" : "circle"), color: i < n ? "var(--ok)" : i === n ? "var(--accent-ink)" : "var(--ink-3)", weight: i === n ? 600 : 500 }));
+    const rowsU = (arr) => arr.map(r => ({ ...r, deco: s.undone[r.t] ? "line-through" : "none", color: s.undone[r.t] ? "var(--ink-3)" : "var(--ink)", act: r.act ? (s.undone[r.t] ? "" : r.act) : "", go: r.act === "Undo" ? () => this.setState(st => ({ undone: { ...st.undone, [r.t]: true } })) : r.act === "Open" ? go("files") : r.act === "Decide" ? () => this.setState({ screen: "inbox", sel: r.ref }) : () => {} }));
+    const board = { title:"Board meeting, 30 September", chips:["Transcript","1h 12m","Sam · Dana · Marcus · Priya"], meta:"Added by Sam yesterday at 6:10 PM · Research/Ingestion/Raw/board-2025-09-30.vtt",
+      progressLabel:"Read and filed", pctLabel:"Done", w:"100%", barColor:"var(--ok)", steps: stepsFor(5), ready:true, notReady:false,
+      summary:"The board approved a higher gala budget, agreed in principle to QR sign-in for volunteers, and asked for the venue insurance gap to be closed before contracts are signed.",
+      takeaways:["Gala budget cap goes from £18k to £21k to cover catering and AV.","QR sign-in from November, if Sam signs it off.","Venue insurance must be confirmed before the contract is signed (Dana).","Marcus is getting a second catering quote by Friday."],
+      overturns:"The £18,000 gala cap on Events › Gala. Ken held that edit for you because other pages depend on it.",
+      tiles:[
+        { title:"Pages updated", count:"4", icon:I("file-pen"), color:"var(--accent-ink)", empty:"", rows: rowsU([{t:"Governance › Decisions log",d:"2 decisions added · cites the note",act:"Open"},{t:"People › Marcus Reid",d:"Catering lead, quote due Fri",act:"Undo"},{t:"Volunteers › Sign-in",d:"New page · draft",act:"Undo"},{t:"Events › Insurance",d:"Escalated to Dana",act:"Open"}]) },
+        { title:"Contradictions", count:"2", icon:I("git-compare"), color:"var(--danger)", empty:"", rows: rowsU([{t:"Gala date",d:"Transcript says 14 Nov, Events › Gala says 21 Nov"},{t:"Sign-in method",d:"QR codes vs. paper sheets in Ways of Working"}]) },
+        { title:"Next steps", count:"3", icon:I("list-checks"), color:"var(--ok)", empty:"", rows: rowsU([{t:"Call Marcus about the catering quote",d:"Added to your list · Today"},{t:"Confirm venue insurance",d:"Sent to Dana's inbox"},{t:"Update the handbook sign-in section",d:"Sent to Priya's inbox"}]) },
+        { title:"Waiting on a decision", count:String(["k1","k4"].filter(id => !s.resolved[id]).length), icon:I("hourglass"), color:"var(--attn-ink)", empty: s.resolved.k1 && s.resolved.k4 ? "Nothing waits. Both were decided." : "", rows: rowsU([...(s.resolved.k1 ? [] : [{t:"Adopt QR sign-in",d:"Ruling · you're the decider",act:"Decide",ref:"k1"}]), ...(s.resolved.k4 ? [] : [{t:"Gala budget cap",d:"Held edit on Events › Gala",act:"Decide",ref:"k4"}])]) }
+      ] };
+    const town = { title:"Volunteer town hall", chips:["Recording","48 min","3 speakers so far"], meta:"Recorded by Sam today at 9:30 AM · transcribed on this computer",
+      progressLabel: pct < 70 ? "Transcribing on this computer" : "Reading the transcript", pctLabel: `${pct}%`, w: `${pct}%`, barColor:"var(--accent)", steps: stepsFor(pct < 70 ? 1 : 2), ready:false, notReady:true,
+      soFar: `So far: ${Math.round(48 * Math.min(pct, 70) / 70)} of 48 minutes transcribed, 3 people speaking.`, summary:"", takeaways:[], overturns:"",
+      tiles:[["Pages updated","file-pen","var(--accent-ink)"],["Contradictions","git-compare","var(--danger)"],["Next steps","list-checks","var(--ok)"],["Waiting on a decision","hourglass","var(--attn-ink)"]].map(([t,i,c]) => ({ title:t, count:"", icon:I(i), color:c, rows:[], empty:"Appears when Ken finishes reading." })) };
+    const src = s.ingestSel === "town" ? town : board;
+    const decIds = ["k5","k6","k1","k4"];
+    const decisions = decIds.map(id => { const it = all.find(x => x.id === id); const closed = !!s.resolved[id];
+      return { kind: it.kind, icon: it.icon, kindColor: it.kindColor, short: it.title, detail: it.body, open: !closed, closed, note: s.notes[id] || it.doneNote, bg: closed ? "var(--rail)" : "var(--surface)",
+        undo: () => this.setState(st => { const r = { ...st.resolved }; delete r[id]; return { resolved: r }; }),
+        opts: it.actions.map((l, ix) => ({ label: l, go: () => resolve(id, l === "Drop" || l === "Discard" || l.startsWith("Keep") ? l + "." : it.doneNote), bg: ix === 0 ? "var(--accent)" : "transparent", color: ix === 0 ? "var(--on-accent)" : "var(--ink-2)", border: ix === 0 ? "none" : "1px solid var(--line-strong)" })) }; });
+    const decLeft = decIds.filter(id => !s.resolved[id]).length;
+    const nsDef = [
+      { id:"n1", t:"Call Marcus about the catering quote", d:"You · Today", preset:"On your list" },
+      { id:"n2", t:"Confirm venue insurance before signing", d:"Dana · before the contract", acts:[["Make a ticket","Ticket OPS-143 made"],["Send to Dana","Sent to Dana's inbox"]] },
+      { id:"n3", t:"Update the handbook sign-in section", d:"Priya · after the ruling", acts:[["Make a ticket","Ticket OPS-144 made"],["Send to Priya","Sent to Priya's inbox"]] },
+      { id:"n4", t:"Get a second catering quote", d:"Marcus · by Friday", acts:[["Make a ticket","Ticket OPS-145 made"],["Add to my list","Added to your list"]] }
+    ];
+    const nextSteps = nsDef.map(n => { const st = n.preset || s.next[n.id]; return { t: n.t, d: n.d, open: !st, closed: !!st, status: st || "",
+      acts: (n.acts || []).map(([l, done], ix) => ({ label: l, go: () => this.setState(x => ({ next: { ...x.next, [n.id]: done } })), bg: ix === 0 ? "var(--accent)" : "transparent", color: ix === 0 ? "var(--on-accent)" : "var(--ink-2)", border: ix === 0 ? "none" : "1px solid var(--line-strong)" })) }; });
+    const pagesUpd = [["Governance › Decisions log","2 decisions added","book-open","var(--ink)"],["People › Marcus Reid","Catering lead, quote due Fri","user-round","var(--info)"],["Volunteers › Sign-in","New page · draft","file-plus","var(--accent-ink)"],["Events › Insurance","Escalated to Dana","triangle-alert","var(--danger)"]]
+      .map(([t,d,ic,c]) => { const u = !!s.undone[t]; return { t, d: u ? "Undone" : d, icon: I(ic), c, live: !u, deco: u ? "line-through" : "none", color: u ? "var(--ink-3)" : "var(--ink)", undo: () => this.setState(st => ({ undone: { ...st.undone, [t]: true } })) }; });
+    const queue = [
+      { id:"town", name:"Volunteer town hall.m4a", status:`${pct}%`, w:`${pct}%`, icon:I("audio-lines"), color:"var(--accent-ink)" },
+      { id:"venue", name:"Venue contract v2.pdf", status:"next", w:"0%", icon:I("file-type"), color:"var(--danger)" }
+    ].map(q => ({ ...q, select: q.id === "town" ? set({ ingestSel: "town" }) : () => {}, selBg: s.ingestSel === q.id ? "var(--accent-soft)" : "transparent" }));
+    const boardWaits = ["k5","k6","k1","k4"].filter(id => !s.resolved[id]).length;
+    const ingested = [
+      { id:"board", title:"Board meeting, 30 Sep", line:`Yesterday · 4 pages, 3 next steps${s.seen.board ? " · seen" : ""}`, waits: boardWaits ? `${boardWaits} wait` : "", icon:I("captions"), color:"var(--ink-2)" },
+      { id:"survey", title:"Volunteer survey results", line:"Mon · 2 pages · seen", waits:"", icon:I("file-spreadsheet"), color:"var(--ok)" },
+      { id:"policy", title:"Safeguarding policy 2025", line:"Sep 24 · 1 page · seen", waits:"", icon:I("file-text"), color:"var(--info)" }
+    ].map(x => ({ ...x, select: set({ ingestSel: "board" }), selBg: s.ingestSel === "board" && x.id === "board" ? "var(--accent-soft)" : "transparent" }));
+
+    // files tree
+    const tree = [["Handbook","folder-open",0,1],["Volunteer Handbook.docx","file-text",1,0,"var(--info)",true,true],["Ways of Working.md","book-open",1,0,"var(--ink)"],["Finance","folder",0,1],["Q4 Budget.xlsx","file-spreadsheet",1,0,"var(--ok)",false,true],["Governance","folder",0,1],["Board meeting notes.md","notebook-text",1,0,"var(--ink-2)"],["Decisions log.md","book-open",1,0,"var(--ink)",false,true],["Grants","folder",0,1],["Grant draft v4.pdf","file-type",1,0,"var(--danger)"],["Events","folder",0,1],["Research","folder",0,1]]
+      .map(([n,ic,depth,folder,c,selF,dot]) => ({ n, icon:I(ic), pad: (8 + depth * 18) + "px", color: c || "oklch(0.7 0.06 80)", bg: selF ? "var(--accent-soft)" : "transparent", weight: folder ? 600 : 400, dot: !!dot }));
+
+    // explore
+    const nodes = [["Gala 2025","50%","45%","var(--accent)",600],["Dana","28%","24%","var(--info)",500],["Marcus","73%","22%","var(--info)",500],["Priya","24%","70%","var(--info)",500],["Venue contract","78%","62%","var(--attn)",500],["Q4 Budget","56%","80%","var(--ok)",500],["Volunteer Handbook","36%","50%","var(--ok)",500],["Board meeting 30 Sep","70%","42%","var(--ink-3)",500],["Insurance","86%","82%","var(--danger)",500]].map(([n,x,y,c,w]) => ({ n, x, y, c, w }));
+    const P = n => nodes.find(x => x.n === n);
+    const edges = [["Gala 2025","Dana"],["Gala 2025","Marcus"],["Gala 2025","Venue contract"],["Gala 2025","Q4 Budget"],["Gala 2025","Board meeting 30 Sep"],["Priya","Volunteer Handbook"],["Volunteer Handbook","Gala 2025",1],["Venue contract","Insurance"],["Board meeting 30 Sep","Marcus"],["Q4 Budget","Insurance",1]].map(([a,b,d]) => ({ x1: parseFloat(P(a).x), y1: parseFloat(P(a).y), x2: parseFloat(P(b).x), y2: parseFloat(P(b).y), dash: d ? "4 4" : "none" }));
+    const catStyle = { decision:["var(--ok-soft)","var(--ok)"], people:["var(--accent-soft)","var(--accent-ink)"], vendor:["var(--attn-soft)","var(--attn-ink)"], event:["var(--panel)","var(--ink-2)"] };
+    const pendDec = ["k1","k4"].filter(id => !s.resolved[id]).length;
+    const cats = [[null,"All"],["decision","decision"],["people","people"],["vendor","vendor"],["event","event"]].map(([k,n]) => { const on = s.cat === k; return { n, count: k === "decision" ? pendDec : 0, dot: k ? catStyle[k][1] : "", go: () => this.setState({ cat: s.cat === k ? null : k }), bg: on ? "var(--ink)" : "var(--surface)", color: on ? "var(--bg)" : "var(--ink-2)", border: on ? "var(--ink)" : "var(--line-strong)" }; });
+    const evAll = [
+      ["NOV 14","event","Gala at the Corn Exchange","Events › Gala",1],["OCT 31","vendor","Venue contract signature due","Venue contract v2.pdf",1],
+      ["TODAY","","","",0,1],
+      ["OCT 1","people","Priya changed the shift-swap rule in the handbook","Volunteer Handbook.docx"],
+      ["SEP 30","decision","Gala budget cap raised to £21,000","board-2025-09-30.vtt",0,0,"k4"],["SEP 30","decision","QR sign-in for volunteers from November","board-2025-09-30.vtt",0,0,"k1"],
+      ["SEP 30","vendor","Marcus to get a second catering quote","board-2025-09-30.vtt"],["SEP 29","vendor","Venue deposit of £2,400 paid","Q4 Budget.xlsx"],
+      ["SEP 24","decision","Safeguarding policy 2025 adopted","Safeguarding policy 2025.pdf",0,0,null,"Decided by Dana"],["SEP 10","decision","Volunteer rota moves to the shared sheet","Ops standup notes.md",0,0,null,"Decided by Sam"],["SEP 12","people","Dana took over grants from Alex","Grants/Handover.md"]
+    ];
+    const filt = evAll.filter(e => e[5] || (!s.cat || e[1] === s.cat) && (s.future || !e[4] || s.cat));
+    const timeline = filt.map(([date,cat,text,src,fut,today,ref,by]) => ({ date: today ? "TODAY · OCT 1, 2026" : date, cat, text, src,
+      pending: !!ref && !s.resolved[ref], by: ref ? (s.resolved[ref] ? "Decided by Sam, today" : "") : (by || ""), go: () => this.setState({ screen: "inbox", sel: ref }),
+      dotBg: today ? "var(--accent)" : "var(--surface)", dotRing: today ? "var(--accent)" : "var(--line-strong)", halo: today ? ", 0 0 0 5px var(--accent-soft)" : "",
+      dateColor: today ? "var(--accent-ink)" : "var(--ink-3)", catBg: cat ? catStyle[cat][0] : "", catColor: cat ? catStyle[cat][1] : "" }));
+    const evShown = filt.filter(e => !e[5]).length, evTotal = evAll.filter(e => !e[5]).length;
+    const views = [["timeline","Timeline"],["map","Map"]].map(([k,l]) => { const on = s.view === k; return { label: l, count: 0, go: () => this.setState({ view: k }), bg: on ? "var(--surface)" : "transparent", shadow: on ? "var(--shadow-1)" : "none", color: on ? "var(--ink)" : "var(--ink-2)" }; });
+
+    // settings
+    const secDef = [["general","General","Appearance, digest, updates"],["team","Team library","Folders, rules, weekly check"],["sync","Sync","Git and shared drives"],["ai","AI","Claude Code and models"],["agents","Agents","MCP server for your tools"],["rules","Ingest rules","What Ken may write"]];
+    const secs = secDef.map(([k,l,sub]) => ({ label:l, sub, go: set({ sec: k }), bg: s.sec === k ? "var(--accent-soft)" : "transparent", color: s.sec === k ? "var(--accent-ink)" : "var(--ink)" }));
+    const blurbs = { sync:"Ken syncs Northside Ops through Git every 2 minutes. Conflicts go to your Inbox under Sync & files.", ai:"Ken's AI features run through Claude Code on this computer, using your own Claude account. Claude Code is installed and signed in.", agents:"The MCP server lets your own agents search and read Northside Ops. It's running on port 7811.", rules:"Human edits always win. Changes that touch more than 20 lines, or numbers other pages rely on, wait in your Inbox." };
+    const repos = [["Ops wiki","book-open","Ken's pages · the team's wiki","Everything","Up to date","var(--ok)"],["Shared drive","hard-drive","Handbook, Finance, Governance","Everything","Up to date","var(--ok)"],["Grants","folder","Applications and reports","Search only","12 queued","var(--accent-ink)"],["Receipts","folder","Scans","Search only","1 couldn't be read","var(--danger)"]].map(([n,ic,d,depth,status,sc],i) => ({ n, icon:I(ic), d, depth, status, sc, border: i ? "1px solid var(--line-soft)" : "none" }));
+
+    const chatPending = !s.resolved.k3;
+    return {
+      sideW: s.collapsed ? "64px" : "236px", expanded, nav, collapseIcon: I(s.collapsed ? "panel-left-open" : "panel-left-close"), collapseLabel: s.collapsed ? "Expand" : "Collapse",
+      toggleSide: () => this.setState(st => ({ collapsed: !st.collapsed })),
+      setBg: s.screen === "settings" ? "var(--accent-soft)" : "transparent", setColor: s.screen === "settings" ? "var(--accent-ink)" : "var(--ink-2)",
+      goSettings: go("settings"), goSettingsTeam: () => this.setState({ screen: "settings", sec: "team" }), goInbox: go("inbox"), goFiles: go("files"),
+      goIngestBoard: e => { e && e.preventDefault(); this.setState({ screen: "ingest", ingestSel: "board" }); }, goIngestTown: () => this.setState({ screen: "ingest", ingestSel: "town" }),
+      openSearch: set({ search: true }), closeSearch: set({ search: false }), stop: e => e.stopPropagation(),
+      toggleAsk: () => this.setState(st => ({ ask: !st.ask })), ask: s.ask, askBg: s.ask ? "var(--accent)" : "transparent", askColor: s.ask ? "var(--on-accent)" : "var(--accent-ink)",
+      chatPending, chatAnswered: !!s.chatAnswer, chatAnswer: s.chatAnswer || "",
+      chatOpts: ["Events › Venue","Gala › Fixed costs"].map(l => ({ label: l, go: () => { this.setState({ chatAnswer: l }); resolve("k3", "Answered in Ask Ken."); } })),
+      isHome: s.screen === "home", isInbox: s.screen === "inbox", isFiles: s.screen === "files", isIngest: s.screen === "ingest", isExplore: s.screen === "explore", isSettings: s.screen === "settings",
+      search: s.search,
+      share: () => { this.setState({ copied: true }); setTimeout(() => this.setState({ copied: false }), 1500); }, shareLabel: s.copied ? "Copied" : "Share", shareIcon: I(s.copied ? "check" : "copy"),
+      sources: ["Volunteer Handbook.docx","Q4 Budget.xlsx","board-2025-09-30.vtt"],
+      list, listSummary: `${nT} tickets · ${nK} tasks`, addTask: () => {}, recents,
+      homeNeeds, openCount, noNeeds: openCount === 0, pct, pctW: `${pct}%`, readVerb: pct < 70 ? "Transcribing" : "Reading",
+      filters, inboxOpen, inboxEmpty: inboxOpen.length === 0, inboxDone, doneCount: inboxDone.length,
+      sel, selOpen, selDone: sel && !!s.resolved[sel.id], selDoneNote: sel ? (s.notes[sel.id] || sel.doneNote) : "", selActions,
+      resolveSel: () => sel && resolve(sel.id, "Ignored for you."), undoSel: () => sel && this.setState(st => { const r = { ...st.resolved }; delete r[sel.id]; return { resolved: r }; }),
+      queue, ingested, src, decisions, decLeft, decTotal: decIds.length, nextSteps, nextCount: nsDef.length, pagesUpd, pagesCount: pagesUpd.filter(p => p.live).length, markSeen: () => this.setState(st => ({ seen: { ...st.seen, board: true } })), seenLabel: s.seen.board ? "Seen ✓" : "Mark as seen",
+      tree,
+      contraLive: !s.resolved.k2, contraFixed: !!s.resolved.k2, contraNote: s.notes.k2 && s.notes.k2.startsWith("Kept Ways") ? "Changed to match Ways of Working" : "Resolved · Ways of Working updated",
+      contraPop: s.contra && !s.resolved.k2, toggleContra: () => this.setState(st => ({ contra: !st.contra })), openContra: () => !s.resolved.k2 && this.setState({ contra: true }),
+      contraKeepThis: () => { resolve("k2", "Kept. Ken updated Ways of Working."); this.setState({ contra: false }); },
+      contraKeepOther: () => { resolve("k2", "Kept Ways of Working. Ken changed this page to 24 hours."); this.setState({ contra: false }); },
+      contraAsk: () => this.setState({ contra: false }),
+      hlBg: s.resolved.k2 ? "transparent" : "var(--attn-soft)", hlLine: s.resolved.k2 ? "transparent" : "var(--attn)", hlCursor: s.resolved.k2 ? "text" : "pointer",
+      isMap: s.view === "map", isTimeline: s.view === "timeline", views, evShown, evTotal, decFilter: s.cat === "decision",
+      exploreMax: s.view === "map" ? "1280px" : "820px", toggleFuture: () => this.setState(st => ({ future: !st.future })), futureIcon: I(s.future ? "chevron-down" : "chevron-right"),
+      nodes, edges, cats, timeline,
+      secs, secTitle: secDef.find(x => x[0] === s.sec)[1], secGeneral: s.sec === "general", secTeam: s.sec === "team", secOther: !["general","team"].includes(s.sec), secBlurb: blurbs[s.sec] || "", repos,
+      setLight: set({ dark: false }), setDark: set({ dark: true }), lightBg: s.dark ? "transparent" : "var(--surface)", darkBg: s.dark ? "var(--surface)" : "transparent",
+      results: [["Volunteer Handbook.docx","file-text","var(--info)","…Swaps need at least 48 hours' notice so the coordinator…"],["Ways of Working.md","book-open","var(--ink)","…Swaps need 24 hours' notice…"],["Board meeting notes.md","notebook-text","var(--ink-2)","…rota swaps came up under any other business…"]].map(([n,ic,c,sn]) => ({ n, icon:I(ic), c, s: sn }))
+    };
+  }
+}
+</script>
+</body>
+</html>

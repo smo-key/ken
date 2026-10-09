@@ -75,10 +75,31 @@ enum Attempt {
 /// pulling the file in the background, so that errno means "come back later".
 /// Anything else — gone, forbidden, corrupt — will not fix itself.
 fn classify(e: std::io::Error) -> Attempt {
-    if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(60) {
+    if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error().is_some_and(still_downloading) {
         Attempt::Downloading
     } else {
         Attempt::Fatal(e)
+    }
+}
+
+/// OS error codes that mean the provider is still fetching the file. macOS:
+/// `ETIMEDOUT` (60). Windows (the Cloud Files API OneDrive uses):
+/// `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` (362), `_NETWORK_UNAVAILABLE`
+/// (388), `_IN_USE` (391), `_REQUEST_ABORTED` (393) and `_REQUEST_TIMEOUT`
+/// (426). On Windows 60 is an unrelated network error, so it is fatal there.
+fn still_downloading(code: i32) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(code, 362 | 388 | 391 | 393 | 426)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        code == 60
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = code;
+        false
     }
 }
 
@@ -196,17 +217,35 @@ fn hydration_sample(path: &Path) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
     }
-    Some((allocated_bytes(&meta).min(total), total))
+    Some((allocated_bytes(path, &meta).min(total), total))
 }
 
 #[cfg(unix)]
-fn allocated_bytes(meta: &Metadata) -> u64 {
+fn allocated_bytes(_path: &Path, meta: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     meta.blocks().saturating_mul(512)
 }
 
-#[cfg(not(unix))]
-fn allocated_bytes(_meta: &Metadata) -> u64 {
+/// The bytes actually on disk. For a placeholder mid-download that's the part
+/// the provider has written so far. Asks by path, so the file is never opened
+/// (opening one could itself start a download).
+#[cfg(windows)]
+fn allocated_bytes(path: &Path, _meta: &Metadata) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut high = 0u32;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `high` is a
+    // valid out pointer.
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == INVALID_FILE_SIZE && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+        return 0;
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_bytes(_path: &Path, _meta: &Metadata) -> u64 {
     0
 }
 
@@ -353,6 +392,7 @@ mod tests {
             Attempt::Downloading
         ));
         // What macOS actually hands back: ETIMEDOUT from the File Provider.
+        #[cfg(target_os = "macos")]
         assert!(matches!(
             classify(std::io::Error::from_raw_os_error(60)),
             Attempt::Downloading
@@ -361,6 +401,22 @@ mod tests {
             classify(std::io::Error::from(std::io::ErrorKind::NotFound)),
             Attempt::Fatal(_)
         ));
+    }
+
+    /// OneDrive on Windows reports a slow or interrupted fetch through the
+    /// Cloud Files errors; 60 is not one of them there.
+    #[test]
+    #[cfg(windows)]
+    fn onedrives_cloud_file_errors_are_retryable_on_windows() {
+        for code in [362, 388, 391, 393, 426] {
+            assert!(
+                matches!(classify(std::io::Error::from_raw_os_error(code)), Attempt::Downloading),
+                "{code} should mean still downloading"
+            );
+        }
+        assert!(matches!(classify(std::io::Error::from_raw_os_error(60)), Attempt::Fatal(_)));
+        // ERROR_FILE_NOT_FOUND stays fatal.
+        assert!(matches!(classify(std::io::Error::from_raw_os_error(2)), Attempt::Fatal(_)));
     }
 
     #[test]

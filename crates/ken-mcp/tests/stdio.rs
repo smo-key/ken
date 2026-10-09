@@ -142,7 +142,8 @@ fn scoped_server_full_session() {
     let reply = client.request("ping", json!({}));
     assert_eq!(reply["result"], json!({}));
 
-    // tools/list → exactly our four tools.
+    // tools/list → exactly the base tools: code navigation, search, the graph,
+    // memory, Your day's tasks and tickets, and the team inbox.
     let reply = client.request("tools/list", json!({}));
     let names: Vec<&str> = reply["result"]["tools"]
         .as_array()
@@ -152,7 +153,7 @@ fn scoped_server_full_session() {
         .collect();
     assert_eq!(
         names,
-        ["search_knowledge", "read_document", "list_documents", "list_projects"]
+        ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list", "family_list", "family_inbox", "family_send"]
     );
 
     // search finds seeded content, marks stripped to bold.

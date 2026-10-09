@@ -283,28 +283,56 @@ fn normalize_stem(stem: &str) -> String {
 
 // ---------- availability gating ----------
 
-/// The user-facing reason transcription can't run, or `None` when it can. The
-/// presence checks are parameters so the gate is testable without the binaries.
+/// The user-facing reason a recording at `path` can't be transcribed, or
+/// `None` when it can. ffmpeg is needed only for what Ken cannot decode
+/// itself ([`decodes_in_process`]). The presence checks are parameters so
+/// the gate is testable without the binaries.
 pub fn transcription_blocker(
+    path: &Path,
     ffmpeg_present: bool,
     model_present: bool,
-    model_path: &Path,
 ) -> Option<String> {
-    match (ffmpeg_present, model_present) {
+    let ffmpeg_ok = ffmpeg_present || decodes_in_process(path);
+    match (ffmpeg_ok, model_present) {
         (true, true) => None,
-        (false, true) => Some(FFMPEG_HELP.to_string()),
-        (true, false) => Some(model_help(model_path)),
-        (false, false) => Some(format!("{FFMPEG_HELP}\n\n{}", model_help(model_path))),
+        (false, true) => Some(ffmpeg_help().to_string()),
+        (true, false) => Some(MODEL_HELP.to_string()),
+        (false, false) => Some(format!("{}\n\n{MODEL_HELP}", ffmpeg_help())),
     }
 }
 
-const FFMPEG_HELP: &str = "ffmpeg isn't installed — Ken needs it to pull audio out of a video before transcribing. Install it with Homebrew (`brew install ffmpeg`) or from https://ffmpeg.org, then try again.";
+/// Why a recording waiting in an inbox cannot be read yet, or `None` when it
+/// can: no transcription model, or ffmpeg missing for a format Ken cannot
+/// decode itself.
+pub fn waiting_reason(path: &Path, ffmpeg_present: bool, model_present: bool) -> Option<String> {
+    if !model_present {
+        return Some("Install a transcription model in Settings › AI to read this recording.".into());
+    }
+    if !ffmpeg_present && !decodes_in_process(path) {
+        return Some(ffmpeg_help().to_string());
+    }
+    None
+}
 
-fn model_help(model_path: &Path) -> String {
-    format!(
-        "No speech-to-text model found. Download a Whisper model — the base English model works well — and place it at:\n\n  {}\n\nGet ggml-base.en.bin from https://huggingface.co/ggerganov/whisper.cpp (the `ggml-base.en.bin` file), then try again.",
-        model_path.display()
-    )
+const MODEL_HELP: &str =
+    "No transcription model is installed. Install one in Settings › AI, then try again.";
+
+/// How to install ffmpeg here. Ken decodes WAV, MP3, M4A, FLAC, Ogg and the
+/// audio of MP4 and MOV itself; ffmpeg is only for the rest.
+pub fn ffmpeg_help() -> &'static str {
+    if cfg!(windows) {
+        "Ken needs ffmpeg to read the audio of this file (WebM, MKV, AVI or Opus). Install it with `winget install Gyan.FFmpeg`, then try again."
+    } else if cfg!(target_os = "macos") {
+        "Ken needs ffmpeg to read the audio of this file (WebM, MKV, AVI or Opus). Install it with `brew install ffmpeg`, then try again."
+    } else {
+        "Ken needs ffmpeg to read the audio of this file (WebM, MKV, AVI or Opus). Install it from your package manager, then try again."
+    }
+}
+
+/// Whether Ken reads this file's audio itself (symphonia), without ffmpeg.
+pub fn decodes_in_process(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "mp4" | "mov" | "m4v")
 }
 
 /// Where Ken keeps its Whisper model, under the app data dir.
@@ -315,24 +343,71 @@ pub fn model_path(base_dir: &Path) -> PathBuf {
 /// Detect a system `ffmpeg`, mirroring how the CLI runner finds `claude`:
 /// PATH first, then the install locations a GUI app's slim PATH misses.
 pub fn discover_ffmpeg() -> Option<PathBuf> {
+    let names = ffmpeg_names();
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("ffmpeg");
-            if crate::runner::is_executable(&candidate) {
-                return Some(candidate);
+            for name in &names {
+                let candidate = dir.join(name);
+                if crate::runner::is_executable(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
     }
-    for candidate in [
-        PathBuf::from("/opt/homebrew/bin/ffmpeg"),
-        PathBuf::from("/usr/local/bin/ffmpeg"),
-        PathBuf::from("/usr/bin/ffmpeg"),
-    ] {
-        if crate::runner::is_executable(&candidate) {
-            return Some(candidate);
-        }
+    ffmpeg_fallbacks().into_iter().find(|c| crate::runner::is_executable(c))
+}
+
+/// The file names `ffmpeg` goes by on PATH: on Windows each executable
+/// extension PATHEXT lists (`.exe`, `.com`; a `.cmd` or `.bat` shim would
+/// need a shell, so those are left out), elsewhere the bare name.
+fn ffmpeg_names() -> Vec<String> {
+    if !cfg!(windows) {
+        return vec!["ffmpeg".into()];
     }
-    None
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE".into());
+    let mut exts: Vec<String> = pathext
+        .split(';')
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| e == ".exe" || e == ".com")
+        .collect();
+    if !exts.contains(&".exe".to_string()) {
+        exts.push(".exe".into());
+    }
+    exts.sort_by_key(|e| e != ".exe");
+    exts.into_iter().map(|e| format!("ffmpeg{e}")).collect()
+}
+
+/// Where package managers put ffmpeg when PATH does not say: winget's links
+/// and packages, Chocolatey and Scoop on Windows; Homebrew and the system on
+/// macOS and Linux.
+fn ffmpeg_fallbacks() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            let winget = local.join("Microsoft").join("WinGet");
+            out.push(winget.join("Links").join("ffmpeg.exe"));
+            // `winget install Gyan.FFmpeg` without its link: the package's
+            // own `<build>/bin/ffmpeg.exe`.
+            for pkg in std::fs::read_dir(winget.join("Packages")).into_iter().flatten().flatten() {
+                if !pkg.file_name().to_string_lossy().starts_with("Gyan.FFmpeg") {
+                    continue;
+                }
+                for build in std::fs::read_dir(pkg.path()).into_iter().flatten().flatten() {
+                    out.push(build.path().join("bin").join("ffmpeg.exe"));
+                }
+            }
+        }
+        let program_data = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        out.push(program_data.join("chocolatey").join("bin").join("ffmpeg.exe"));
+        if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            out.push(home.join("scoop").join("shims").join("ffmpeg.exe"));
+        }
+    } else {
+        out.push(PathBuf::from("/opt/homebrew/bin/ffmpeg"));
+        out.push(PathBuf::from("/usr/local/bin/ffmpeg"));
+        out.push(PathBuf::from("/usr/bin/ffmpeg"));
+    }
+    out
 }
 
 // ---------- filesystem resolution ----------
@@ -470,10 +545,98 @@ fn rel_of(path: &Path, project_root: &Path) -> Option<String> {
 
 // ---------- ffmpeg + Whisper (thin, untested shells) ----------
 
+/// Decode a recording's audio to 16 kHz mono `f32` PCM, what Whisper
+/// expects: in-process first (symphonia: WAV, MP3, AAC/M4A, the audio of
+/// MP4/MOV, FLAC, Ogg Vorbis), then ffmpeg when it is installed and the file
+/// is one symphonia cannot read.
+pub fn decode_audio(path: &Path, ffmpeg: Option<&Path>) -> Result<Vec<f32>> {
+    match decode_in_process(path) {
+        Ok(samples) => Ok(samples),
+        Err(own) => match ffmpeg {
+            Some(ffmpeg) => extract_audio_f32(ffmpeg, path),
+            None if decodes_in_process(path) => Err(own),
+            None => Err(Error::Other(format!("Ken could not read this file's audio itself ({own}). {}", ffmpeg_help()))),
+        },
+    }
+}
+
+/// [`decode_audio`] through symphonia only: the first track it can decode,
+/// downmixed and resampled to 16 kHz.
+pub fn decode_in_process(path: &Path) -> Result<Vec<f32>> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as DecodeError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let fail = |e: DecodeError| Error::Other(format!("could not read the audio: {e}"));
+    let file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, stream, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(fail)?;
+    let mut format = probed.format;
+    // The default track when it decodes, else the first one that does (a
+    // video's picture track does not).
+    let codecs = symphonia::default::get_codecs();
+    let mut candidates: Vec<&symphonia::core::formats::Track> = format.default_track().into_iter().collect();
+    candidates.extend(format.tracks().iter());
+    let (track_id, mut decoder) = candidates
+        .into_iter()
+        .filter(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .find_map(|t| codecs.make(&t.codec_params, &DecoderOptions::default()).ok().map(|d| (t.id, d)))
+        .ok_or_else(|| Error::Other("this file has no audio Ken can read".into()))?;
+
+    let mut out = Vec::new();
+    let mut resampler: Option<(u32, crate::record::LinearResampler)> = None;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(DecodeError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(DecodeError::ResetRequired) => break,
+            Err(e) => return Err(fail(e)),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            // One bad frame is skipped, as players do.
+            Err(DecodeError::DecodeError(_)) => continue,
+            Err(e) => return Err(fail(e)),
+        };
+        let spec = *decoded.spec();
+        let channels = spec.channels.count().max(1) as u16;
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        let mono = crate::record::downmix_to_mono(buf.samples(), channels);
+        if resampler.as_ref().is_none_or(|(rate, _)| *rate != spec.rate) {
+            if let Some((_, mut old)) = resampler.take() {
+                out.extend(old.finish());
+            }
+            resampler = Some((spec.rate, crate::record::LinearResampler::new(spec.rate, crate::record::TARGET_RATE)));
+        }
+        if let Some((_, r)) = resampler.as_mut() {
+            out.extend(r.process(&mono));
+        }
+    }
+    if let Some((_, mut r)) = resampler {
+        out.extend(r.finish());
+    }
+    Ok(out)
+}
+
 /// Decode a video's audio to 16 kHz mono `f32` PCM via ffmpeg — exactly what
 /// Whisper expects. Streams raw `f32le` on stdout so no WAV parser is needed.
 pub fn extract_audio_f32(ffmpeg: &Path, video: &Path) -> Result<Vec<f32>> {
-    let output = std::process::Command::new(ffmpeg)
+    let mut cmd = std::process::Command::new(ffmpeg);
+    let output = crate::proc::quiet(&mut cmd)
         .args(["-nostdin", "-i"])
         .arg(video)
         .args(["-ar", "16000", "-ac", "1", "-f", "f32le", "-"])
@@ -519,6 +682,17 @@ pub fn scale_channel_pct(idx: usize, count: usize, pct: u8) -> u8 {
     (((idx.min(count - 1) * 100) + pct.min(100) as usize) / count).min(100) as u8
 }
 
+/// The language Whisper is told: "en" for an English-only model file
+/// (`ggml-base.en.bin`, `ggml-small.en-q5_1.bin`), "auto" otherwise.
+pub fn whisper_language(model: &Path) -> &'static str {
+    let name = model.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if name.contains(".en.") || name.contains(".en-") {
+        "en"
+    } else {
+        "auto"
+    }
+}
+
 /// Transcribe 16 kHz mono samples to timed cues with Whisper. Compiled only
 /// with the `whisper` feature; the fallback returns an actionable error so the
 /// rest of Ken builds without the native toolchain.
@@ -532,14 +706,33 @@ pub fn transcribe_with_progress(
 
     // whisper-rs 0.16 accepts any `AsRef<Path>`, so the model path passes through
     // directly (no UTF-8 round-trip needed).
-    let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
-        .map_err(|e| Error::Other(format!("couldn't load the Whisper model: {e}")))?;
+    // The graphics card when it is on, with flash attention; a model the
+    // card cannot take is loaded again on the CPU (see `compute`).
+    let load = |gpu: bool| {
+        let mut cp = WhisperContextParameters::default();
+        cp.use_gpu(gpu).flash_attn(gpu);
+        WhisperContext::new_with_params(model, cp)
+    };
+    let gpu = crate::compute::use_gpu();
+    let ctx = match load(gpu) {
+        Ok(c) => Ok(c),
+        Err(e) if gpu => {
+            eprintln!("Whisper on the graphics card failed ({e}); loading it on the CPU");
+            load(false)
+        }
+        Err(e) => Err(e),
+    }
+    .map_err(|e| Error::Other(format!("couldn't load the Whisper model: {e}")))?;
     let mut state = ctx
         .create_state()
         .map_err(|e| Error::Other(format!("Whisper init failed: {e}")))?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("en"));
+    params.set_n_threads(crate::compute::threads());
+    // An English-only model (`*.en*`) is told the language; a multilingual
+    // one detects it, so a meeting in another language is not forced into
+    // English.
+    params.set_language(Some(whisper_language(model)));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -595,26 +788,29 @@ pub fn transcribe(model: &Path, samples: &[f32]) -> Result<Vec<Cue>> {
     transcribe_with_progress(model, samples, noop_progress())
 }
 
-/// Full pipeline: video → ffmpeg audio → Whisper → WebVTT. Blocking; call from
-/// a worker thread.
-pub fn generate_vtt(ffmpeg: &Path, model: &Path, video: &Path) -> Result<String> {
+/// Full pipeline: recording → 16 kHz audio ([`decode_audio`]) → Whisper →
+/// WebVTT. Blocking; call from a worker thread.
+pub fn generate_vtt(ffmpeg: Option<&Path>, model: &Path, video: &Path) -> Result<String> {
     generate_vtt_with_progress(ffmpeg, model, video, noop_progress())
 }
 
-/// [`generate_vtt`] reporting phase progress: `Extracting` before ffmpeg runs,
-/// then Whisper's percent stream.
+/// [`generate_vtt`] reporting phase progress: `Extracting` while the audio is
+/// decoded, then Whisper's percent stream.
 pub fn generate_vtt_with_progress(
-    ffmpeg: &Path,
+    ffmpeg: Option<&Path>,
     model: &Path,
     video: &Path,
     on_progress: ProgressFn,
 ) -> Result<String> {
     on_progress(TranscriptPhase::Extracting);
-    let samples = extract_audio_f32(ffmpeg, video)?;
+    let samples = decode_audio(video, ffmpeg)?;
     if samples.is_empty() {
-        return Err(Error::Other("this video has no audio to transcribe".into()));
+        return Err(Error::Other("this recording has no audio to transcribe".into()));
     }
     let cues = transcribe_with_progress(model, &samples, on_progress)?;
+    if cues.iter().all(|c| c.text.trim().is_empty()) {
+        return Err(Error::Other("nothing was said in this recording that Whisper could hear".into()));
+    }
     Ok(emit_webvtt(&cues))
 }
 
@@ -622,7 +818,7 @@ pub fn generate_vtt_with_progress(
 /// path written. The caller re-indexes the video so its transcript becomes
 /// searchable and the `index-updated` event fires.
 pub fn generate_and_cache(
-    ffmpeg: &Path,
+    ffmpeg: Option<&Path>,
     model: &Path,
     project_root: &Path,
     video_rel: &str,
@@ -632,7 +828,7 @@ pub fn generate_and_cache(
 
 /// [`generate_and_cache`] with a progress sink (see [`TranscriptPhase`]).
 pub fn generate_and_cache_with_progress(
-    ffmpeg: &Path,
+    ffmpeg: Option<&Path>,
     model: &Path,
     project_root: &Path,
     video_rel: &str,
@@ -647,9 +843,32 @@ pub fn generate_and_cache_with_progress(
     Ok(out)
 }
 
+/// Whether a recording at `rel` (inside `project_root`) has a transcript
+/// already: adjacent, or generated into the cache.
+pub fn has_transcript(project_root: &Path, rel: &str) -> bool {
+    resolve_transcript(&project_root.join(rel), project_root).is_some()
+}
+
+/// Carry a generated transcript along when its recording moves inside the
+/// project (the cache is keyed by path). A no-op when there is none.
+pub fn move_cached(project_root: &Path, from_rel: &str, to_rel: &str) {
+    let dir = cache_dir(project_root);
+    let from = dir.join(cache_name(from_rel));
+    if from.is_file() {
+        let _ = std::fs::copy(&from, dir.join(cache_name(to_rel)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn english_models_are_told_english_and_the_others_detect() {
+        assert_eq!(whisper_language(Path::new("ggml-base.en.bin")), "en");
+        assert_eq!(whisper_language(Path::new("ggml-small.en-q5_1.bin")), "en");
+        assert_eq!(whisper_language(Path::new("ggml-large-v3-turbo-q5_0.bin")), "auto");
+    }
 
     #[test]
     fn timestamp_formatting() {
@@ -770,20 +989,89 @@ mod tests {
 
     #[test]
     fn availability_gate_reports_each_missing_prerequisite() {
-        let model = Path::new("/data/ken/whisper/ggml-base.en.bin");
-        assert_eq!(transcription_blocker(true, true, model), None);
+        let webm = Path::new("calls/sync.webm");
+        let mp4 = Path::new("calls/sync.mp4");
+        assert_eq!(transcription_blocker(webm, true, true), None);
+        // Ken decodes an mp4's audio itself: no ffmpeg needed.
+        assert_eq!(transcription_blocker(mp4, false, true), None);
 
-        let ffmpeg_only = transcription_blocker(false, true, model).unwrap();
+        let ffmpeg_only = transcription_blocker(webm, false, true).unwrap();
         assert!(ffmpeg_only.contains("ffmpeg"));
-        assert!(!ffmpeg_only.contains("ggml-base.en.bin"));
+        assert!(!ffmpeg_only.contains("transcription model"));
 
-        let model_only = transcription_blocker(true, false, model).unwrap();
-        assert!(model_only.contains("ggml-base.en.bin"));
-        assert!(model_only.contains("/data/ken/whisper/ggml-base.en.bin"));
+        let model_only = transcription_blocker(mp4, false, false).unwrap();
+        assert!(model_only.contains("transcription model"));
+        assert!(!model_only.contains("ffmpeg"));
 
-        let both = transcription_blocker(false, false, model).unwrap();
+        let both = transcription_blocker(webm, false, false).unwrap();
         assert!(both.contains("ffmpeg"));
-        assert!(both.contains("ggml-base.en.bin"));
+        assert!(both.contains("transcription model"));
+    }
+
+    #[test]
+    fn a_recording_waits_for_the_model_and_for_ffmpeg_only_when_needed() {
+        let m4a = Path::new("Raw/standup.m4a");
+        let mkv = Path::new("Raw/standup.mkv");
+        assert!(waiting_reason(m4a, false, false).unwrap().contains("Install a transcription model in Settings"));
+        assert_eq!(waiting_reason(m4a, false, true), None);
+        assert!(waiting_reason(mkv, false, true).unwrap().contains("ffmpeg"));
+        assert_eq!(waiting_reason(mkv, true, true), None);
+        let help = ffmpeg_help();
+        if cfg!(windows) {
+            assert!(help.contains("winget install Gyan.FFmpeg"));
+        } else if cfg!(target_os = "macos") {
+            assert!(help.contains("brew install ffmpeg"));
+        }
+    }
+
+    #[test]
+    fn ffmpeg_is_looked_for_under_its_windows_name() {
+        let names = ffmpeg_names();
+        if cfg!(windows) {
+            assert_eq!(names.first().map(String::as_str), Some("ffmpeg.exe"));
+            assert!(names.iter().all(|n| !n.ends_with(".cmd") && !n.ends_with(".bat")));
+            assert!(ffmpeg_fallbacks().iter().any(|p| p.ends_with("WinGet/Links/ffmpeg.exe") || p.ends_with(r"WinGet\Links\ffmpeg.exe")));
+        } else {
+            assert_eq!(names, vec!["ffmpeg".to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_wav_is_decoded_in_process_to_16k_mono() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        // One second of a 440 Hz tone, 44.1 kHz stereo, 16-bit.
+        let spec = hound::WavSpec { channels: 2, sample_rate: 44_100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..44_100 {
+            let s = ((i as f32 * 440.0 * std::f32::consts::TAU / 44_100.0).sin() * 0.5 * 32767.0) as i16;
+            w.write_sample(s).unwrap();
+            w.write_sample(s).unwrap();
+        }
+        w.finalize().unwrap();
+        let samples = decode_audio(&path, None).unwrap();
+        assert!((samples.len() as i64 - 16_000).abs() < 50, "len {}", samples.len());
+        let peak = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!((0.4..0.6).contains(&peak), "peak {peak}");
+    }
+
+    #[test]
+    fn a_file_with_no_audio_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-audio.mp3");
+        std::fs::write(&path, b"this is not an mp3 at all").unwrap();
+        assert!(decode_audio(&path, None).is_err());
+    }
+
+    #[test]
+    fn a_generated_transcript_follows_its_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(cache_dir(root)).unwrap();
+        std::fs::write(cache_dir(root).join(cache_name("Raw/a.m4a")), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n").unwrap();
+        assert!(!has_transcript(root, "Filed/a.m4a"));
+        move_cached(root, "Raw/a.m4a", "Filed/a.m4a");
+        assert!(has_transcript(root, "Filed/a.m4a"));
     }
 
     #[test]
@@ -793,6 +1081,7 @@ mod tests {
             name: "t".into(),
             id: uuid::Uuid::new_v4(),
             excluded: Vec::new(),
+            features: serde_json::Map::new(),
             extra: serde_json::Map::new(),
         };
         let project = Project { root: PathBuf::from("/tmp/x"), config: config.clone() };

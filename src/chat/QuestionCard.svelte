@@ -124,7 +124,7 @@
 
     {#if answered}
       <div class="summary">
-        {#each answerSummary(payload) as line (line)}
+        {#each answerSummary(payload) as line}
           <div>{line}</div>
         {/each}
       </div>

@@ -13,6 +13,19 @@ thiserror.workspace = true
 anyhow = "1"
 uuid.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
+# Vector search (KNN) via SQLite's vec0 virtual table, statically linked
+# alongside the bundled SQLite/FTS5. Pinned exactly (=0.1.9): this is a 0.1.x
+# crate that bundles the vec0 C amalgamation and builds it through `cc`, so a
+# patch bump can shift both the C sources and the on-disk vec0 format — re-run
+# spikes/S1 on any change. Registered at connection-open via
+# `sqlite3_auto_extension`; a runtime `vec_version()` probe drives graceful
+# degradation to FTS5-only if registration ever fails.
+sqlite-vec = "=0.1.9"
+# Fast, stable, non-cryptographic hash for chunk `content_hash` values (change
+# detection during incremental re-embedding) and for FakeEmbedder's
+# deterministic test vectors. xxHash is stable across runs/platforms, which the
+# chunker's hash-stability test relies on.
+twox-hash = "2"
 notify = "8"
 ignore = "0.4"
 calamine = "0.31"
@@ -30,6 +43,10 @@ tiny_http = "0.12"
 similar = "2"
 cpal = "0.18"
 hound = "3.5"
+# Audio decoding for transcription, in-process and pure Rust: WAV, MP3,
+# AAC/M4A and the audio track of MP4/MOV, FLAC, Ogg Vorbis. ffmpeg is only
+# the fallback, for what this cannot read (Opus in WebM/MKV, AVI).
+symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3", "alac"] }
 # Blocking, streamed HTTPS GET for the in-app model downloader — the only
 # network the app performs (a deliberate, user-initiated fetch). ureq is a tiny
 # blocking client using rustls (no OpenSSL/native-tls); default features would
@@ -41,6 +58,23 @@ hound = "3.5"
 # proxy (which re-signs certs with a private root installed in the OS keychain)
 # fail the download with `invalid peer certificate: UnknownIssuer`.
 ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
+# Symbol-name extraction for FTS index augmentation (semantic-index task
+# 1.10, S7b Condition A): a small language-agnostic regex over common
+# declaration keywords (fn/struct/class/def/...), run once per chunk at
+# index time. Not on any hot per-keystroke path.
+regex = "1"
+# The code map (codemap.rs): definitions, references and imports, parsed with
+# tree-sitter and each grammar's own tags query, as GitHub's code navigation
+# does. Local, no model; each grammar builds its C parser through `cc`.
+tree-sitter = "0.27"
+tree-sitter-tags = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c-sharp = "0.23"
 [features]
 default = ["whisper", "local-llm"]
 whisper = ["dep:whisper-rs"]
@@ -62,17 +96,36 @@ local-llm = ["dep:llama-cpp-2"]
 #   Windows -> vulkan (needs the Vulkan SDK's glslc at build time; at runtime
 #              vulkan-1.dll ships with GPU drivers)
 #   other   -> CPU-only (what Linux CI exercises)
+# `common` on every platform: llama.cpp's grammar sampler, which holds
+# entity extraction to valid JSON (local_llm::JSON_GRAMMAR).
 [target.'cfg(windows)'.dependencies]
 whisper-rs = { version = "0.16", features = ["vulkan"], optional = true }
-llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["vulkan"], optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["vulkan", "common"], optional = true }
+# Job objects, so cancelling a `claude.cmd` session ends node too (proc::track),
+# on-disk size of a downloading cloud file (cloud::allocated_bytes), and the
+# microphone privacy switch Record reads (record::win, the registry).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading"] }
+# OCR (module `ocr::win`) on what Windows ships: Windows.Media.Ocr for the
+# text, Windows.Graphics.Imaging to decode images, Windows.Data.Pdf to render
+# scanned pages. The same `windows` release Tauri's WebView2 bindings use, so
+# it adds features, not a second copy.
+windows = { version = "0.61", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+] }
 
 [target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
 whisper-rs = { version = "0.16", optional = true }
-llama-cpp-2 = { version = "=0.1.151", default-features = false, optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["common"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"], optional = true }
-llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["metal"], optional = true }
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["metal", "common"], optional = true }
 screencapturekit = "9.0.1"
 objc2 = "0.6"
 objc2-av-foundation = "0.3"

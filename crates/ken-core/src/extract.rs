@@ -67,11 +67,21 @@ impl FileKind {
             // transcript is editable in the UI and indexes its own words. (An
             // adjacent-to-video `.vtt` is still pulled in as that video's
             // transcript by `crate::transcript`; see the note in `extract`.)
-            "txt" | "text" | "log" | "vtt" => FileKind::Txt,
+            "txt" | "text" | "log" | "vtt" | "srt" => FileKind::Txt,
             "rs" | "ts" | "js" | "jsx" | "tsx" | "svelte" | "py" | "rb" | "go" | "java"
             | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "swift" | "kt" | "sh" | "bash"
             | "zsh" | "sql" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "html"
             | "htm" | "css" | "scss" | "xml" | "csv" => FileKind::Code,
+            // Build scripts, module variants, Vue and game-UI markup were read
+            // as binary, so their words were never searchable: on 2026-10-06
+            // "how is the mod packaged" missed build.gradle.kts and "one party
+            // member's row on the HUD" missed PartyMemberChip.ui (Shattered
+            // Realms has 129 .ui and 43 .mjs files). Named one by one rather
+            // than "any file without NUL bytes is text", which would also read
+            // the 12,000 .blockyanim/.blockymodel/.particle* asset files that
+            // are meant to stay name-only. `.env.example` is still a secret
+            // name (kenignore), so it is not here.
+            "kts" | "gradle" | "properties" | "mjs" | "cjs" | "mts" | "cts" | "vue" | "ui" | "lang" => FileKind::Code,
             "docx" => FileKind::Docx,
             "xlsx" | "xlsm" => FileKind::Xlsx,
             "pptx" => FileKind::Pptx,
@@ -79,7 +89,11 @@ impl FileKind {
             "ipynb" => FileKind::Ipynb,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" | "tif"
             | "svg" => FileKind::Image,
-            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => FileKind::Video,
+            // A recording, with or without pictures: its content is its
+            // transcript (`crate::transcript`), so audio files are this kind
+            // too.
+            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg"
+            | "oga" | "opus" | "wma" => FileKind::Video,
             "url" => FileKind::Url,
             "drawio" => FileKind::Drawio,
             _ => FileKind::Binary,
@@ -138,10 +152,109 @@ pub fn extract(path: &Path) -> Result<Extracted> {
 
 fn extract_plain(path: &Path) -> Result<Extracted> {
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-    Ok(Extracted {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
-        title: None,
-    })
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let is_html = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+    if is_html {
+        return Ok(html_text(&text));
+    }
+    Ok(Extracted { text, title: None })
+}
+
+/// The text a person reads on an HTML page, and its `<title>`. A page saved
+/// from a browser carries its scripts, styles and images inline: one 1.3 MB
+/// talk page held 5,000 characters of words. Searching and ingest want the
+/// words.
+pub fn html_text(html: &str) -> Extracted {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RES: OnceLock<(Vec<Regex>, Regex, Regex, Regex, Regex)> = OnceLock::new();
+    let (drop, title_re, block, tag, blank) = RES.get_or_init(|| {
+        let drop = ["script", "style", "svg", "noscript", "template", "head"]
+            .iter()
+            .map(|t| Regex::new(&format!(r"(?is)<{t}\b[^>]*>.*?</{t}\s*>")).unwrap())
+            .chain(std::iter::once(Regex::new(r"(?s)<!--.*?-->").unwrap()))
+            .collect();
+        (
+            drop,
+            Regex::new(r"(?is)<title[^>]*>(.*?)</title\s*>").unwrap(),
+            Regex::new(r"(?i)</?(p|div|br|li|h[1-6]|tr|td|th|section|article|header|footer|main|nav|aside|ul|ol|table|blockquote|pre|figure|figcaption|dt|dd)\b[^>]*>").unwrap(),
+            Regex::new(r"(?s)<[^>]*>").unwrap(),
+            Regex::new(r"\n{3,}").unwrap(),
+        )
+    });
+    let title = title_re
+        .captures(html)
+        .map(|c| decode_entities(c[1].trim()))
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty());
+    let mut s = html.to_string();
+    for re in drop {
+        s = re.replace_all(&s, " ").into_owned();
+    }
+    let s = block.replace_all(&s, "\n");
+    // Inline tags go without a space: `<b>faster</b>,` reads "faster,".
+    let s = tag.replace_all(&s, "");
+    let s = decode_entities(&s);
+    let lines: Vec<String> = s.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    let text = blank.replace_all(lines.join("\n").trim(), "\n\n").into_owned();
+    Extracted { text, title }
+}
+
+/// The HTML entities that show up in prose, and numeric ones.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let end = after.find(';').filter(|e| *e <= 10);
+        let decoded = end.and_then(|e| {
+            let name = &after[..e];
+            let ch = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                "nbsp" => Some(' '),
+                "ndash" => Some('–'),
+                "mdash" => Some('—'),
+                "lsquo" => Some('‘'),
+                "rsquo" => Some('’'),
+                "ldquo" => Some('“'),
+                "rdquo" => Some('”'),
+                "hellip" => Some('…'),
+                "middot" => Some('·'),
+                "bull" => Some('•'),
+                "copy" => Some('©'),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            ch.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &after[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A `.url` shortcut's searchable content is the URL it points at — the rest of
@@ -340,6 +453,52 @@ fn extract_image(path: &Path) -> Result<Extracted> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_keeps_the_words_and_drops_scripts_styles_and_inline_images() {
+        let page = format!(
+            "<!doctype html><html><head><title>AI First Development &ndash; Optimize Yourself</title>\
+             <style>body {{ color: red }}</style><script>var big = \"{}\";</script></head>\
+             <body><!-- nav --><h1>Where to Start</h1><p>The goal is not only to develop <b>faster</b>, \
+             but&nbsp;also to raise the quality.</p><img src=\"data:image/png;base64,{}\">\
+             <svg><path d=\"M0 0\"/></svg><ul><li>Skills</li><li>Tools &amp; more</li></ul></body></html>",
+            "x".repeat(200_000),
+            "A".repeat(200_000),
+        );
+        let got = html_text(&page);
+        assert_eq!(got.title.as_deref(), Some("AI First Development – Optimize Yourself"));
+        assert!(got.text.contains("Where to Start"));
+        assert!(got.text.contains("The goal is not only to develop faster, but also to raise the quality."));
+        assert!(got.text.contains("Skills\n") && got.text.contains("Tools & more"));
+        assert!(!got.text.contains("xxxx") && !got.text.contains("AAAA") && !got.text.contains("color"));
+        assert!(got.text.len() < 300, "{} chars", got.text.len());
+    }
+
+    #[test]
+    fn html_files_extract_as_text() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("talk.html");
+        fs::write(&p, "<html><head><title>T</title></head><body><p>Hello <i>there</i></p></body></html>").unwrap();
+        let got = extract(&p).unwrap();
+        assert_eq!(got.text, "Hello there");
+        assert_eq!(got.title.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn entities_decode_and_a_bare_ampersand_stays() {
+        assert_eq!(decode_entities("a &amp; b &#8212; c &#x2019; d & e &unknown; f"), "a & b — c ’ d & e &unknown; f");
+    }
+
+    /// The real page that hit the prompt limit: `KEN_HTML_SAMPLE=<path>
+    /// cargo test -- --ignored html_sample`.
+    #[test]
+    #[ignore]
+    fn html_sample() {
+        let Ok(p) = std::env::var("KEN_HTML_SAMPLE") else { return };
+        let got = extract(Path::new(&p)).unwrap();
+        println!("title: {:?}\nchars: {}\n{}", got.title, got.text.len(), &got.text[..got.text.len().min(600)]);
+        assert!(got.text.len() < 50_000);
+    }
     use std::path::PathBuf;
 
     fn fixture(rel: &str) -> PathBuf {
@@ -357,11 +516,41 @@ mod tests {
         assert!(FileKind::Ipynb.has_content());
         assert_eq!(FileKind::from_path(Path::new("x.unknown")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("noext")), FileKind::Binary);
+        assert_eq!(FileKind::from_path(Path::new("call.srt")), FileKind::Txt);
+    }
+
+    #[test]
+    fn build_scripts_and_ui_markup_are_text() {
+        for name in [
+            "build.gradle.kts",
+            "settings.gradle",
+            "gradle.properties",
+            "scripts/gen.mjs",
+            "lib/x.cjs",
+            "src/a.mts",
+            "src/a.cts",
+            "App.vue",
+            "Common/UI/Custom/Party/PartyMemberChip.ui",
+            "Server/Languages/en-US/server.lang",
+            "Cargo.toml",
+            "setup.cfg",
+            "php.ini",
+        ] {
+            assert_eq!(FileKind::from_path(Path::new(name)), FileKind::Code, "{name}");
+        }
+        // Engine asset formats stay name-only.
+        for name in ["Sword.blockymodel", "Swing.blockyanim", "Spark.particlespawner"] {
+            assert_eq!(FileKind::from_path(Path::new(name)), FileKind::Binary, "{name}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("PartyMemberChip.ui");
+        std::fs::write(&path, "Group #NameCell { Anchor: (Width: 168); }\n").unwrap();
+        assert!(extract(&path).unwrap().text.contains("NameCell"));
     }
 
     #[test]
     fn video_kind_mapping() {
-        for ext in ["mp4", "mov", "m4v", "webm", "mkv", "avi", "MP4", "MoV"] {
+        for ext in ["mp4", "mov", "m4v", "webm", "mkv", "avi", "MP4", "MoV", "wav", "mp3", "m4a", "flac", "ogg"] {
             let name = format!("clips/demo.{ext}");
             assert_eq!(
                 FileKind::from_path(Path::new(&name)),

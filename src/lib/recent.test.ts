@@ -4,6 +4,7 @@ import {
   fallbackRecents,
   homeRecents,
   loadRecents,
+  mergeTeamRecents,
   recentlyOpened,
   recordRecent,
   saveRecents,
@@ -123,5 +124,28 @@ describe("recents persistence", () => {
     expect(loadRecents("p1")).toEqual([]);
     localStorage.setItem("ken.files.recent.p1", '[{"path":1},{"path":"a.md","at":3}]');
     expect(loadRecents("p1")).toEqual([{ path: "a.md", at: 3 }]);
+  });
+});
+
+describe("mergeTeamRecents", () => {
+  it("merges every repo's history, newest first, up to the limit", () => {
+    const out = mergeTeamRecents(
+      [
+        { projectId: "a", entries: [{ path: "x.md", at: 30 }, { path: "y.md", at: 10 }], known: null },
+        { projectId: "b", entries: [{ path: "z.md", at: 20 }], known: null },
+      ],
+      2,
+    );
+    expect(out).toEqual([
+      { projectId: "a", path: "x.md", at: 30 },
+      { projectId: "b", path: "z.md", at: 20 },
+    ]);
+  });
+
+  it("drops entries a repo's index no longer has", () => {
+    const out = mergeTeamRecents([
+      { projectId: "a", entries: [{ path: "gone.md", at: 5 }, { path: "here.md", at: 4 }], known: new Set(["here.md"]) },
+    ]);
+    expect(out.map((r) => r.path)).toEqual(["here.md"]);
   });
 });

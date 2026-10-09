@@ -15,7 +15,14 @@ workspace = true
 
 [dependencies]
 ken-core = { path = "../crates/ken-core" }
-tauri = { version = "2", features = ["protocol-asset"] }
+# `tray-icon` keeps Ken resident when its window is closed: the file
+# watchers that drive incremental indexing live in this process, so a
+# quit means nothing is indexed until the app is opened again.
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
+# One Ken per person: closing the window only hides it to the tray, so
+# opening Ken again (Start menu, Dock, a file) must bring that window back
+# rather than start a second copy on the same indexes and watchers.
+tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"

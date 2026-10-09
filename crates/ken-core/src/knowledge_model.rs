@@ -44,8 +44,84 @@ pub const EXTRACT_CHAR_BUDGET: usize = 12_000;
 /// Corpus-wide reading is slower than a digest.
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(600);
 
-const ENTITY_KINDS: [&str; 5] =
-    ["person", "organization", "topic", "decision", "other"];
+/// The closed list of entity kinds, in the order the prompts name them; any
+/// other kind a model answers is stored as `other`.
+///
+/// - `person`: a human being. Never a bot or an AI agent ([`is_bot_or_agent`]).
+/// - `organization`: a company, studio, team or group.
+/// - `repo`: a repository, service or app the workspace knows by name. Ken
+///   calls these repos. Added 2026-10-06: the Shattered Realms dry run filed
+///   all five of its repos (and the wiki and docs vault) under `other`,
+///   because no kind fit them.
+/// - `topic`: a feature, system, idea or area of work.
+/// - `decision`: a ruling or choice that was made.
+/// - `other`: what fits none of the above.
+pub const ENTITY_KINDS: [&str; 6] =
+    ["person", "organization", "repo", "topic", "decision", "other"];
+
+/// The kind list as the prompts spell it: `person|organization|...`.
+fn kind_choices() -> String {
+    ENTITY_KINDS.join("|")
+}
+
+/// A model's kind, lowercased and checked against [`ENTITY_KINDS`]; anything
+/// unknown is `other`, and "repository" is the same kind as `repo`.
+fn coerce_kind(raw: &serde_json::Value) -> String {
+    let kind = raw.as_str().map(|k| k.trim().to_lowercase()).unwrap_or_default();
+    let kind = if kind == "repository" { "repo".to_string() } else { kind };
+    if ENTITY_KINDS.contains(&kind.as_str()) {
+        kind
+    } else {
+        "other".into()
+    }
+}
+
+/// Bots and AI agents that commit to repos, by name or commit address
+/// (compared after `federation::normalize_name`, or as a raw address).
+const BOTS_AND_AGENTS: &[&str] = &[
+    "claude",
+    "claude code",
+    "cursor",
+    "cursor agent",
+    "copilot",
+    "github copilot",
+    "codex",
+    "devin",
+    "dependabot",
+    "renovate",
+    "github actions",
+    "noreply@anthropic.com",
+    "cursoragent@cursor.com",
+];
+
+/// A person entity is dropped as a bot or AI agent when its name is a known
+/// bot or agent, holds a `[bot]` account or a known agent address, or ends in
+/// the word "bot". Measured 2026-10-06: the Shattered Realms dry run made
+/// people of Claude, Cursor Agent, dependabot and the Hytale Sync Bot (4 of
+/// 14 people). A human who is really called Claude would be dropped too; no
+/// teammate in any measured workspace is.
+pub fn is_bot_or_agent(name: &str) -> bool {
+    let raw = name.trim().to_lowercase();
+    let norm = crate::federation::normalize_name(name);
+    raw.contains("[bot]")
+        || norm.split(' ').next_back() == Some("bot")
+        || BOTS_AND_AGENTS
+            .iter()
+            .any(|b| if b.contains('@') { raw.contains(b) } else { norm == *b })
+}
+
+/// An edge label is git activity, not knowledge, when one of its words is
+/// commit, commits, committed, committer(s) or committing. Measured
+/// 2026-10-06: 15 of the dry run's 96 map edges were "commits to", "one
+/// commit", "top committer", "major committer" or "commits from account".
+pub fn is_activity_label(label: &str) -> bool {
+    const ACTIVITY: [&str; 6] =
+        ["commit", "commits", "committed", "committer", "committers", "committing"];
+    label
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| ACTIVITY.contains(&w))
+}
 
 /// A parsed extraction, ready for `Db::replace_knowledge_model`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -65,9 +141,10 @@ pub struct ModelCounts {
 /// The extraction prompt: read the material, answer with ONE JSON
 /// object of entities (with connections) and dated events.
 pub fn compose_extraction_prompt(files: &[String], today: &str) -> String {
+    let kinds = kind_choices();
     let mut p = format!(
         "You are Ken, building the knowledge model for this project — the \
-entities (people, organizations, topics, decisions) and dated events \
+entities (people, organizations, repos, topics, decisions) and dated events \
 that the Map and Timeline views draw.\n\n\
 Read the project's source material listed below (open any of these \
 files as needed; never modify anything). Today's date is {today}.\n\n\
@@ -76,8 +153,9 @@ shaped exactly like this:\n\
 {{\n\
   \"entities\": [\n\
     {{\n\
-      \"kind\": \"person|organization|topic|decision|other\",\n\
+      \"kind\": \"{kinds}\",\n\
       \"name\": \"short display name\",\n\
+      \"aliases\": [\"another name the material gives this same person\"],\n\
       \"summary\": \"one plain sentence about it\",\n\
       \"sources\": [\"relative/path.md\"],\n\
       \"connections\": [{{\"to\": \"another entity's name\", \"label\": \"short relation\"}}]\n\
@@ -98,7 +176,20 @@ Rules:\n\
 - Dates are best effort — use document dates from file names or content; \
 omit events with no inferable date entirely.\n\
 - Every connections.to must exactly name another entity in your list.\n\
-- sources and source are project-relative paths from the list below.\n\n\
+- sources and source are project-relative paths from the list below.\n\
+- Kinds are exactly these: person is a human being; organization a company, \
+studio or group; repo a repository, service or app the material names (a code \
+repo, a wiki, a docs vault, a tool the team ships); topic a feature, system or \
+idea; decision a ruling that was made; other only when none of these fits.\n\
+- People are people. Bots and AI agents (Claude, Cursor Agent, Copilot, \
+dependabot, any [bot] account or sync bot) are tools, not people: leave them out.\n\
+- One person is one entity. When the material ties two names to one person \
+(the same commit email, or a people/ page or CODEOWNERS that lists both), make \
+one entity and put the other names in aliases. Never join two names because \
+they share a first name.\n\
+- A connection says what one thing does to another: owns, decides, depends on, \
+replaces, implements, documents, part of. Never commit counts, commit activity \
+or rankings (\"commits to\", \"top committer\").\n\n\
 Indexed source files:\n"
     );
     if files.is_empty() {
@@ -131,17 +222,42 @@ pub fn content_hash(text: &str) -> String {
 /// entities carry no sources (the merge attributes them to this file), and
 /// relations name entities by their display name.
 pub fn compose_file_prompt(rel_path: &str, text: &str, today: &str) -> String {
+    compose_file_prompt_with_addendum(rel_path, text, today, "")
+}
+
+/// Same as [`compose_file_prompt`], with an optional project-profiler
+/// addendum (design D3: `profiler::profile_prompt_addendum` — summary +
+/// focus hints, already capped at 500 chars) inserted into the fixed
+/// preamble so it counts against `EXTRACT_CHAR_BUDGET` like everything else
+/// in the prompt. An empty/blank `addendum` reproduces `compose_file_prompt`
+/// exactly byte-for-byte — this is how the profiler flag being off (or no
+/// profile existing) stays inert here: the caller simply never passes a
+/// non-empty addendum in that case, so nothing about this function's output
+/// changes.
+pub fn compose_file_prompt_with_addendum(
+    rel_path: &str,
+    text: &str,
+    today: &str,
+    addendum: &str,
+) -> String {
+    let addendum_block = if addendum.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", addendum.trim())
+    };
     // Budget the whole prompt, not just the body: the instructions must fit
     // "alongside" the document inside EXTRACT_CHAR_BUDGET. Build the fixed
     // preamble first, then let the body fill whatever characters remain.
+    let kinds = kind_choices();
     let head = format!(
         "You are Ken, extracting the knowledge in ONE document for a project's \
-Map and Timeline. Today's date is {today}.\n\n\
+Map and Timeline. Today's date is {today}.\n\
+{addendum_block}\n\
 Read the document below (path: {rel_path}) and output ONLY a JSON object — no \
 prose before or after, no code fences — shaped exactly like this:\n\
 {{\n\
   \"entities\": [\n\
-    {{\"kind\": \"person|organization|topic|decision|other\", \
+    {{\"kind\": \"{kinds}\", \
 \"name\": \"short display name\", \"summary\": \"one plain sentence\"}}\n\
   ],\n\
   \"relations\": [\n\
@@ -157,7 +273,9 @@ Rules:\n\
 - At most {FILE_MAX_ENTITIES} entities, {FILE_MAX_RELATIONS} relations, and \
 {FILE_MAX_EVENTS} events — only what THIS document grounds; never invent.\n\
 - relations.a and relations.b must each name an entity in your list.\n\
-- Dates are best effort — omit events with no inferable yyyy-mm-dd date.\n\n\
+- Dates are best effort — omit events with no inferable yyyy-mm-dd date.\n\
+- repo is a repository, service or app; bots and AI agents are never people; \
+relations say what one thing does to another, never commit counts.\n\n\
 Document:\n"
     );
     // Reserve the preamble (and the trailing newline) so the full prompt stays
@@ -177,6 +295,20 @@ Document:\n"
 /// references, collapse duplicate pairs, enforce the caps. Only an
 /// answer with no parseable JSON object is an error.
 pub fn parse_extraction(raw: &str) -> Result<Extraction> {
+    parse_extraction_for(raw, &[])
+}
+
+/// Whether a person entity called `name` is dropped as a bot or an agent:
+/// never when the team's `roster` lists the name, an alias or an address
+/// ([`crate::people::by_name`]). The team says who is a person; a teammate
+/// whose handle ends in "bot" or reads like an agent's stays.
+fn dropped_as_bot(name: &str, roster: &[crate::people::Person]) -> bool {
+    crate::people::by_name(roster, name).is_none() && is_bot_or_agent(name)
+}
+
+/// [`parse_extraction`], with the team's `roster` checked before a person
+/// is dropped as a bot ([`dropped_as_bot`]).
+pub fn parse_extraction_for(raw: &str, roster: &[crate::people::Person]) -> Result<Extraction> {
     let no_json =
         || Error::Other("the model's answer contained no JSON object".into());
     let start = raw.find('{').ok_or_else(no_json)?;
@@ -187,6 +319,7 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
     // Entities first (names must exist before connections can resolve).
     let mut entities: Vec<EntityInput> = Vec::new();
     let mut raw_connections: Vec<Vec<(String, String)>> = Vec::new();
+    let mut aliases: Vec<Vec<String>> = Vec::new();
     for item in value["entities"].as_array().unwrap_or(&Vec::new()) {
         if entities.len() >= MAX_ENTITIES {
             break;
@@ -194,11 +327,11 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
         let Some(name) = non_empty_str(&item["name"]) else {
             continue; // no usable name — drop the record
         };
-        let kind = item["kind"]
-            .as_str()
-            .map(|k| k.trim().to_lowercase())
-            .filter(|k| ENTITY_KINDS.contains(&k.as_str()))
-            .unwrap_or_else(|| "other".into());
+        let kind = coerce_kind(&item["kind"]);
+        if kind == "person" && dropped_as_bot(&name, roster) {
+            continue; // a tool, not a teammate; its connections now dangle and drop
+        }
+        aliases.push(if kind == "person" { person_aliases(&name, &item["aliases"]) } else { Vec::new() });
         let sources = string_list(&item["sources"]);
         let conns = item["connections"]
             .as_array()
@@ -222,19 +355,19 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
         raw_connections.push(conns);
     }
 
-    // Resolve connections: case-insensitive name → index; dangling and
-    // self references drop; duplicate pairs (either direction) collapse.
-    let mut by_name: std::collections::HashMap<String, usize> = Default::default();
-    for (i, e) in entities.iter().enumerate() {
-        by_name.entry(e.name.to_lowercase()).or_insert(i);
-    }
+    // One person, one entity: names tied by aliases fold together.
+    let (mut entities, raw_connections, by_name) = fold_aliases(entities, raw_connections, &aliases);
+
+    // Resolve connections: case-insensitive name (or alias) → index;
+    // dangling and self references drop, as do git-activity labels;
+    // duplicate pairs (either direction) collapse.
     let mut seen: std::collections::HashSet<(usize, usize)> = Default::default();
     for (from, conns) in raw_connections.into_iter().enumerate() {
         for (to_name, label) in conns {
             let Some(&to) = by_name.get(&to_name.trim().to_lowercase()) else {
                 continue;
             };
-            if to == from {
+            if to == from || is_activity_label(&label) {
                 continue;
             }
             let pair = (from.min(to), from.max(to));
@@ -279,6 +412,12 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
 /// the JSON — the merge attributes everything to the file being extracted.
 /// Infallible: a malformed value yields an empty delta.
 pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
+    parse_delta_value_for(value, &[])
+}
+
+/// [`parse_delta_value`], with the team's `roster` checked before a person
+/// is dropped as a bot ([`dropped_as_bot`]).
+pub fn parse_delta_value_for(value: &serde_json::Value, roster: &[crate::people::Person]) -> Extraction {
     let empty = Vec::new();
     let mut entities: Vec<EntityInput> = Vec::new();
     for item in value["entities"].as_array().unwrap_or(&empty) {
@@ -288,11 +427,10 @@ pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
         let Some(name) = non_empty_str(&item["name"]) else {
             continue;
         };
-        let kind = item["kind"]
-            .as_str()
-            .map(|k| k.trim().to_lowercase())
-            .filter(|k| ENTITY_KINDS.contains(&k.as_str()))
-            .unwrap_or_else(|| "other".into());
+        let kind = coerce_kind(&item["kind"]);
+        if kind == "person" && dropped_as_bot(&name, roster) {
+            continue;
+        }
         entities.push(EntityInput {
             kind,
             name,
@@ -325,14 +463,14 @@ pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
         ) else {
             continue;
         };
-        if a == b {
+        let label = rel["label"].as_str().unwrap_or("").trim().to_string();
+        if a == b || is_activity_label(&label) {
             continue;
         }
         let pair = (a.min(b), a.max(b));
         if !seen.insert(pair) {
             continue;
         }
-        let label = rel["label"].as_str().unwrap_or("").trim().to_string();
         entities[a].connections.push((b, label));
         relation_count += 1;
     }
@@ -380,6 +518,46 @@ pub fn extract_one<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    extract_one_with_addendum(db, rel_path, content_hash, today, at, generate, "")
+}
+
+/// Same as [`extract_one`], with an optional project-profiler prompt
+/// addendum (design D3) threaded into [`compose_file_prompt_with_addendum`].
+/// `addendum` is normally `profiler::profile_prompt_addendum(&profile)` when
+/// the `profiler` flag is on and a profile exists — an empty string (what
+/// [`extract_one`] always passes) reproduces the plain extraction path
+/// exactly, which is how flag-off/no-profile inertness holds here.
+pub fn extract_one_with_addendum<G>(
+    db: &mut Db,
+    rel_path: &str,
+    content_hash: &str,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+) -> Result<()>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
+    extract_one_for(db, rel_path, content_hash, today, at, generate, addendum, &[])
+}
+
+/// [`extract_one_with_addendum`], with the team's `roster`: a person it
+/// lists is never dropped as a bot ([`dropped_as_bot`]).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_one_for<G>(
+    db: &mut Db,
+    rel_path: &str,
+    content_hash: &str,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+    roster: &[crate::people::Person],
+) -> Result<()>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let text = db.get_text(rel_path)?.unwrap_or_default();
     // An empty (or whitespace-only) file has nothing to extract — mark it done
     // and skip the generation. A blank `.md`, a stub, or a file whose extractor
@@ -389,10 +567,10 @@ where
         db.mark_extraction_done(rel_path, content_hash, at)?;
         return Ok(());
     }
-    let prompt = compose_file_prompt(rel_path, &text, today);
+    let prompt = compose_file_prompt_with_addendum(rel_path, &text, today, addendum);
     match generate(&prompt) {
         Ok(value) => {
-            let delta = parse_delta_value(&value);
+            let delta = parse_delta_value_for(&value, roster);
             db.merge_knowledge_delta(rel_path, &delta, at)?;
             db.mark_extraction_done(rel_path, content_hash, at)?;
             Ok(())
@@ -416,10 +594,41 @@ pub fn process_next_pending<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    process_next_pending_with_addendum(db, today, at, generate, "")
+}
+
+/// Same as [`process_next_pending`], threading an optional project-profiler
+/// addendum (design D3) through to [`extract_one_with_addendum`].
+pub fn process_next_pending_with_addendum<G>(
+    db: &mut Db,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+) -> Result<Option<String>>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
+    process_next_pending_for(db, today, at, generate, addendum, &[])
+}
+
+/// [`process_next_pending_with_addendum`], with the team's `roster`: a
+/// person it lists is never dropped as a bot ([`dropped_as_bot`]).
+pub fn process_next_pending_for<G>(
+    db: &mut Db,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+    roster: &[crate::people::Person],
+) -> Result<Option<String>>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let Some((rel_path, content_hash)) = db.next_pending_extraction()? else {
         return Ok(None);
     };
-    extract_one(db, &rel_path, &content_hash, today, at, generate)?;
+    extract_one_for(db, &rel_path, &content_hash, today, at, generate, addendum, roster)?;
     Ok(Some(rel_path))
 }
 
@@ -433,12 +642,14 @@ pub fn build_knowledge_model(
     today: &str,
     cancel: &CancelToken,
 ) -> Result<ModelCounts> {
-    let files: Vec<String> = db
-        .list_files()?
-        .into_iter()
-        .filter(|f| f.status == "indexed")
-        .map(|f| f.rel_path)
-        .collect();
+    // Full tier only: a search-only file (a code or reference repo, a `~`
+    // line) never reaches the graph, the deep rebuild included.
+    let files = db.entity_tier_paths()?;
+    // What was waiting before the build reads: the build covers it.
+    let waiting: Vec<(String, String)> = {
+        let listed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        db.waiting_extractions()?.into_iter().filter(|(p, _)| listed.contains(p.as_str())).collect()
+    };
     let prompt = compose_extraction_prompt(&files, today);
     match assistant::oneshot(binary, &project.root, &prompt, EXTRACTION_TIMEOUT, cancel)? {
         OneshotOutcome::Completed(text) => {
@@ -450,6 +661,11 @@ pub fn build_knowledge_model(
                 &extraction.events,
                 engine::now_epoch(),
             )?;
+            // The whole project was just read: the per-file queue it covered
+            // is done, so the local model works only on what changes next,
+            // not hours of files the map already holds. A file edited while
+            // the build ran keeps its new hash and stays queued.
+            db.settle_extractions(&waiting, engine::now_epoch())?;
             Ok(ModelCounts {
                 entities: extraction.entities.len(),
                 edges,
@@ -645,6 +861,102 @@ impl AutoBuildTracker {
     }
 }
 
+/// A person's usable aliases: its other names, minus its own name and minus a
+/// lone first name ("Kyle" for "Kyle Ahlstrom" could be any Kyle).
+fn person_aliases(name: &str, raw: &serde_json::Value) -> Vec<String> {
+    let own = name.trim().to_lowercase();
+    let first = own.split_whitespace().next().unwrap_or("").to_string();
+    string_list(raw)
+        .into_iter()
+        .filter(|a| {
+            let a = a.to_lowercase();
+            a != own && !(own.contains(' ') && a == first)
+        })
+        .collect()
+}
+
+/// One person is one entity: a person whose name another person lists in
+/// its aliases is folded into that person (sources, connections, and its
+/// name as a lookup). Measured 2026-10-06: the dry run kept "Chris" and
+/// "Stingbro" apart though both commit from one GitHub noreply address.
+/// Returns the kept entities, their raw connections, and the lowercased
+/// name-or-alias → index lookup that connections resolve through.
+fn fold_aliases(
+    entities: Vec<EntityInput>,
+    raw_connections: Vec<Vec<(String, String)>>,
+    aliases: &[Vec<String>],
+) -> (Vec<EntityInput>, Vec<Vec<(String, String)>>, std::collections::HashMap<String, usize>) {
+    let n = entities.len();
+    let mut person_by_name: std::collections::HashMap<String, usize> = Default::default();
+    for (i, e) in entities.iter().enumerate() {
+        if e.kind == "person" {
+            person_by_name.entry(e.name.to_lowercase()).or_insert(i);
+        }
+    }
+    // into[j] = the entity j folds into (itself when kept). One level only:
+    // a person already folded, or already holding a fold, is not folded again.
+    let mut into: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for alias in &aliases[i] {
+            let Some(&j) = person_by_name.get(&alias.to_lowercase()) else {
+                continue;
+            };
+            let free = |x: usize, into: &[usize]| into[x] == x && (0..n).all(|k| k == x || into[k] != x);
+            if j != i && into[i] == i && free(j, &into) {
+                into[j] = i;
+            }
+        }
+    }
+
+    let mut new_index: Vec<usize> = vec![0; n];
+    let mut kept: Vec<EntityInput> = Vec::new();
+    let mut kept_conns: Vec<Vec<(String, String)>> = Vec::new();
+    let mut aka: Vec<Vec<String>> = Vec::new();
+    for i in (0..n).filter(|&i| into[i] == i) {
+        new_index[i] = kept.len();
+        kept.push(entities[i].clone());
+        kept_conns.push(raw_connections[i].clone());
+        aka.push(aliases[i].clone());
+    }
+    for i in (0..n).filter(|&i| into[i] != i) {
+        let t = new_index[into[i]];
+        let e = &entities[i];
+        for s in &e.sources {
+            if !kept[t].sources.contains(s) {
+                kept[t].sources.push(s.clone());
+            }
+        }
+        if kept[t].summary.is_empty() {
+            kept[t].summary = e.summary.clone();
+        }
+        if !aka[t].iter().any(|a| a.to_lowercase() == e.name.to_lowercase()) {
+            aka[t].push(e.name.clone());
+        }
+        kept_conns[t].extend(raw_connections[i].iter().cloned());
+    }
+    // A merged person says what else it is called, so a reader sees the fold.
+    for (e, names) in kept.iter_mut().zip(&aka) {
+        let lower = e.summary.to_lowercase();
+        let missing: Vec<&str> =
+            names.iter().filter(|a| !lower.contains(&a.to_lowercase())).map(String::as_str).collect();
+        if e.kind == "person" && !missing.is_empty() {
+            let sep = if e.summary.is_empty() { "" } else { " " };
+            e.summary = format!("{}{sep}Also known as {}.", e.summary, missing.join(", "));
+        }
+    }
+
+    let mut by_name: std::collections::HashMap<String, usize> = Default::default();
+    for (i, e) in kept.iter().enumerate() {
+        by_name.entry(e.name.to_lowercase()).or_insert(i);
+    }
+    for (i, names) in aka.iter().enumerate() {
+        for a in names {
+            by_name.entry(a.to_lowercase()).or_insert(i);
+        }
+    }
+    (kept, kept_conns, by_name)
+}
+
 fn non_empty_str(v: &serde_json::Value) -> Option<String> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
@@ -733,6 +1045,45 @@ mod tests {
     }
 
     #[test]
+    fn process_next_pending_with_addendum_reaches_the_generated_prompt() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("notes/kickoff.md", "md", 1, 1, "indexed", None, "We hired Priya.").unwrap();
+        db.enqueue_extraction_if_changed("notes/kickoff.md", &content_hash("We hired Priya.")).unwrap();
+        let seen_prompt = std::cell::RefCell::new(String::new());
+        let generate = |p: &str| -> Result<serde_json::Value> {
+            *seen_prompt.borrow_mut() = p.to_string();
+            Ok(serde_json::json!({"entities": [], "relations": [], "events": []}))
+        };
+        process_next_pending_with_addendum(
+            &mut db, "2026-07-14", 100, &generate, "Project summary: A billing tool.\nFocus areas: vendors",
+        )
+        .unwrap();
+        assert!(seen_prompt.borrow().contains("Project summary: A billing tool."));
+        assert!(seen_prompt.borrow().contains("Focus areas: vendors"));
+    }
+
+    #[test]
+    fn process_next_pending_with_empty_addendum_matches_plain_path() {
+        // Consumer inertness (project-profiler 1.6): the addendum-aware entry
+        // point called with "" must behave exactly like the plain one, so a
+        // caller that never resolves a profile (flag off, or none exists)
+        // gets byte-identical prompts either way.
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("notes/kickoff.md", "md", 1, 1, "indexed", None, "We hired Priya.").unwrap();
+        db.enqueue_extraction_if_changed("notes/kickoff.md", &content_hash("We hired Priya.")).unwrap();
+        let seen_prompt = std::cell::RefCell::new(String::new());
+        let generate = |p: &str| -> Result<serde_json::Value> {
+            *seen_prompt.borrow_mut() = p.to_string();
+            Ok(serde_json::json!({"entities": [], "relations": [], "events": []}))
+        };
+        process_next_pending_with_addendum(&mut db, "2026-07-14", 100, &generate, "").unwrap();
+        assert_eq!(
+            seen_prompt.into_inner(),
+            compose_file_prompt("notes/kickoff.md", "We hired Priya.", "2026-07-14")
+        );
+    }
+
+    #[test]
     fn empty_file_is_marked_done_without_generating() {
         let mut db = Db::open_in_memory().unwrap();
         // A blank file: whitespace-only extracted text.
@@ -758,7 +1109,7 @@ mod tests {
         assert!(p.contains("ONLY a JSON object"));
         assert!(p.contains("\"relations\""));
         assert!(p.contains("\"events\""));
-        assert!(p.contains("person|organization|topic|decision|other"));
+        assert!(p.contains("person|organization|repo|topic|decision|other"));
         assert!(p.contains("yyyy-mm-dd"));
         assert!(p.contains("2026-07-14"));
         // Per-file caps are stated so the model self-limits.
@@ -773,6 +1124,31 @@ mod tests {
         let p = compose_file_prompt("big.md", &big, "2026-07-14");
         // The document body is capped; the surrounding instructions are small.
         assert!(p.matches('x').count() <= EXTRACT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn compose_file_prompt_is_byte_identical_with_empty_addendum() {
+        // project-profiler D3: the profile addendum seam must be inert when
+        // there is nothing to add — the plain `compose_file_prompt` and the
+        // addendum variant called with "" must produce the exact same text.
+        let a = compose_file_prompt("notes/kickoff.md", "We hired Priya.", "2026-07-14");
+        let b = compose_file_prompt_with_addendum("notes/kickoff.md", "We hired Priya.", "2026-07-14", "");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compose_file_prompt_with_addendum_inserts_profile_context_within_budget() {
+        let addendum = "Project summary: A billing migration tool.\nFocus areas: vendors, cutover";
+        let p = compose_file_prompt_with_addendum(
+            "notes/kickoff.md",
+            "We hired Priya.",
+            "2026-07-14",
+            addendum,
+        );
+        assert!(p.contains("Project summary: A billing migration tool."));
+        assert!(p.contains("Focus areas: vendors, cutover"));
+        assert!(p.contains("notes/kickoff.md"));
+        assert!(p.chars().count() <= EXTRACT_CHAR_BUDGET);
     }
 
     #[test]
@@ -829,6 +1205,163 @@ mod tests {
     fn parse_delta_empty_is_empty() {
         let ex = parse_delta_value(&serde_json::json!({}));
         assert!(ex.entities.is_empty() && ex.events.is_empty());
+    }
+
+    // ---------- graph cleanup (2026-10-06 dry run) ----------
+
+    #[test]
+    fn kinds_are_a_closed_list_with_repo() {
+        let k = |s: &str| coerce_kind(&serde_json::json!(s));
+        assert_eq!(k("repo"), "repo");
+        assert_eq!(k(" Repository "), "repo");
+        assert_eq!(k("Person"), "person");
+        assert_eq!(k("service"), "other", "only the listed kinds survive");
+        assert_eq!(coerce_kind(&serde_json::Value::Null), "other");
+        assert_eq!(kind_choices(), "person|organization|repo|topic|decision|other");
+    }
+
+    #[test]
+    fn bots_and_agents_are_not_people() {
+        for bot in [
+            "Claude",
+            "Cursor Agent",
+            "dependabot",
+            "dependabot[bot]",
+            "cursor[bot] <206951365+cursor[bot]@users.noreply.github.com>",
+            "Hytale Sync Bot",
+            "Claude <noreply@anthropic.com>",
+            "GitHub Actions",
+        ] {
+            assert!(is_bot_or_agent(bot), "{bot} is a bot or agent");
+        }
+        for person in ["Chris", "Zoë Ångström", "AlpahSignalAI", "Claudette Ruiz", "Abbott", "PixelPat / Pat"] {
+            assert!(!is_bot_or_agent(person), "{person} is a person");
+        }
+    }
+
+    /// A teammate the roster lists is never dropped as a bot at extraction,
+    /// however their name reads; a bot nobody lists still is.
+    #[test]
+    fn a_roster_person_named_like_a_bot_is_kept() {
+        let roster = vec![crate::people::Person {
+            id: "mabel".into(),
+            name: "Mabel Bot".into(),
+            emails: vec![],
+            aliases: vec!["claude".into()],
+        }];
+        let v = serde_json::json!({"entities": [
+            {"name": "Mabel Bot", "kind": "person"},
+            {"name": "Claude", "kind": "person"},
+            {"name": "Hytale Sync Bot", "kind": "person"}
+        ]});
+        let names = |ex: &Extraction| ex.entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        assert!(names(&parse_delta_value(&v)).is_empty(), "no roster: all three read as bots");
+        assert_eq!(names(&parse_delta_value_for(&v, &roster)), vec!["Mabel Bot", "Claude"]);
+        let raw = serde_json::to_string(&v).unwrap();
+        assert_eq!(names(&parse_extraction_for(&raw, &roster).unwrap()), vec!["Mabel Bot", "Claude"]);
+    }
+
+    #[test]
+    fn activity_labels_are_git_statistics() {
+        for l in ["commits to", "one commit", "top committer", "major committer", "commits from account", "Committed"] {
+            assert!(is_activity_label(l), "{l}");
+        }
+        for l in ["owns", "decides", "depends on", "reports to committee", "replaces", ""] {
+            assert!(!is_activity_label(l), "{l}");
+        }
+    }
+
+    #[test]
+    fn parse_drops_bots_and_activity_edges() {
+        let raw = r#"{"entities": [
+            {"kind": "person", "name": "Chris", "summary": "Lead.",
+             "connections": [{"to": "Shattered-Realms", "label": "top committer"},
+                             {"to": "Decision log renumber", "label": "ruled"},
+                             {"to": "Claude", "label": "works with"}]},
+            {"kind": "person", "name": "Claude", "summary": "An AI agent.",
+             "connections": [{"to": "Shattered-Realms", "label": "commits to"}]},
+            {"kind": "person", "name": "Hytale Sync Bot", "summary": "Syncs."},
+            {"kind": "repo", "name": "Shattered-Realms", "summary": "The mod."},
+            {"kind": "decision", "name": "Decision log renumber", "summary": "Renumbered."},
+            {"kind": "topic", "name": "Claude", "summary": "Using Claude to review code is a topic, not a person."}
+        ]}"#;
+        let ex = parse_extraction(raw).unwrap();
+        let names: Vec<(&str, &str)> = ex.entities.iter().map(|e| (e.kind.as_str(), e.name.as_str())).collect();
+        assert_eq!(
+            names,
+            vec![("person", "Chris"), ("repo", "Shattered-Realms"), ("decision", "Decision log renumber"), ("topic", "Claude")]
+        );
+        // "top committer" dropped; "ruled" kept; "works with" now names the
+        // topic Claude (the person is gone), which is what the name says.
+        assert_eq!(ex.entities[0].connections, vec![(2, "ruled".to_string()), (3, "works with".to_string())]);
+
+        // The per-file path drops them too.
+        let v = serde_json::json!({
+            "entities": [
+                {"kind": "person", "name": "dependabot[bot]", "summary": ""},
+                {"kind": "repository", "name": "skyboxeditor", "summary": ""},
+                {"kind": "person", "name": "BinaryConstruct", "summary": ""}
+            ],
+            "relations": [
+                {"a": "BinaryConstruct", "b": "skyboxeditor", "label": "one commit"},
+                {"a": "BinaryConstruct", "b": "skyboxeditor", "label": "maintains"}
+            ]
+        });
+        let ex = parse_delta_value(&v);
+        assert_eq!(ex.entities.len(), 2);
+        assert_eq!(ex.entities[0].kind, "repo");
+        assert_eq!(ex.entities[1].connections, vec![(0, "maintains".to_string())]);
+    }
+
+    #[test]
+    fn one_person_with_two_names_is_one_entity() {
+        // Stingbro listed first, Chris second naming it as an alias: the fold
+        // works in either order, and connections to either name land on Chris.
+        let raw = r#"{"entities": [
+            {"kind": "person", "name": "Stingbro", "summary": "",
+             "sources": ["Repo-Map/Shattered-Realms-Tools.md"],
+             "connections": [{"to": "Shattered-Realms-Tools", "label": "owns"}]},
+            {"kind": "person", "name": "Chris", "aliases": ["Stingbro", "Chris"],
+             "summary": "Makes the rulings.", "sources": ["Current/Team.md"]},
+            {"kind": "repo", "name": "Shattered-Realms-Tools", "summary": "Tools.",
+             "connections": [{"to": "stingbro", "label": "hosted by"}]}
+        ]}"#;
+        let ex = parse_extraction(raw).unwrap();
+        assert_eq!(ex.entities.len(), 2);
+        let chris = &ex.entities[0];
+        assert_eq!(chris.name, "Chris");
+        assert_eq!(chris.summary, "Makes the rulings. Also known as Stingbro.");
+        assert_eq!(chris.sources, vec!["Current/Team.md", "Repo-Map/Shattered-Realms-Tools.md"]);
+        // "owns" moved to Chris; the repo's "hosted by" Stingbro resolved to
+        // Chris and collapsed into the same pair.
+        assert_eq!(chris.connections, vec![(1, "owns".to_string())]);
+        assert!(ex.entities[1].connections.is_empty());
+    }
+
+    #[test]
+    fn a_first_name_alone_never_joins_two_people() {
+        let raw = r#"{"entities": [
+            {"kind": "person", "name": "Kyle Ahlstrom", "aliases": ["Kyle"], "summary": "One Kyle."},
+            {"kind": "person", "name": "Kyle", "summary": "Some Kyle."},
+            {"kind": "topic", "name": "Payments", "aliases": ["Kyle Ahlstrom"], "summary": "Not a person: no fold."}
+        ]}"#;
+        let ex = parse_extraction(raw).unwrap();
+        assert_eq!(ex.entities.len(), 3);
+        assert_eq!(ex.entities[0].summary, "One Kyle.");
+    }
+
+    #[test]
+    fn prompts_name_the_cleanup_rules() {
+        let p = compose_extraction_prompt(&[], "2026-10-06");
+        assert!(p.contains("\"aliases\""));
+        assert!(p.contains("Bots and AI agents"));
+        assert!(p.contains("the same commit email"));
+        assert!(p.contains("share a first name"));
+        assert!(p.contains("Never commit counts"));
+        assert!(p.contains("repo a repository, service or app"));
+        let f = compose_file_prompt("a.md", "text", "2026-10-06");
+        assert!(f.contains("bots and AI agents are never people"));
+        assert!(f.contains("never commit counts"));
     }
 
     // ---------- auto-build policy ----------
@@ -1008,7 +1541,7 @@ mod tests {
         assert!(prompt.contains("\"entities\""));
         assert!(prompt.contains("\"connections\""));
         assert!(prompt.contains("\"events\""));
-        assert!(prompt.contains("person|organization|topic|decision|other"));
+        assert!(prompt.contains("person|organization|repo|topic|decision|other"));
         assert!(prompt.contains("yyyy-mm-dd"));
         assert!(prompt.contains("At most 200 entities and 150 events"));
         assert!(prompt.contains("never invent"));
@@ -1105,6 +1638,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn build_stores_the_model_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_claude(dir.path(), "complete");
@@ -1114,11 +1648,13 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("notes/meeting.md", "md", 10, 1, "indexed", None, "text")
             .unwrap();
+        db.enqueue_extraction_if_changed("notes/meeting.md", "h1").unwrap();
 
         let counts =
             build_knowledge_model(&bin, &project, &mut db, "2026-07-12", &CancelToken::new())
                 .unwrap();
         assert_eq!(counts, ModelCounts { entities: 3, edges: 1, events: 2 });
+        assert!(db.next_pending_extraction().unwrap().is_none(), "the build covered the queue");
         let (entities, edges) = db.list_entities_with_edges().unwrap();
         assert_eq!(entities.len(), 3);
         assert_eq!(edges.len(), 1);
@@ -1127,6 +1663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn failed_build_keeps_the_old_model() {
         let dir = tempfile::tempdir().unwrap();
         let project =

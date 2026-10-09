@@ -8,6 +8,8 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Link from "@lucide/svelte/icons/link";
   import { app } from "../lib/app.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { memberLeaf } from "../lib/api";
   import { imports } from "../lib/imports.svelte";
   import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
   import { buildTree } from "../lib/tree";
@@ -24,6 +26,21 @@
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
   let { width }: { width: number } = $props();
+
+  // Files opens on the team's wiki; the menu above the tree shows any of
+  // the team's repos. A file opened from another repo (a search hit, a
+  // citation) shows that repo here. Choosing one stays on Files.
+  const teamRepos = $derived.by(() => {
+    const ids = scope.groups.find((g) => g.name === scope.team)?.projectIds ?? null;
+    return app.members
+      .filter((m): m is typeof m & { id: string } => !!m.id && (m.status === "active" || m.status === "dormant"))
+      .filter((m) => ids === null || ids.includes(m.id))
+      .sort((a, b) => (a.id === scope.wikiId ? -1 : b.id === scope.wikiId ? 1 : a.name.localeCompare(b.name)));
+  });
+
+  function showRepo(id: string) {
+    if (id && id !== app.focused) void app.focusMember(id, { stay: true });
+  }
 
   const unreadOnly = $derived(app.filesFilter === "unread");
   const markAllEnabled = $derived(isMarkAllEnabled(app.unread.length));
@@ -134,6 +151,19 @@
 </script>
 
 <div class="tree" style:width="{width}px">
+  {#if app.workspace && teamRepos.length > 1}
+    <div class="repo-pick">
+      <select
+        aria-label="Repo shown in Files"
+        value={app.focused ?? ""}
+        onchange={(e) => showRepo((e.currentTarget as HTMLSelectElement).value)}
+      >
+        {#each teamRepos as m (m.id)}
+          <option value={m.id}>{memberLeaf(m.name)}{m.id === scope.wikiId ? " · wiki" : ""}</option>
+        {/each}
+      </select>
+    </div>
+  {/if}
   {#if app.favorites.length > 0}
     <div class="tree-head">Favorites</div>
     <div class="favorites">
@@ -246,7 +276,8 @@
   .tree {
     /* Width comes from the resizable, persisted sidebar preference. */
     flex: none;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     /* No top padding: sticky offsets resolve against this scroll container's
@@ -440,5 +471,12 @@
     color: var(--danger);
     padding: 2px;
     flex: none;
+  }
+  .repo-pick {
+    margin: 0 8px 8px;
+  }
+  .repo-pick select {
+    width: 100%;
+    font-weight: 600;
   }
 </style>

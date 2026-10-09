@@ -1,36 +1,56 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import TeamScreen from "./TeamScreen.svelte";
+  import TeamInbox from "../team/TeamInbox.svelte";
+  import type { SettingsSection } from "../lib/app.svelte";
+  // Settings: what is yours (You), what is this computer's (This machine),
+  // Ken's features, the connector for agents, and About. Each repo's own
+  // settings open from its row on Team.
+  import { onMount, untrack } from "svelte";
   import { app } from "../lib/app.svelte";
-  import { ingests } from "../lib/ingests.svelte";
+  import { memory } from "../lib/memory.svelte";
+  import { toWorkspaceAddress, unopenableReason } from "../lib/kenAddress";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
-  import { api, type McpInfo, type SyncStatus, type ModelStatus } from "../lib/api";
+  import {
+    api,
+    type ClaudeDoctor,
+    type EmbeddingState,
+    type FeatureInfo,
+    type GpuInfo,
+    type McpInfo,
+    type ModelCategory,
+    type ModelStatus,
+  } from "../lib/api";
+  import { claudeInstallHelp } from "../lib/platform";
+  import { embeddingLine, embeddingPct, modelSize, modelsFor, runsOnLine, tierLabel } from "../lib/models";
+  import { toast } from "../lib/toast.svelte";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
+  import ProgressBar from "../lib/ProgressBar.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
-  import ChevronRight from "@lucide/svelte/icons/chevron-right";
-  import {
-    buildFolderTree,
-    folderTriState,
-    isExcluded,
-    toggleFolder as toggleFolderPaths,
-    type FolderNode,
-  } from "../lib/folderTree";
 
-  let busy = $state(false);
-  let toggling = $state(false);
-  let runnerMode = $state<"hidden-tui" | "headless">(
-    app.project?.ingestRunner ?? "headless",
-  );
-  let sync = $state<SyncStatus | null>(null);
-  let syncingNow = $state(false);
   let mcp = $state<McpInfo | null>(null);
   let copied = $state<"command" | "instruction" | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
-  // Downloadable transcription models (discovered from the whisper.cpp repo).
   let models = $state<ModelStatus[]>([]);
   let modelsLoading = $state(true);
   let removing = $state<string | null>(null);
+  // Registry-driven feature flags: global defaults plus this repo's overrides.
+  let features = $state<FeatureInfo[]>([]);
+  let featuresBusy = $state<string | null>(null);
+  let doctor = $state<ClaudeDoctor | null>(null);
+  let gpu = $state<GpuInfo | null>(null);
+  let embedding = $state<EmbeddingState | null>(null);
+
+  const sections: { key: SettingsSection; label: string; sub: string }[] = [
+    { key: "general", label: "General", sub: "Appearance, files, updates" },
+    { key: "team", label: "Team library", sub: "Folders, rules, weekly check" },
+    { key: "sync", label: "Sync", sub: "Git and the team inbox" },
+    { key: "ai", label: "AI", sub: "Claude Code and models" },
+    { key: "agents", label: "Agents", sub: "The connector for your tools" },
+    { key: "rules", label: "Ingest rules", sub: "What Ken may write" },
+  ];
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
     { value: "light", title: "Light" },
@@ -38,32 +58,76 @@
     { value: "system", title: "System" },
   ];
 
-  const excludedSet = $derived(new Set(app.project?.excluded ?? []));
-  const folderTree = $derived(buildFolderTree(app.folders));
-  let expanded = $state<Set<string>>(new Set());
-
-  function toggleExpand(relPath: string) {
-    const next = new Set(expanded);
-    next.has(relPath) ? next.delete(relPath) : next.add(relPath);
-    expanded = next;
-  }
-
-  const transcriptionModels = $derived(models.filter((m) => m.category === "transcription"));
-  // Language models arrive when the other plan appends them; this card renders
-  // whatever categories the catalog returns.
-  const languageModels = $derived(models.filter((m) => m.category === "language"));
-
-  async function selectModel(category: "transcription" | "language", id: string) {
-    await api.setModelSelection(category, id);
-    await refreshModels();
-  }
+  const transcriptionModels = $derived(modelsFor(models, "transcription"));
+  const embeddingModels = $derived(modelsFor(models, "embedding"));
+  // Background reading is this machine's; the rest are Ken's features.
+  const backgroundReading = $derived(features.find((f) => f.name === "backgroundExtraction") ?? null);
+  const kenFeatures = $derived(features.filter((f) => f.name !== "backgroundExtraction"));
 
   onMount(() => {
-    void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
+    void api.claudeDoctor().then((d) => (doctor = d)).catch(() => (doctor = null));
+    void api.gpuInfo().then((g) => (gpu = g)).catch(() => (gpu = null));
+    void api.embeddingState().then((s) => (embedding = s)).catch(() => (embedding = null));
     void refreshModels();
-    return () => clearTimeout(copyTimer);
+    void loadFeatures();
+    void memory.init();
+    let off: (() => void) | undefined;
+    void api.onSemanticProgress((s) => (embedding = s)).then((fn) => (off = fn));
+    return () => {
+      clearTimeout(copyTimer);
+      off?.();
+    };
   });
+
+  // Settings stays mounted: a change of repo reads that repo's features and
+  // its agent command.
+  let seenFocus: string | null | undefined;
+  $effect(() => {
+    const f = app.focused;
+    if (seenFocus !== undefined && f !== seenFocus) {
+      untrack(() => {
+        void loadFeatures();
+        void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
+      });
+    }
+    seenFocus = f;
+  });
+
+  async function loadFeatures() {
+    features = await api.listFeatures(app.project?.id).catch(() => []);
+  }
+
+  /** A flag's default for every repo. `semanticIndex` refreshes the app's
+   *  copy so the status line stays right when the default drives it. */
+  async function setGlobalDefault(flag: FeatureInfo, value: boolean) {
+    featuresBusy = flag.name;
+    try {
+      await api.setGlobalFeature(flag.name, value);
+      if (flag.name === "semanticIndex") {
+        app.semanticIndex = await api.getSemanticIndex().catch(() => app.semanticIndex);
+      }
+      await loadFeatures();
+    } catch (e) {
+      toast.error(`Could not change ${flag.label}`, e);
+    } finally {
+      featuresBusy = null;
+    }
+  }
+
+  /** This repo's own value for a per-repo flag. */
+  async function setRepoOverride(flag: FeatureInfo, value: boolean) {
+    featuresBusy = flag.name;
+    try {
+      if (flag.name === "semanticIndex") await app.setSemanticIndex(value);
+      else await api.setProjectFeature(flag.name, value);
+      await loadFeatures();
+    } catch (e) {
+      toast.error(`Could not change ${flag.label}`, e);
+    } finally {
+      featuresBusy = null;
+    }
+  }
 
   async function refreshModels() {
     modelsLoading = true;
@@ -76,20 +140,57 @@
     }
   }
 
-  function fmtModelSize(n: number): string {
-    if (n <= 0) return "";
-    const mb = n / (1024 * 1024);
-    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-    return `${Math.round(mb)} MB`;
-  }
-
   async function removeModel(id: string) {
     removing = id;
     try {
       await api.removeModel(id);
       await refreshModels();
+    } catch (e) {
+      toast.error("Could not remove the model", e);
     } finally {
       removing = null;
+    }
+  }
+
+  async function select(category: ModelCategory, id: string) {
+    try {
+      await api.setModelSelection(category, id);
+      await refreshModels();
+      if (category === "embedding") embedding = await api.embeddingState().catch(() => embedding);
+    } catch (e) {
+      toast.error("Could not switch the model", e);
+      await refreshModels();
+    }
+  }
+
+  /** Switching the search-by-meaning model re-reads every file once; say so
+   *  before it starts. */
+  function pick(e: Event, category: ModelCategory, m: ModelStatus) {
+    if (category !== "embedding" || !embeddingModels.some((x) => x.selected)) {
+      void select(category, m.id);
+      return;
+    }
+    // Put the radios back as they were until the switch is confirmed.
+    const el = e.currentTarget as HTMLInputElement;
+    const current = embeddingModels.find((x) => x.selected)?.id;
+    for (const input of document.getElementsByName(el.name) as NodeListOf<HTMLInputElement>) {
+      input.checked = input.value === current;
+    }
+    const r = el.getBoundingClientRect();
+    openConfirm(r.left, r.bottom + 6, {
+      title: `Search by meaning with ${m.name}?`,
+      body: "Ken reads every file once more for meaning. Keyword search works meanwhile.",
+      confirmLabel: "Switch",
+      onConfirm: () => void select(category, m.id),
+    });
+  }
+
+  async function setUseGpu(on: boolean) {
+    try {
+      await api.setUseGpu(on);
+      gpu = await api.gpuInfo().catch(() => (gpu ? { ...gpu, useGpu: on } : gpu));
+    } catch (e) {
+      toast.error("Could not change the graphics card setting", e);
     }
   }
 
@@ -100,479 +201,481 @@
       clearTimeout(copyTimer);
       copyTimer = setTimeout(() => (copied = null), 1600);
     } catch {
-      // Clipboard unavailable — leave the button as-is.
+      // Clipboard unavailable: leave the button as it is.
     }
   }
 
-  async function toggleSyncAuto() {
-    if (!sync) return;
-    sync = await api.setSyncAuto(!sync.auto);
-  }
-
-  async function syncNow() {
-    syncingNow = true;
-    try {
-      await api.syncNow();
-    } finally {
-      // Brief acknowledgement; live progress shows on the title-bar dot.
-      setTimeout(() => (syncingNow = false), 1200);
-    }
-  }
-
-  async function setRunnerMode(mode: "hidden-tui" | "headless") {
-    runnerMode = mode;
-    await api.setIngestRunnerMode(mode);
-  }
-
-  async function toggleFolder(relPath: string) {
-    if (!app.project || toggling) return;
-    toggling = true;
-    try {
-      const currentlyExcluded = isExcluded(relPath, excludedSet);
-      const next = toggleFolderPaths(relPath, currentlyExcluded, excludedSet);
-      await app.setExcluded(next);
-    } finally {
-      toggling = false;
-    }
-  }
-
-  async function reindex() {
-    busy = true;
-    try {
-      await app.reindex();
-    } finally {
-      busy = false;
-    }
+  /** A distill candidate's body, cut short; approving opens the whole memory. */
+  function bodyPreview(body: string, max = 320): string {
+    const trimmed = body.trim();
+    return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
   }
 </script>
 
-<div class="wrap">
-  <div class="inner">
+<div class="settings">
+  <nav class="snav" aria-label="Settings">
     <h1>Settings</h1>
+    {#each sections as s (s.key)}
+      <button class:on={app.settingsSection === s.key} onclick={() => (app.settingsSection = s.key)}>
+        <span class="slabel">{s.label}</span>
+        <span class="ssub">{s.sub}</span>
+      </button>
+    {/each}
+  </nav>
+  <div class="wrap">
+  <div class="inner">
+    <h2 class="stitle">{sections.find((s) => s.key === app.settingsSection)?.label}</h2>
 
-    <section class="group">
-      <div class="group-head">This project</div>
-
-    <div class="card">
-      <div class="card-title">Project</div>
-      <div class="row">
-        <span class="label">Name</span>
-        <span>{app.project?.name}</span>
-      </div>
-      <div class="row">
-        <span class="label">Folder</span>
-        <span class="mono small">{app.project?.root}</span>
-      </div>
-      <div class="row">
-        <span class="label">Index</span>
-        <span>{app.files.length} files
-          {#if app.failedFiles.length}· {app.failedFiles.length} failed{/if}
-        </span>
-        <button class="btn btn-small" onclick={reindex} disabled={busy}>
-          {busy ? "Rebuilding…" : "Reindex"}
-        </button>
-      </div>
-      <p class="note">
-        Reindex rebuilds Ken's local index from your files. It never changes the
-        files themselves.
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Watched folders</div>
-      <p class="note">
-        Ken watches every folder by default. Uncheck one to leave it and
-        everything inside it out of search and AI features.
-      </p>
-      {#if app.folders.length === 0}
-        <p class="note">No subfolders — everything at the top level is watched.</p>
-      {:else}
-        <div class="folder-tree">
-          {#each folderTree as node (node.relPath)}
-            {@render folderRow(node, 0)}
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    {#snippet folderRow(node: FolderNode, depth: number)}
-      {@const tri = folderTriState(node.relPath, excludedSet)}
-      <div class="frow" style:padding-left={`${depth * 20}px`}>
-        {#if node.children.length > 0}
-          <button
-            class="chev"
-            class:open={expanded.has(node.relPath)}
-            aria-label={expanded.has(node.relPath) ? "Collapse" : "Expand"}
-            onclick={() => toggleExpand(node.relPath)}
-          >
-            <ChevronRight size={14} strokeWidth={2} />
-          </button>
-        {:else}
-          <span class="chev-spacer"></span>
-        {/if}
-        <label class="fcheck">
-          <input
-            type="checkbox"
-            checked={tri === "checked"}
-            indeterminate={tri === "indeterminate"}
-            disabled={toggling}
-            onchange={() => toggleFolder(node.relPath)}
-          />
-          <span class="mono">{node.name}</span>
-        </label>
-      </div>
-      {#if expanded.has(node.relPath)}
-        <div class="subtree">
-          {#each node.children as child (child.relPath)}
-            {@render folderRow(child, depth + 1)}
-          {/each}
-        </div>
-      {/if}
-    {/snippet}
-
-    {#if app.ignored.length > 0}
-      <div class="card">
-        <div class="card-title">Ignored files</div>
-        <p class="note">
-          Issues for these files are hidden from Review and Home — for you only,
-          never shared with your team. They stay indexed and searchable.
-        </p>
-        <div class="folders">
-          {#each app.ignored as path (path)}
-            <div class="folder ignored">
-              <span class="mono">{path}</span>
-              <button
-                class="btn btn-small"
-                onclick={() => void app.unignoreFile(path)}
-              >
-                Un-ignore
-              </button>
-            </div>
-          {/each}
-        </div>
-      </div>
+    {#if app.settingsSection === "team"}
+      <TeamScreen />
     {/if}
 
-    <div class="card">
-      <div class="card-title">Cloud files</div>
-      <div class="row">
-        <label class="radio">
-          <input
-            type="checkbox"
-            checked={app.backgroundIndex}
-            onchange={(e) =>
-              void app.setBackgroundIndex(e.currentTarget.checked)}
-          />
-          Index cloud files in the background
-        </label>
-      </div>
-      <p class="note">
-        Downloads cloud-offline documents so they're searchable without opening
-        them. Large media still download on open.
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Video transcription</div>
-      <div class="row">
-        <label class="radio">
-          <input
-            type="checkbox"
-            checked={app.transcribeVideosOnIndex}
-            onchange={(e) =>
-              void app.setTranscribeVideosOnIndex(e.currentTarget.checked)}
-          />
-          Transcribe videos during indexing
-        </label>
-      </div>
-      <p class="note">
-        Runs on-device speech-to-text (Whisper) to make video audio searchable
-        as files are indexed. Off by default because it's slow and CPU-heavy;
-        you can always transcribe a single video on demand from its player.
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Sync &amp; collaboration</div>
-      {#if sync?.mode === "git"}
-        <div class="row">
-          <span class="chip mono">git</span>
-          {#if sync.remote}
-            <span class="mono small">{sync.remote} {sync.branch ?? ""}</span>
-            <span class="soft">
-              {sync.active
-                ? "updates flow automatically · conflicts go to Review"
-                : "automatic updates are off"}
-            </span>
-          {:else}
-            <span class="soft">
-              no shared location set up yet — Ken keeps everything local
-            </span>
-          {/if}
-        </div>
-        {#if sync.remote}
-          <div class="row">
-            <label class="radio">
-              <input
-                type="checkbox"
-                checked={sync.auto}
-                onchange={() => void toggleSyncAuto()}
-              />
-              Keep this project in sync automatically
-            </label>
-            <button
-              class="btn btn-small sync-now"
-              onclick={() => void syncNow()}
-              disabled={!sync.active || syncingNow}
-            >
-              {syncingNow ? "Syncing…" : "Sync now"}
-            </button>
-          </div>
+    {#if app.settingsSection === "sync"}
+      <section class="group">
+        <div class="card">
+          <div class="card-title">How the team's files sync</div>
           <p class="note">
-            Ken fetches your team's updates when you return to the app and
-            shares your saves shortly after you make them. When two people
-            change the same document, both versions land in Review.
+            Each folder Ken reads syncs through its own Git remote, set in its row under Team library. A file two people
+            changed at once shows in the Inbox under Sync &amp; files, with both versions side by side.
           </p>
-        {/if}
-      {:else}
-        <div class="row">
-          <span class="chip mono">shared drive</span>
-          <span class="soft">
-            Ken watches for conflicting copies — they land in Review.
-          </span>
         </div>
-        <p class="note">
-          If this folder lives in Dropbox, OneDrive, or Google Drive, the
-          drive does the syncing; Ken keeps an eye out for the damage
-          conflicting edits leave behind.
-        </p>
-      {/if}
-    </div>
-    </section>
+        <TeamInbox />
+      </section>
+    {/if}
 
+    {#if app.settingsSection === "rules"}
+      <section class="group">
+        <div class="card">
+          <div class="card-title">What Ken writes on its own</div>
+          <p class="note">
+            When a source is added, Ken writes the note and what follows from it at once, each citing the note: page edits,
+            new pages, ideas, escalations and your next steps. Each has an Undo on its card in Ingest.
+          </p>
+        </div>
+        <div class="card">
+          <div class="card-title">What waits for you</div>
+          <ul class="rules">
+            <li>A ruling, in the words of the person who decides it. Only they can accept it.</li>
+            <li>A change to Ways-of-Working, Conventions or a rule. It becomes a ticket.</li>
+            <li>An edit that rewrites more than a fifth of a page, or lands on a page someone changed while Ken was reading.</li>
+            <li>An action. It becomes a ticket once accepted.</li>
+          </ul>
+          <p class="note">These wait in the Inbox under Ken. Human edits always win.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">The team's own rules</div>
+          <p class="note">The rules reviewers check work against are pages in the wiki. Add one under Team library.</p>
+          <div class="row"><button class="btn btn-small" onclick={() => (app.settingsSection = "team")}>Open Team library</button></div>
+        </div>
+      </section>
+    {/if}
+
+    <!-- ── General ─────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "general"}
     <section class="group">
-      <div class="group-head">On this Mac</div>
 
-    <div class="card">
-      <div class="card-title">Appearance</div>
-      <div class="row">
-        <span class="label">Theme</span>
-        <div class="seg-group" role="radiogroup" aria-label="Theme">
-          {#each themeOptions as opt (opt.value)}
-            <button
-              class="seg"
-              class:on={theme.mode === opt.value}
-              role="radio"
-              aria-checked={theme.mode === opt.value}
-              onclick={() => theme.set(opt.value)}
-            >{opt.title}</button>
-          {/each}
+      <div class="card">
+        <div class="card-title">Appearance</div>
+        <div class="row">
+          <span class="label">Theme</span>
+          <div class="seg-group" role="radiogroup" aria-label="Theme">
+            {#each themeOptions as opt (opt.value)}
+              <button
+                class="seg"
+                class:on={theme.mode === opt.value}
+                role="radio"
+                aria-checked={theme.mode === opt.value}
+                onclick={() => theme.set(opt.value)}>{opt.title}</button
+              >
+            {/each}
+          </div>
         </div>
       </div>
-    </div>
 
-    <div class="card">
-      <div class="card-title">Files list</div>
-      <div class="row">
+      <div class="card">
+        <div class="card-title">Files list</div>
         <label class="radio">
-          <input
-            type="checkbox"
-            checked={app.followOpen}
-            onchange={(e) => app.setFollowOpen(e.currentTarget.checked)}
-          />
+          <input type="checkbox" checked={app.followOpen} onchange={(e) => app.setFollowOpen(e.currentTarget.checked)} />
           Highlight the open file in the files list
         </label>
+        <p class="note">The folder tree follows and opens to whichever file is open.</p>
       </div>
-      <p class="note">
-        The folder tree follows and expands to whichever file is open.
-      </p>
-    </div>
 
-    <div class="card">
-      <div class="card-title">Offline models</div>
-      <p class="note">These run on your Mac — nothing you say or store leaves it.</p>
-      {#if modelsLoading}
-        <p class="note">Checking for models…</p>
-      {:else}
-        {@render modelCategory("Transcription", "transcription", transcriptionModels)}
-        {#if languageModels.length > 0}
-          {@render modelCategory("Answers & Map", "language", languageModels)}
-        {/if}
+      {#if app.ignored.length > 0}
+        <div class="card">
+          <div class="card-title">Ignored files</div>
+          <p class="note">
+            Ken no longer flags these when it cannot read them. For you only, never shared. They stay indexed and
+            searchable.
+          </p>
+          <div class="list">
+            {#each app.ignored as path (path)}
+              <div class="list-row">
+                <span class="mono small">{path}</span>
+                <button class="btn btn-small push" onclick={() => void app.unignoreFile(path)}>Un-ignore</button>
+              </div>
+            {/each}
+          </div>
+        </div>
       {/if}
-    </div>
 
-    {#snippet modelCategory(title: string, cat: "transcription" | "language", list: ModelStatus[])}
-      <div class="mcat">
-        <div class="mcat-title">{title}</div>
-        {#each list as m (m.id)}
-          <div class="mopt" class:selected={m.selected}>
+    </section>
+    {/if}
+
+    <!-- ── AI ─────────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "ai"}
+    <section class="group">
+
+      <div class="card">
+        <div class="card-title">Offline models</div>
+        <p class="note">These run on this computer; nothing you say or store leaves it.</p>
+        {#if modelsLoading}
+          <p class="note">Checking for models…</p>
+        {:else}
+          {@render modelCategory("Transcription", "transcription", transcriptionModels)}
+
+          {@render modelCategory("Search by meaning", "embedding", embeddingModels)}
+          {#if embedding}
+            <div class="mstate">
+              {#if embedding.rebuilding}
+                <ProgressBar pct={embeddingPct(embedding)} label={embeddingLine(embedding)} />
+              {:else}
+                <p class="note">{embeddingLine(embedding)}</p>
+              {/if}
+            </div>
+          {/if}
+
+          <div class="mcat">
+            <div class="mcat-title">Graphics card</div>
+            <label class="radio">
+              <input type="checkbox" checked={gpu?.useGpu ?? true} disabled={!gpu} onchange={(e) => void setUseGpu(e.currentTarget.checked)} />
+              Use the graphics card
+            </label>
+            {#if gpu}<p class="note">{runsOnLine(gpu)}</p>{/if}
+          </div>
+        {/if}
+      </div>
+
+      {#snippet modelCategory(title: string, cat: ModelCategory, list: ModelStatus[])}
+        <div class="mcat">
+          <div class="mcat-title">{title}</div>
+          {#each list as m (m.id)}
+            {@render modelRow(cat, m, true)}
+          {:else}
+            <p class="note">None on offer.</p>
+          {/each}
+        </div>
+      {/snippet}
+
+      {#snippet modelRow(cat: ModelCategory, m: ModelStatus, selectable: boolean)}
+        <div class="mopt" class:selected={selectable && m.selected}>
+          {#if selectable}
             <label class="mradio">
               <input
                 type="radio"
                 name={`model-${cat}`}
+                value={m.id}
                 checked={m.selected}
                 disabled={!m.installed}
-                onchange={() => void selectModel(cat, m.id)}
+                onchange={(e) => pick(e, cat, m)}
               />
-              <span class="mopt-main">
-                <span class="mname">{m.name}</span>
-                <span class="mtier">{m.tier === "recommended" ? "Recommended" : "Advanced"}</span>
-                <span class="mblurb">{m.blurb}</span>
-              </span>
+              {@render modelText(m)}
             </label>
-            {#if m.installed}
-              <div class="mopt-actions">
-                <span class="soft"><span class="ok-dot"></span>Installed{#if m.sizeBytes}· {fmtModelSize(m.sizeBytes)}{/if}</span>
-                {#if !m.selected}
-                  <button class="btn btn-small remove" onclick={() => void removeModel(m.id)} disabled={removing === m.id}>
-                    {removing === m.id ? "Removing…" : "Remove"}
-                  </button>
-                {/if}
-              </div>
-            {:else}
+          {:else}
+            <div class="mradio indent">{@render modelText(m)}</div>
+          {/if}
+          {#if m.installed}
+            <div class="mopt-actions">
+              <span class="soft"><span class="ok-dot"></span>Installed{#if m.sizeBytes} · {modelSize(m.sizeBytes)}{/if}</span>
+              {#if !m.selected || !selectable}
+                <button class="btn btn-small push" onclick={() => void removeModel(m.id)} disabled={removing === m.id}>
+                  {removing === m.id ? "Removing…" : "Remove"}
+                </button>
+              {/if}
+            </div>
+          {:else}
+            <div class="mopt-actions">
               <ModelDownloadDialog status={m} compact onInstalled={refreshModels} />
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/snippet}
+            </div>
+          {/if}
+        </div>
+      {/snippet}
 
-    <div class="card">
-      <div class="card-title">AI runner</div>
-      {#if ingests.doctor?.found}
-        <p class="note">
-          <span class="ok-dot"></span>Claude Code found
-          {#if ingests.doctor.version}({ingests.doctor.version}){/if}
-          <span class="mono small">{ingests.doctor.path}</span>
-        </p>
-      {:else}
-        <p class="note warn">
-          Claude Code isn't installed — ingests can't run until it is.
-          <span class="mono small">npm i -g @anthropic-ai/claude-code</span>
-        </p>
-      {/if}
-      <div class="row">
-        <span class="label">Mode</span>
-        <label class="radio">
-          <input
-            type="radio"
-            name="runner"
-            checked={runnerMode === "headless"}
-            onchange={() => setRunnerMode("headless")}
-          />
-          Background <span class="soft">(recommended — can't get stuck on setup prompts)</span>
-        </label>
-      </div>
-      <div class="row">
-        <span class="label"></span>
-        <label class="radio">
-          <input
-            type="radio"
-            name="runner"
-            checked={runnerMode === "hidden-tui"}
-            onchange={() => setRunnerMode("hidden-tui")}
-          />
-          Interactive <span class="soft">(watch or step in via Chats; Claude's one-time prompts need answering there)</span>
-        </label>
-      </div>
-    </div>
-    </section>
+      {#snippet modelText(m: ModelStatus)}
+        <span class="mopt-main">
+          <span class="mname">{m.name} <span class="mtier">{tierLabel(m.tier)}</span></span>
+          <span class="mblurb">{m.blurb}{#if m.languages} · {m.languages}{/if}</span>
+        </span>
+      {/snippet}
 
-    <section class="group">
-      <div class="group-head">Working with agents</div>
-
-    <div class="card">
-      <div class="mcp-head">
-        <span class="card-title">Connect an agent</span>
-        {#if mcp?.binaryPath}
-          <span class="mcp-status">
-            <span class="ok-dot"></span>Ready — agents start it on demand
-          </span>
+      <div class="card">
+        <div class="card-title">Claude Code</div>
+        {#if doctor?.found}
+          <p class="note">
+            <span class="ok-dot"></span>Found{#if doctor.version}, version {doctor.version}{/if}
+            {#if doctor.path}<span class="mono small path">{doctor.path}</span>{/if}
+          </p>
+          <p class="note">Ken writes, reads sources in, judges and answers with it.</p>
+        {:else if doctor}
+          <p class="note warn">Not found. Ingest, the digest, answers and the map need it.</p>
+          <p class="note">{doctor.help || claudeInstallHelp()}</p>
+        {:else}
+          <p class="note">Checking…</p>
         {/if}
       </div>
-      <p class="note">
-        Ken's connector lets Claude Code, Cursor, and other agents search this
-        project's knowledge and read its documents. It can only read — never
-        change — your files.
-      </p>
-      {#if mcp?.binaryPath}
-        <div class="mcp-block">
-          <div class="mcp-comment"># add Ken to any agent — scoped to this project</div>
-          <div class="mcp-cmd-row">
-            <code class="mcp-cmd">{mcp.addCommand}</code>
-            <button
-              class="mcp-copy"
-              onclick={() => mcp && copy(mcp.addCommand, "command")}
-            >
-              {#if copied === "command"}
-                <Check size={13} strokeWidth={1.75} /> copied
-              {:else}
-                <Copy size={13} strokeWidth={1.75} /> copy
-              {/if}
+
+      {#if backgroundReading}
+        <div class="card">
+          <div class="card-title">{backgroundReading.label}</div>
+          <label class="radio">
+            <input
+              type="checkbox"
+              checked={backgroundReading.global}
+              disabled={featuresBusy === backgroundReading.name}
+              onchange={(e) => backgroundReading && void setGlobalDefault(backgroundReading, e.currentTarget.checked)}
+            />
+            Read new files in the background
+          </label>
+          <p class="note">{backgroundReading.description}</p>
+        </div>
+      {/if}
+      <div class="card">
+        <div class="card-title">Memory: journal distillation</div>
+        <p class="note">
+          Ken reads the workspace journal and drafts long-term memories from what keeps coming back. Nothing is
+          written to <span class="mono small">memory/</span> until you approve a draft below.
+        </p>
+        {#if memory.phase === "planning" || memory.phase === "distilling"}
+          <div class="row">
+            <span class="mini-spinner" aria-hidden="true"></span>
+            <span class="soft">{memory.phase === "planning" ? "Reading the journal…" : "Drafting…"}</span>
+          </div>
+        {/if}
+        {#if memory.phase === "error" && memory.errorReason}
+          <p class="note warn">Distillation failed: {memory.errorReason}</p>
+        {/if}
+        <div class="row">
+          <button
+            class="btn btn-small"
+            onclick={() => void memory.distill()}
+            disabled={memory.phase === "planning" || memory.phase === "distilling"}
+          >
+            {memory.phase === "planning" || memory.phase === "distilling" ? "Distilling…" : "Distill the journal"}
+          </button>
+        </div>
+      </div>
+
+      {#each memory.candidates as c (c.slug)}
+        <div class="card">
+          <div class="card-title">{c.slug}</div>
+          <div class="row"><span class="chip mono">.ken-workspace/memory/{c.slug}.md</span></div>
+          {#if c.description}<p class="note">{c.description}</p>{/if}
+          <pre class="memory-body">{bodyPreview(c.body)}</pre>
+          {#if c.sources.length > 0}
+            <div class="list">
+              {#each c.sources as src}
+                {@const reason = unopenableReason(toWorkspaceAddress(src))}
+                <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
+              {/each}
+            </div>
+          {/if}
+          <div class="row">
+            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, true)} disabled={memory.resolvingSlug === c.slug}>
+              Approve
+            </button>
+            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, false)} disabled={memory.resolvingSlug === c.slug}>
+              Dismiss
             </button>
           </div>
         </div>
-        <div class="mcp-chips">
-          <span class="mcp-chip">
-            <strong>Scope</strong> — this project only
-          </span>
-          <button
-            class="mcp-chip mcp-chip-btn"
-            onclick={() => mcp && copy(mcp.llmInstruction, "instruction")}
-          >
-            <strong>LLM instruction</strong> — paste into any agent ·
-            <span class="mcp-chip-action">
-              {#if copied === "instruction"}
-                <Check size={12} strokeWidth={1.75} /> copied
-              {:else}
-                <Copy size={12} strokeWidth={1.75} /> copy
-              {/if}
-            </span>
-          </button>
-        </div>
-      {:else if mcp}
-        <p class="note">
-          The connector (<span class="mono small">ken-mcp</span>) ships with
-          Ken's installer but wasn't found on this machine — reinstalling Ken
-          restores it. Building from source? Run
-          <span class="mono small">cargo build -p ken-mcp</span>.
-        </p>
-      {/if}
-    </div>
+      {/each}
     </section>
 
+    {#if kenFeatures.length > 0}
+      <section class="group">
+        <div class="group-head">Features</div>
+        {#each kenFeatures as flag (flag.name)}
+          <div class="card">
+            <div class="card-title">{flag.label}</div>
+            <p class="note">
+              {flag.description}
+              <span class="flag-meta">{flag.applies} · <span class="mono">{flag.name}</span></span>
+            </p>
+            <label class="radio">
+              <input
+                type="checkbox"
+                checked={flag.global}
+                disabled={featuresBusy === flag.name}
+                onchange={(e) => void setGlobalDefault(flag, e.currentTarget.checked)}
+              />
+              On by default for every repo
+            </label>
+            {#if flag.scope === "project"}
+              <label class="radio">
+                <input
+                  type="checkbox"
+                  checked={flag.projectOverride ?? flag.global}
+                  disabled={featuresBusy === flag.name}
+                  onchange={(e) => void setRepoOverride(flag, e.currentTarget.checked)}
+                />
+                On for {app.project?.name ?? "this repo"}
+              </label>
+              <p class="note">
+                {flag.projectOverride === null ? "This repo follows the default above." : "This repo has its own setting."}
+              </p>
+            {/if}
+            {#if flag.name === "semanticIndex" && flag.effective && app.semanticIndexState}
+              {#if app.semanticIndexState.state === "building"}
+                <p class="note">Reading for meaning: {app.semanticIndexState.done} of {app.semanticIndexState.total} files.</p>
+              {:else if app.semanticIndexState.state === "unavailable"}
+                <p class="note">Not available now: {app.semanticIndexState.reason}</p>
+              {:else if app.semanticIndexState.state === "warning"}
+                <p class="note">{app.semanticIndexState.reason}</p>
+              {/if}
+            {/if}
+          </div>
+        {/each}
+      </section>
+    {/if}
+    {/if}
+
+    <!-- ── Agents ──────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "agents"}
+    <section class="group">
+      <div class="card">
+        <div class="mcp-head">
+          <span class="card-title">Connect an agent</span>
+          {#if mcp?.binaryPath}
+            <span class="mcp-status"><span class="ok-dot"></span>Ready; an agent starts it when it needs it</span>
+          {/if}
+        </div>
+        <p class="note">
+          Ken's connector lets Claude Code, Cursor and other agents search the team's repos and read their files. It
+          writes only Your day tasks, memories, the journal and team inbox messages, never your files.
+        </p>
+        {#if mcp?.binaryPath}
+          <div class="mcp-block">
+            <div class="mcp-comment"># add Ken to an agent, scoped to this repo</div>
+            <div class="mcp-cmd-row">
+              <code class="mcp-cmd">{mcp.addCommand}</code>
+              <button class="mcp-copy" onclick={() => mcp && copy(mcp.addCommand, "command")}>
+                {#if copied === "command"}<Check size={13} strokeWidth={1.75} /> copied{:else}<Copy size={13} strokeWidth={1.75} /> copy{/if}
+              </button>
+            </div>
+          </div>
+          <div class="mcp-chips">
+            <span class="mcp-chip"><strong>Scope</strong>: this repo</span>
+            <button class="mcp-chip mcp-chip-btn" onclick={() => mcp && copy(mcp.llmInstruction, "instruction")}>
+              <strong>Instructions for the agent</strong>: paste them in ·
+              <span class="mcp-chip-action">
+                {#if copied === "instruction"}<Check size={12} strokeWidth={1.75} /> copied{:else}<Copy size={12} strokeWidth={1.75} /> copy{/if}
+              </span>
+            </button>
+          </div>
+        {:else if mcp}
+          <p class="note">
+            The connector (<span class="mono small">ken-mcp</span>) comes with Ken's installer but is not on this
+            computer; installing Ken again puts it back. From source: <span class="mono small">cargo build -p ken-mcp</span>.
+          </p>
+        {/if}
+      </div>
+    </section>
+    {/if}
+
+    <!-- ── About (General) ─────────────────────────────────────────── -->
+    {#if app.settingsSection === "general"}
     <section class="group">
       <div class="group-head">About</div>
-
-    <div class="card">
-      <div class="row">
-        <span class="about-version">Ken v{whatsNew.version}</span>
-        <button class="whats-new" onclick={() => whatsNew.show()}>
-          What's new in this version
-        </button>
+      <div class="card">
+        <div class="row">
+          <span class="about-version">Ken v{whatsNew.version}</span>
+          <button class="whats-new" onclick={() => whatsNew.show()}>What's new in this version</button>
+        </div>
+        <p class="note">Each folder's own settings (reindex, watched folders, cloud files, sync) open from its row in Team library.</p>
       </div>
-    </div>
     </section>
-
+    {/if}
+  </div>
   </div>
 </div>
 
 <style>
+  .settings {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    min-height: 0;
+  }
+  .snav {
+    width: 230px;
+    flex: none;
+    border-right: 1px solid var(--line-soft);
+    padding: 24px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-sizing: border-box;
+    overflow-y: auto;
+  }
+  .snav h1 {
+    margin: 0 0 14px;
+    padding: 0 10px;
+    font-family: var(--font-serif);
+    font-size: 28px;
+    font-weight: 500;
+  }
+  .snav button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    text-align: left;
+    color: var(--ink);
+  }
+  .snav button:hover {
+    background: var(--line-soft);
+  }
+  .snav button.on {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+  .slabel {
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+  .ssub {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  .stitle {
+    margin: 0;
+    font-family: var(--font-serif);
+    font-size: 24px;
+    font-weight: 500;
+  }
+  .rules {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
   .wrap {
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 36px 44px;
+    padding: 32px 40px;
   }
   .inner {
-    max-width: 720px;
-    margin: 0 auto;
+    max-width: 760px;
     display: flex;
     flex-direction: column;
-    gap: 40px; /* between groups (overrides the old uniform 18px) */
+    gap: 20px;
   }
-  /* Groups: generous separation between, tighter within — restores hierarchy
-     without new chrome. */
   .group {
     display: flex;
     flex-direction: column;
@@ -586,12 +689,6 @@
     color: var(--ink-tertiary);
     margin-bottom: 2px;
   }
-  h1 {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 28px;
-    font-weight: 500;
-  }
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -600,9 +697,6 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-  }
-  .card.muted {
-    color: var(--ink-tertiary);
   }
   .card-title {
     font-size: 14px;
@@ -630,24 +724,31 @@
     color: var(--ink-tertiary);
     line-height: 1.6;
   }
-  .folders {
+  .note.warn {
+    color: var(--needs-input-text);
+  }
+  .path {
+    display: block;
+    overflow-wrap: anywhere;
+  }
+  /* Where a feature applies, and its code name for anyone editing JSON. */
+  .flag-meta {
+    display: block;
+    font-size: 11.5px;
+    opacity: 0.85;
+  }
+  .list {
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
-  .folder {
+  .list-row {
     display: flex;
     align-items: center;
     gap: 9px;
     font-size: 13px;
-    cursor: pointer;
-    padding: 3px 0;
   }
-  /* The ignored-files rows are read-only listings, not toggles. */
-  .folder.ignored {
-    cursor: default;
-  }
-  .btn {
+  .push {
     margin-left: auto;
   }
   .radio {
@@ -672,10 +773,6 @@
     background: var(--sunken);
     flex: none;
   }
-  .sync-now {
-    margin-left: auto;
-  }
-  /* Appearance / any segmented control, matching the Files All/Unread filter. */
   .seg-group {
     display: inline-flex;
     border: 1px solid var(--border);
@@ -690,41 +787,78 @@
     font-size: 12.5px;
     font-weight: 500;
   }
-  .seg-group .seg:hover { background: var(--sunken); }
+  .seg-group .seg:hover {
+    background: var(--sunken);
+  }
   .seg-group .seg.on {
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent-deep);
     font-weight: 600;
   }
-  /* Watched-folders tree */
-  .folder-tree { display: flex; flex-direction: column; gap: 2px; }
-  .frow { display: flex; align-items: center; gap: 4px; }
-  .chev {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 18px; height: 18px; border: none; background: transparent;
-    color: var(--ink-tertiary); border-radius: 4px;
-    transition: transform 0.15s ease;
-  }
-  .chev:hover { background: var(--sunken); color: var(--ink); }
-  .chev.open { transform: rotate(90deg); }
-  .chev-spacer { width: 18px; flex: none; }
-  .fcheck { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
-  .fcheck input { accent-color: var(--accent); }
-  .subtree { display: flex; flex-direction: column; gap: 2px; }
   /* Offline models */
-  .mcat { display: flex; flex-direction: column; gap: 10px; }
-  .mcat + .mcat { margin-top: 16px; }
-  .mcat-title { font-size: 12px; font-weight: 600; color: var(--ink-secondary); }
-  .mopt { display: flex; flex-direction: column; gap: 6px; padding: 8px 0; }
-  .mradio { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
-  .mradio input { accent-color: var(--accent); margin-top: 3px; }
-  .mopt-main { display: flex; flex-direction: column; gap: 2px; }
-  .mname { font-size: 13px; font-weight: 500; }
-  .mtier { font-size: 11px; color: var(--accent); }
-  .mblurb { font-size: 12px; color: var(--ink-tertiary); }
-  .mopt-actions { display: flex; align-items: center; gap: 10px; padding-left: 28px; }
-  .remove {
-    margin-left: auto;
+  .mcat {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 14px;
+    border-top: 1px solid var(--sunken);
+  }
+  .mcat-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-secondary);
+  }
+  .mopt {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 0;
+  }
+  .mradio {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+  }
+  .mradio.indent {
+    padding-left: 24px;
+    cursor: default;
+  }
+  .mradio input {
+    accent-color: var(--accent);
+    margin-top: 3px;
+  }
+  .mopt-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .mname {
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .mtier {
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--accent);
+  }
+  .mblurb {
+    font-size: 12px;
+    color: var(--ink-tertiary);
+  }
+  .mopt-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-left: 24px;
+  }
+  .mopt-actions :global(.model) {
+    flex: 1;
+  }
+  .mstate {
+    padding-left: 24px;
+    max-width: 420px;
   }
   .ok-dot {
     display: inline-block;
@@ -734,8 +868,38 @@
     background: var(--healthy);
     margin-right: 7px;
   }
-  .note.warn {
-    color: var(--needs-input-text);
+  .memory-body {
+    margin: 0;
+    padding: 10px 12px;
+    background: var(--sunken);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  /* A ken://workspace/... source that can't be opened yet: shown, with why. */
+  .disabled-link {
+    color: var(--ink-tertiary);
+    cursor: not-allowed;
+  }
+  .mini-spinner {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    border: 2px solid color-mix(in srgb, var(--ink-tertiary) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .mcp-head {
     display: flex;
@@ -812,6 +976,14 @@
   .mcp-chip-btn:hover {
     border-color: var(--border-strong);
   }
+  .mcp-chip-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--accent);
+    font-weight: 600;
+    vertical-align: middle;
+  }
   .about-version {
     font-size: 13px;
     color: var(--ink-secondary);
@@ -829,13 +1001,5 @@
   }
   .whats-new:hover {
     text-decoration: underline;
-  }
-  .mcp-chip-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    color: var(--accent);
-    font-weight: 600;
-    vertical-align: middle;
   }
 </style>

@@ -38,6 +38,8 @@
   const isDropTarget = $derived(drag.over === node.relPath);
   // Unread = changed by someone/something else since the user last looked.
   const isUnread = $derived(!isFolder && app.isUnread(node.relPath));
+  // Ken could not read it, and the person has not said to ignore it.
+  const isFailed = $derived(node.file?.status === "failed" && !app.ignored.includes(node.relPath));
 
   // Auto-expand when a reveal request targets this folder or something inside it.
   $effect(() => {
@@ -271,7 +273,7 @@
   <button
     class="row file"
     class:selected={app.openFile === node.relPath}
-    class:failed={node.file?.status === "failed"}
+    class:failed={isFailed}
     class:unread={isUnread}
     style:padding-left={`${8 + depth * 18 + 10}px`}
     draggable="true"
@@ -290,16 +292,16 @@
     ondragover={(e) => hasFiles(e.dataTransfer) && onExternalOver(e)}
     ondragleave={(e) => hasFiles(e.dataTransfer) && onExternalLeave()}
     ondrop={(e) => hasFiles(e.dataTransfer) && onExternalDrop(e)}
-    title={node.file?.status === "failed"
-      ? `Not indexed — ${node.file.error ?? "unknown reason"}`
+    title={isFailed
+      ? `Could not read — ${node.file?.error ?? "no reason given"}`
       : node.file?.status === "cloud_only"
         ? "Stored online only — open it and Ken will download it"
         : node.relPath}
   >
     <FileGlyph kind={node.file?.kind ?? "binary"} size="sm" />
     <span class="name">{node.name}</span>
-    {#if node.file?.status === "failed"}
-      <span class="fail-dot" title={node.file.error ?? "not indexed"}></span>
+    {#if isFailed}
+      <span class="fail-mark" title={node.file?.error ?? "could not read"}>could not read</span>
     {:else if node.file?.status === "cloud_only"}
       <CloudIcon class="cloud-dot" size={12} strokeWidth={1.75} />
     {:else if isUnread}
@@ -361,13 +363,15 @@
     padding: 0 5px;
     flex: none;
   }
-  .fail-dot {
+  .fail-mark {
     margin-left: auto;
-    width: 6px;
-    height: 6px;
-    border-radius: 3px;
-    background: var(--danger);
     flex: none;
+    font-size: 10px;
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+    border-radius: 4px;
+    padding: 0 5px;
+    white-space: nowrap;
   }
   /* Unread = changed by someone else. Name goes semibold and an accent dot
      trails it — distinct from the red failure dot and the grey cloud icon. */

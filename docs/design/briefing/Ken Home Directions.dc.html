@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Hanken+Grotesk:wght@400;500;600;700&family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,500&family=Instrument+Sans:wght@400;500;600;700&family=Oregano&display=swap" rel="stylesheet">
+<style>html,body{margin:0;background:#E9E8E4}body{font-family:"Hanken Grotesk",system-ui,sans-serif;-webkit-font-smoothing:antialiased}a{color:oklch(0.48 0.09 175);text-decoration:none}a:hover{text-decoration:underline}button{font-family:inherit;cursor:pointer}</style>
+</helmet>
+<section style="padding:48px;display:flex;flex-direction:column;gap:24px">
+  <div style="display:flex;flex-direction:column;gap:6px;max-width:900px">
+    <div style="font-size:13px;font-weight:600;color:#6B6862;letter-spacing:.06em;text-transform:uppercase">Turn 1 · Home directions</div>
+    <div style="font-size:15px;color:#3A3833;line-height:1.55;text-wrap:pretty">Three directions for Home. All three keep every current feature (digest + share + sources, tickets, tasks with accept / not mine / reply, + Task, recent files, index health, sync and update status, chats) and add one place that answers "what needs me?". Each also proposes the new labeled sidebar. Compare with the <a href="Ken Current Home.dc.html">current Home</a>.</div>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start">
+
+    <!-- ===================== 1a BRIEFING ===================== -->
+    <div id="1a" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;background:#1E1D1A;color:#fff;border-radius:6px;padding:3px 9px">1a</span>
+        <span style="font-size:16px;font-weight:600;color:#1E1D1A">Briefing</span>
+        <span style="font-size:14px;color:#6B6862">Editorial digest leads; a "Needs you" rail on the right. Warm light, Newsreader + Hanken Grotesk, teal accent.</span>
+      </div>
+      <div data-screen-label="1a Briefing" style="width:1280px;height:820px;display:flex;background:oklch(0.975 0.005 85);color:oklch(0.23 0.01 60);overflow:hidden;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.12);font-family:'Hanken Grotesk',sans-serif">
+        <aside style="width:232px;flex:none;background:oklch(0.955 0.006 85);border-right:1px solid oklch(0.9 0.008 80);display:flex;flex-direction:column;padding:14px 12px;gap:4px;box-sizing:border-box">
+          <div style="display:flex;gap:7px;padding:2px 4px 14px"><span style="width:12px;height:12px;border-radius:6px;background:#FF5F57"></span><span style="width:12px;height:12px;border-radius:6px;background:#FEBC2E"></span><span style="width:12px;height:12px;border-radius:6px;background:#28C840"></span></div>
+          <button style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:10px;border:1px solid oklch(0.9 0.008 80);background:oklch(0.99 0.003 85);text-align:left;margin-bottom:12px">
+            <span style="width:30px;height:30px;border-radius:8px;background:oklch(0.23 0.01 60);color:oklch(0.975 0.005 85);display:flex;align-items:center;justify-content:center;font-family:Oregano,cursive;font-size:19px;flex:none">K</span>
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column"><span style="font-size:13.5px;font-weight:600;color:oklch(0.23 0.01 60)">Northside Ops</span><span style="font-size:11.5px;color:oklch(0.5 0.08 160);display:flex;align-items:center;gap:5px"><span style="width:6px;height:6px;border-radius:3px;background:oklch(0.6 0.12 155)"></span>Synced 2m ago</span></span>
+            <span style="width:14px;height:14px;background:oklch(0.55 0.01 60);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/chevrons-up-down.svg) center/contain no-repeat"></span>
+          </button>
+          <sc-for list="{{ navA }}" as="n" hint-placeholder-count="10">
+            <sc-if value="{{ n.head }}"><div style="font-size:11px;font-weight:600;color:oklch(0.55 0.01 60);letter-spacing:.06em;text-transform:uppercase;padding:14px 10px 4px">{{ n.head }}</div></sc-if>
+            <sc-if value="{{ n.label }}">
+              <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:{{ n.bg }};color:{{ n.color }};font-size:13.5px;font-weight:{{ n.weight }};text-align:left">
+                <span style="width:16px;height:16px;flex:none;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>
+                <span style="flex:1">{{ n.label }}</span>
+                <sc-if value="{{ n.count }}"><span style="font-size:11.5px;font-weight:700;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:oklch(0.93 0.06 75);color:oklch(0.45 0.1 60);display:inline-flex;align-items:center;justify-content:center">{{ n.count }}</span></sc-if>
+                <sc-if value="{{ n.dot }}"><span style="width:7px;height:7px;border-radius:4px;background:oklch(0.5 0.1 175)"></span></sc-if>
+              </button>
+            </sc-if>
+          </sc-for>
+          <div style="flex:1"></div>
+          <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:transparent;color:oklch(0.42 0.01 60);font-size:13.5px"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/settings.svg) center/contain no-repeat"></span>Settings</button>
+          <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:transparent;color:oklch(0.55 0.01 60);font-size:13px"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/panel-left-close.svg) center/contain no-repeat"></span>Collapse</button>
+        </aside>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+          <header style="height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 24px;border-bottom:1px solid oklch(0.92 0.006 80)">
+            <button style="flex:1;max-width:520px;height:36px;border-radius:10px;border:1px solid oklch(0.9 0.008 80);background:oklch(0.995 0.002 85);display:flex;align-items:center;gap:10px;padding:0 12px;font-size:13.5px;color:oklch(0.55 0.01 60)">
+              <span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1;text-align:left">Search or ask Northside Ops…</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid oklch(0.9 0.008 80);border-radius:5px;padding:1px 6px">⌘K</span>
+            </button>
+            <span style="flex:1"></span>
+            <button style="height:32px;display:flex;align-items:center;gap:7px;padding:0 12px;border-radius:9px;border:1px solid oklch(0.9 0.008 80);background:oklch(0.995 0.002 85);font-size:13px;color:oklch(0.35 0.01 60)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/refresh-cw.svg) center/contain no-repeat"></span>Update ready</button>
+            <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 12px;border-radius:9px;border:none;background:oklch(0.48 0.09 175);color:#fff;font-size:13px;font-weight:600"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/sparkles.svg) center/contain no-repeat"></span>Ask Ken<span style="width:7px;height:7px;border-radius:4px;background:oklch(0.82 0.13 80)"></span></button>
+          </header>
+          <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 340px;overflow:hidden">
+            <main style="padding:28px 40px;overflow:hidden;display:flex;flex-direction:column;gap:22px">
+              <div style="display:flex;flex-direction:column;gap:14px;max-width:640px">
+                <div style="display:flex;align-items:baseline;gap:12px">
+                  <h1 style="margin:0;font-family:Newsreader,serif;font-size:34px;font-weight:500;letter-spacing:-.015em;line-height:1.1">Good morning, Sam</h1>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:oklch(0.5 0.01 60);white-space:nowrap"><span>Thursday, October 1</span><span>·</span><span>Digest at 7:02 AM · 3 sources</span><span style="flex:1"></span><button style="height:28px;padding:0 10px;border-radius:8px;border:1px solid oklch(0.9 0.008 80);background:transparent;font-size:12.5px;color:oklch(0.35 0.01 60);display:flex;align-items:center;gap:6px"><span style="width:13px;height:13px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/copy.svg) center/contain no-repeat"></span>Share</button></div>
+                <div style="font-family:Newsreader,serif;font-size:18px;line-height:1.55;text-wrap:pretty">
+                  <p style="margin:0 0 10px">Three things moved overnight. Priya updated the <a href="#">Volunteer Handbook</a> with a new shift-swap rule, which disagrees with the one in <a href="#">Ways of Working</a>. The <a href="#">Q4 Budget</a> now shows the venue deposit as paid.</p>
+                  <p style="margin:0">Ken read yesterday's board meeting and filed two decisions and one action for you.</p>
+                </div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:10px;max-width:680px">
+                <div style="display:flex;align-items:center;gap:10px">
+                  <h2 style="margin:0;font-size:15px;font-weight:600">Your list</h2>
+                  <span style="font-size:13px;color:oklch(0.55 0.01 60)">3 tickets · 4 tasks</span>
+                  <span style="flex:1"></span>
+                  <button style="height:28px;padding:0 10px;border-radius:8px;border:none;background:transparent;font-size:13px;font-weight:600;color:oklch(0.45 0.09 175);display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span>Add task</button>
+                </div>
+                <div style="display:flex;flex-direction:column;border-top:1px solid oklch(0.91 0.007 80)">
+                  <sc-for list="{{ list }}" as="t" hint-placeholder-count="6">
+                    <div style="display:flex;align-items:center;gap:12px;min-height:42px;border-bottom:1px solid oklch(0.92 0.006 80)">
+                      <span style="width:18px;height:18px;flex:none;border-radius:{{ t.cbRadius }};border:1.5px solid {{ t.cbBorder }};background:{{ t.cbBg }};box-sizing:border-box"></span>
+                      <span style="flex:1;min-width:0;display:flex;align-items:baseline;gap:8px">
+                        <sc-if value="{{ t.id }}"><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:oklch(0.45 0.09 175)">{{ t.id }}</span></sc-if>
+                        <span style="font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ t.color }};text-decoration:{{ t.deco }}">{{ t.title }}</span>
+                        <span style="font-size:12.5px;color:oklch(0.58 0.01 60);white-space:nowrap">{{ t.detail }}</span>
+                      </span>
+                      <sc-if value="{{ t.state }}"><span style="font-size:12px;color:oklch(0.4 0.01 60);background:oklch(0.94 0.006 80);border-radius:6px;padding:2px 8px">{{ t.state }}</span></sc-if>
+                      <span style="width:62px;text-align:right;font-size:12.5px;font-variant-numeric:tabular-nums;color:{{ t.dueColor }};font-weight:{{ t.dueWeight }}">{{ t.due }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:10px;max-width:680px">
+                <h2 style="margin:0;font-size:15px;font-weight:600">Picked up where you left off</h2>
+                <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px">
+                  <sc-for list="{{ recents }}" as="r" hint-placeholder-count="4">
+                    <div style="display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:10px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.92 0.006 80)">
+                      <span style="width:18px;height:18px;background:{{ r.color }};mask:url({{ r.icon }}) center/contain no-repeat"></span>
+                      <span style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.name }}</span>
+                      <span style="font-size:12px;color:oklch(0.58 0.01 60)">{{ r.repo }} · {{ r.at }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </main>
+            <aside style="border-left:1px solid oklch(0.92 0.006 80);background:oklch(0.965 0.006 85);padding:22px 18px;display:flex;flex-direction:column;gap:10px;overflow:hidden">
+              <div style="display:flex;align-items:center;gap:8px"><h2 style="margin:0;font-size:15px;font-weight:600">Needs you</h2><span style="font-size:12px;font-weight:700;padding:1px 8px;border-radius:10px;background:oklch(0.93 0.06 75);color:oklch(0.45 0.1 60)">4</span></div>
+              <sc-for list="{{ needs }}" as="n" hint-placeholder-count="4">
+                <div style="display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:oklch(0.995 0.002 85);border:1px solid oklch(0.91 0.007 80)">
+                  <div style="display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;color:{{ n.kindColor }};text-transform:uppercase;letter-spacing:.05em"><span style="width:14px;height:14px;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>{{ n.kind }}</div>
+                  <div style="font-size:14px;font-weight:600;line-height:1.35;text-wrap:pretty">{{ n.title }}</div>
+                  <div style="font-size:12.5px;color:oklch(0.5 0.01 60);line-height:1.45">{{ n.body }}</div>
+                  <div style="display:flex;gap:6px;margin-top:2px">
+                    <button style="height:28px;padding:0 11px;border-radius:7px;border:none;background:oklch(0.48 0.09 175);color:#fff;font-size:12.5px;font-weight:600">{{ n.primary }}</button>
+                    <button style="height:28px;padding:0 11px;border-radius:7px;border:1px solid oklch(0.9 0.008 80);background:transparent;color:oklch(0.35 0.01 60);font-size:12.5px">{{ n.secondary }}</button>
+                  </div>
+                </div>
+              </sc-for>
+              <div style="display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:12px;border:1px dashed oklch(0.86 0.01 80)">
+                <div style="display:flex;align-items:center;gap:8px;font-size:13px"><span style="width:14px;height:14px;background:oklch(0.48 0.09 175);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/loader.svg) center/contain no-repeat"></span><b style="font-weight:600">Reading</b> board-2025-09-30.vtt<span style="flex:1"></span><span style="font-variant-numeric:tabular-nums;color:oklch(0.5 0.01 60)">62%</span></div>
+                <div style="height:4px;border-radius:2px;background:oklch(0.92 0.006 80)"><div style="width:62%;height:100%;border-radius:2px;background:oklch(0.48 0.09 175)"></div></div>
+                <div style="font-size:12px;color:oklch(0.55 0.01 60)">Library: 4 of 4 repos indexed · 12 queued · <span style="color:oklch(0.52 0.15 28)">1 couldn't be read</span></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== 1b QUEUE ===================== -->
+    <div id="1b" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;background:#1E1D1A;color:#fff;border-radius:6px;padding:3px 9px">1b</span>
+        <span style="font-size:16px;font-weight:600;color:#1E1D1A">Queue</span>
+        <span style="font-size:14px;color:#6B6862">Action-first: what needs you is the headline, digest is a compact card. Cool light, Schibsted Grotesk, indigo accent.</span>
+      </div>
+      <div data-screen-label="1b Queue" style="width:1280px;height:820px;display:flex;background:oklch(0.982 0.003 250);color:oklch(0.21 0.02 260);overflow:hidden;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.12);font-family:'Schibsted Grotesk',sans-serif">
+        <aside style="width:232px;flex:none;background:oklch(0.21 0.02 260);color:oklch(0.85 0.01 260);display:flex;flex-direction:column;padding:14px 12px;gap:2px;box-sizing:border-box">
+          <div style="display:flex;gap:7px;padding:2px 4px 14px"><span style="width:12px;height:12px;border-radius:6px;background:#FF5F57"></span><span style="width:12px;height:12px;border-radius:6px;background:#FEBC2E"></span><span style="width:12px;height:12px;border-radius:6px;background:#28C840"></span></div>
+          <button style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:10px;border:none;background:oklch(0.27 0.02 260);text-align:left;margin-bottom:12px">
+            <span style="width:30px;height:30px;border-radius:8px;background:oklch(0.98 0.003 250);color:oklch(0.21 0.02 260);display:flex;align-items:center;justify-content:center;font-family:Oregano,cursive;font-size:19px;flex:none">K</span>
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column"><span style="font-size:13.5px;font-weight:600;color:#fff">Northside Ops</span><span style="font-size:11.5px;color:oklch(0.75 0.1 155);display:flex;align-items:center;gap:5px"><span style="width:6px;height:6px;border-radius:3px;background:oklch(0.72 0.14 155)"></span>Synced 2m ago</span></span>
+            <span style="width:14px;height:14px;background:oklch(0.7 0.01 260);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/chevrons-up-down.svg) center/contain no-repeat"></span>
+          </button>
+          <sc-for list="{{ navB }}" as="n" hint-placeholder-count="10">
+            <sc-if value="{{ n.head }}"><div style="font-size:11px;font-weight:600;color:oklch(0.6 0.015 260);letter-spacing:.06em;text-transform:uppercase;padding:14px 10px 4px">{{ n.head }}</div></sc-if>
+            <sc-if value="{{ n.label }}">
+              <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:{{ n.bg }};color:{{ n.color }};font-size:13.5px;font-weight:{{ n.weight }};text-align:left">
+                <span style="width:16px;height:16px;flex:none;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>
+                <span style="flex:1">{{ n.label }}</span>
+                <sc-if value="{{ n.count }}"><span style="font-size:11.5px;font-weight:700;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:oklch(0.78 0.14 70);color:oklch(0.25 0.05 60);display:inline-flex;align-items:center;justify-content:center">{{ n.count }}</span></sc-if>
+                <sc-if value="{{ n.dot }}"><span style="width:7px;height:7px;border-radius:4px;background:oklch(0.7 0.13 268)"></span></sc-if>
+              </button>
+            </sc-if>
+          </sc-for>
+          <div style="flex:1"></div>
+          <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:transparent;color:oklch(0.78 0.01 260);font-size:13.5px"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/settings.svg) center/contain no-repeat"></span>Settings</button>
+          <button style="display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;border:none;background:transparent;color:oklch(0.62 0.015 260);font-size:13px"><span style="width:16px;height:16px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/panel-left-close.svg) center/contain no-repeat"></span>Collapse</button>
+        </aside>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+          <header style="height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 28px;border-bottom:1px solid oklch(0.92 0.006 260);background:#fff">
+            <button style="flex:1;max-width:560px;height:36px;border-radius:9px;border:1px solid oklch(0.9 0.008 260);background:oklch(0.975 0.004 260);display:flex;align-items:center;gap:10px;padding:0 12px;font-size:13.5px;color:oklch(0.55 0.015 260)">
+              <span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1;text-align:left">Search or ask anything…</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid oklch(0.9 0.008 260);border-radius:5px;padding:1px 6px;background:#fff">⌘K</span>
+            </button>
+            <span style="flex:1"></span>
+            <button style="height:34px;display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:9px;border:1px solid oklch(0.88 0.04 268);background:oklch(0.96 0.02 268);color:oklch(0.42 0.16 268);font-size:13px;font-weight:600"><span style="width:15px;height:15px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/messages-square.svg) center/contain no-repeat"></span>Chats<span style="font-size:11px;font-weight:700;padding:0 6px;border-radius:8px;background:oklch(0.78 0.14 70);color:oklch(0.25 0.05 60)">1</span></button>
+          </header>
+          <main style="flex:1;min-height:0;padding:28px 32px;display:flex;flex-direction:column;gap:22px;overflow:hidden">
+            <div style="display:flex;align-items:flex-end;gap:16px">
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span style="font-size:13px;font-weight:500;color:oklch(0.5 0.015 260)">Thursday, October 1 · Northside Ops</span>
+                <h1 style="margin:0;font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1.15">4 things need you today</h1>
+              </div>
+              <span style="flex:1"></span>
+              <button style="height:34px;padding:0 14px;border-radius:9px;border:none;background:oklch(0.48 0.17 268);color:#fff;font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/plus.svg) center/contain no-repeat"></span>New task</button>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px">
+              <sc-for list="{{ needs4 }}" as="n" hint-placeholder-count="4">
+                <div style="display:flex;flex-direction:column;gap:8px;padding:14px;border-radius:12px;background:#fff;border:1px solid oklch(0.91 0.006 260);box-shadow:0 1px 2px rgba(20,24,40,.04)">
+                  <div style="display:flex;align-items:center;gap:8px"><span style="width:26px;height:26px;border-radius:7px;background:{{ n.tint }};display:flex;align-items:center;justify-content:center"><span style="width:14px;height:14px;background:{{ n.kindColorB }};mask:url({{ n.icon }}) center/contain no-repeat"></span></span><span style="font-size:12px;font-weight:600;color:oklch(0.5 0.015 260)">{{ n.kind }}</span></div>
+                  <div style="font-size:14px;font-weight:600;line-height:1.35;text-wrap:pretty;min-height:38px">{{ n.title }}</div>
+                  <div style="font-size:12.5px;color:oklch(0.5 0.015 260);line-height:1.45;flex:1">{{ n.body }}</div>
+                  <div style="display:flex;gap:6px">
+                    <button style="flex:1;height:30px;border-radius:7px;border:none;background:oklch(0.48 0.17 268);color:#fff;font-size:12.5px;font-weight:600">{{ n.primary }}</button>
+                    <button style="height:30px;padding:0 10px;border-radius:7px;border:1px solid oklch(0.9 0.008 260);background:#fff;color:oklch(0.35 0.015 260);font-size:12.5px">{{ n.secondary }}</button>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+            <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px">
+              <div style="display:flex;flex-direction:column;border-radius:12px;background:#fff;border:1px solid oklch(0.91 0.006 260);overflow:hidden">
+                <div style="display:flex;align-items:center;gap:4px;padding:8px 10px;border-bottom:1px solid oklch(0.93 0.005 260)">
+                  <span style="height:30px;padding:0 12px;border-radius:7px;background:oklch(0.95 0.02 268);color:oklch(0.42 0.16 268);font-size:13px;font-weight:600;display:flex;align-items:center">Today · 7</span>
+                  <span style="height:30px;padding:0 12px;border-radius:7px;color:oklch(0.45 0.015 260);font-size:13px;display:flex;align-items:center">Tickets · 3</span>
+                  <span style="height:30px;padding:0 12px;border-radius:7px;color:oklch(0.45 0.015 260);font-size:13px;display:flex;align-items:center">Recent files</span>
+                </div>
+                <sc-for list="{{ list }}" as="t" hint-placeholder-count="6">
+                  <div style="display:flex;align-items:center;gap:12px;min-height:44px;padding:0 16px;border-bottom:1px solid oklch(0.95 0.004 260)">
+                    <span style="width:17px;height:17px;flex:none;border-radius:{{ t.cbRadius }};border:1.5px solid {{ t.cbBorderB }};background:{{ t.cbBgB }};box-sizing:border-box"></span>
+                    <sc-if value="{{ t.id }}"><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:oklch(0.48 0.17 268)">{{ t.id }}</span></sc-if>
+                    <span style="flex:1;min-width:0;font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ t.colorB }};text-decoration:{{ t.deco }}">{{ t.title }}</span>
+                    <sc-if value="{{ t.state }}"><span style="font-size:12px;color:oklch(0.42 0.015 260);border:1px solid oklch(0.9 0.008 260);border-radius:6px;padding:1px 8px">{{ t.state }}</span></sc-if>
+                    <span style="width:62px;text-align:right;font-size:12.5px;font-variant-numeric:tabular-nums;color:{{ t.dueColorB }};font-weight:{{ t.dueWeight }}">{{ t.due }}</span>
+                  </div>
+                </sc-for>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:12px;min-height:0">
+                <div style="display:flex;flex-direction:column;gap:10px;padding:16px;border-radius:12px;background:#fff;border:1px solid oklch(0.91 0.006 260)">
+                  <div style="display:flex;align-items:center;gap:8px"><span style="width:15px;height:15px;background:oklch(0.48 0.17 268);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/newspaper.svg) center/contain no-repeat"></span><span style="font-size:14px;font-weight:600">Morning digest</span><span style="font-size:12px;color:oklch(0.55 0.015 260)">7:02 AM</span><span style="flex:1"></span><span style="font-size:12.5px;color:oklch(0.48 0.17 268);font-weight:600">Share</span></div>
+                  <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.55;color:oklch(0.3 0.015 260);display:flex;flex-direction:column;gap:4px">
+                    <li>Handbook's new shift-swap rule disagrees with Ways of Working.</li>
+                    <li>Q4 Budget shows the venue deposit as paid.</li>
+                    <li>Board meeting: 2 decisions and 1 action filed for you.</li>
+                  </ul>
+                  <div style="display:flex;gap:6px;flex-wrap:wrap"><sc-for list="{{ sources }}" as="s" hint-placeholder-count="3"><span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:oklch(0.42 0.015 260);background:oklch(0.96 0.004 260);border-radius:5px;padding:2px 7px">{{ s }}</span></sc-for></div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;padding:14px 16px;border-radius:12px;background:#fff;border:1px solid oklch(0.91 0.006 260)">
+                  <div style="display:flex;align-items:center;font-size:13px;gap:6px"><b style="font-weight:600">Ingesting</b><span style="color:oklch(0.5 0.015 260)">board-2025-09-30.vtt</span><span style="flex:1"></span><span style="font-variant-numeric:tabular-nums">62%</span></div>
+                  <div style="height:5px;border-radius:3px;background:oklch(0.94 0.005 260)"><div style="width:62%;height:100%;border-radius:3px;background:oklch(0.48 0.17 268)"></div></div>
+                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px">
+                    <div style="display:flex;flex-direction:column"><b style="font-size:17px;font-weight:600">4/4</b><span style="font-size:11.5px;color:oklch(0.55 0.015 260)">repos indexed</span></div>
+                    <div style="display:flex;flex-direction:column"><b style="font-size:17px;font-weight:600">12</b><span style="font-size:11.5px;color:oklch(0.55 0.015 260)">queued</span></div>
+                    <div style="display:flex;flex-direction:column"><b style="font-size:17px;font-weight:600;color:oklch(0.55 0.17 25)">1</b><span style="font-size:11.5px;color:oklch(0.55 0.015 260)">couldn't read</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== 1c DESK (dark) ===================== -->
+    <div id="1c" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;background:#1E1D1A;color:#fff;border-radius:6px;padding:3px 9px">1c</span>
+        <span style="font-size:16px;font-weight:600;color:#1E1D1A">Desk</span>
+        <span style="font-size:14px;color:#6B6862">Ken as a co-worker: chat docked as a first-class column. Warm dark, Literata + Instrument Sans, copper accent.</span>
+      </div>
+      <div data-screen-label="1c Desk" style="width:1280px;height:820px;display:flex;background:oklch(0.19 0.008 60);color:oklch(0.93 0.008 80);overflow:hidden;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.2);font-family:'Instrument Sans',sans-serif">
+        <aside style="width:64px;flex:none;border-right:1px solid oklch(0.27 0.01 60);display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:4px">
+          <div style="display:flex;flex-direction:column;gap:5px;padding-bottom:12px"><span style="width:10px;height:10px;border-radius:5px;background:#FF5F57"></span><span style="width:10px;height:10px;border-radius:5px;background:#FEBC2E"></span><span style="width:10px;height:10px;border-radius:5px;background:#28C840"></span></div>
+          <span style="width:34px;height:34px;border-radius:9px;background:oklch(0.93 0.008 80);color:oklch(0.19 0.008 60);display:flex;align-items:center;justify-content:center;font-family:Oregano,cursive;font-size:22px;margin-bottom:10px">K</span>
+          <sc-for list="{{ navC }}" as="n" hint-placeholder-count="9">
+            <button title="{{ n.label }}" style="width:40px;height:40px;border-radius:10px;border:none;background:{{ n.bg }};color:{{ n.color }};display:flex;align-items:center;justify-content:center;position:relative">
+              <span style="width:18px;height:18px;background:currentColor;mask:url({{ n.icon }}) center/contain no-repeat"></span>
+              <sc-if value="{{ n.count }}"><span style="position:absolute;top:3px;right:2px;font-size:10px;font-weight:700;min-width:16px;height:16px;border-radius:8px;background:oklch(0.8 0.13 80);color:oklch(0.22 0.03 60);display:flex;align-items:center;justify-content:center">{{ n.count }}</span></sc-if>
+            </button>
+          </sc-for>
+          <div style="flex:1"></div>
+          <button style="width:40px;height:40px;border-radius:10px;border:none;background:transparent;color:oklch(0.65 0.01 70);display:flex;align-items:center;justify-content:center"><span style="width:18px;height:18px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/panel-left-open.svg) center/contain no-repeat"></span></button>
+        </aside>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+          <header style="height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 24px;border-bottom:1px solid oklch(0.27 0.01 60)">
+            <span style="font-size:14px;font-weight:600">Northside Ops</span><span style="font-size:12px;color:oklch(0.72 0.1 155);display:flex;align-items:center;gap:5px"><span style="width:6px;height:6px;border-radius:3px;background:oklch(0.7 0.13 155)"></span>Synced</span>
+            <span style="flex:1"></span>
+            <button style="width:300px;height:34px;border-radius:9px;border:1px solid oklch(0.3 0.01 60);background:oklch(0.22 0.009 60);display:flex;align-items:center;gap:9px;padding:0 12px;font-size:13px;color:oklch(0.62 0.01 70)"><span style="width:14px;height:14px;background:currentColor;mask:url(https://unpkg.com/lucide-static@0.460.0/icons/search.svg) center/contain no-repeat"></span><span style="flex:1;text-align:left">Search</span><span style="font-family:'JetBrains Mono',monospace;font-size:11px">⌘K</span></button>
+          </header>
+          <main style="flex:1;min-height:0;padding:28px;display:flex;flex-direction:column;gap:22px;overflow:hidden">
+            <div style="display:flex;flex-direction:column;gap:10px;padding:22px 24px;border-radius:14px;background:oklch(0.23 0.012 60);border:1px solid oklch(0.29 0.012 60)">
+              <div style="display:flex;align-items:center;gap:10px;font-size:12.5px;color:oklch(0.68 0.01 70)"><span style="color:oklch(0.76 0.11 55);font-weight:600">Thursday, October 1</span><span>Digest · 7:02 AM</span><span style="flex:1"></span><span>Share</span></div>
+              <div style="font-family:Literata,serif;font-size:18px;line-height:1.6;text-wrap:pretty;max-width:66ch">Three things moved overnight. Priya updated the <span style="color:oklch(0.8 0.1 55);border-bottom:1px solid oklch(0.5 0.08 55)">Volunteer Handbook</span> with a shift-swap rule that disagrees with <span style="color:oklch(0.8 0.1 55);border-bottom:1px solid oklch(0.5 0.08 55)">Ways of Working</span>. The <span style="color:oklch(0.8 0.1 55);border-bottom:1px solid oklch(0.5 0.08 55)">Q4 Budget</span> shows the venue deposit as paid. Two decisions and one action came out of the board meeting.</div>
+            </div>
+            <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px">
+              <div style="display:flex;flex-direction:column;gap:10px;min-height:0">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:4px;background:oklch(0.8 0.13 80)"></span><h2 style="margin:0;font-size:14px;font-weight:600">Needs you</h2><span style="font-size:12.5px;color:oklch(0.62 0.01 70)">4</span></div>
+                <sc-for list="{{ needs }}" as="n" hint-placeholder-count="4">
+                  <div style="display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:10px;background:oklch(0.22 0.009 60);border:1px solid oklch(0.28 0.01 60)">
+                    <span style="width:16px;height:16px;flex:none;background:{{ n.kindColorC }};mask:url({{ n.icon }}) center/contain no-repeat"></span>
+                    <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px"><span style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ n.title }}</span><span style="font-size:12px;color:oklch(0.62 0.01 70)">{{ n.kind }}</span></span>
+                    <button style="height:28px;padding:0 11px;border-radius:7px;border:none;background:oklch(0.74 0.12 55);color:oklch(0.2 0.02 55);font-size:12.5px;font-weight:600;white-space:nowrap">{{ n.primary }}</button>
+                  </div>
+                </sc-for>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:10px;min-height:0">
+                <div style="display:flex;align-items:center;gap:8px"><h2 style="margin:0;font-size:14px;font-weight:600">On your plate</h2><span style="font-size:12.5px;color:oklch(0.62 0.01 70)">7</span><span style="flex:1"></span><span style="font-size:12.5px;color:oklch(0.76 0.11 55);font-weight:600">+ Task</span></div>
+                <div style="display:flex;flex-direction:column;border-radius:10px;border:1px solid oklch(0.28 0.01 60);overflow:hidden">
+                  <sc-for list="{{ list }}" as="t" hint-placeholder-count="6">
+                    <div style="display:flex;align-items:center;gap:10px;min-height:42px;padding:0 14px;border-bottom:1px solid oklch(0.25 0.01 60);background:oklch(0.21 0.009 60)">
+                      <span style="width:16px;height:16px;flex:none;border-radius:{{ t.cbRadius }};border:1.5px solid {{ t.cbBorderC }};background:{{ t.cbBgC }};box-sizing:border-box"></span>
+                      <span style="flex:1;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ t.colorC }};text-decoration:{{ t.deco }}">{{ t.title }}</span>
+                      <span style="font-size:12px;font-variant-numeric:tabular-nums;color:{{ t.dueColorC }}">{{ t.due }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+        <aside style="width:320px;flex:none;border-left:1px solid oklch(0.27 0.01 60);background:oklch(0.215 0.009 60);display:flex;flex-direction:column">
+          <div style="height:56px;flex:none;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid oklch(0.27 0.01 60)"><span style="width:15px;height:15px;background:oklch(0.76 0.11 55);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/sparkles.svg) center/contain no-repeat"></span><span style="font-size:14px;font-weight:600">Ken</span><span style="font-size:12px;color:oklch(0.62 0.01 70)">Budget deposit</span><span style="flex:1"></span><span style="width:15px;height:15px;background:oklch(0.62 0.01 70);mask:url(https://unpkg.com/lucide-static@0.460.0/icons/terminal.svg) center/contain no-repeat"></span></div>
+          <div style="flex:1;padding:16px;display:flex;flex-direction:column;gap:12px;overflow:hidden">
+            <div style="align-self:flex-end;max-width:85%;padding:9px 12px;border-radius:12px 12px 4px 12px;background:oklch(0.3 0.02 55);font-size:13px;line-height:1.5">Move the venue deposit out of contingency in the Q4 budget.</div>
+            <div style="font-size:13px;line-height:1.55;color:oklch(0.86 0.008 80)">I found the deposit (£2,400) under Contingency in <span style="color:oklch(0.8 0.1 55)">Q4 Budget.xlsx</span>. Which line should it go under?</div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <button style="height:34px;border-radius:8px;border:1px solid oklch(0.5 0.08 55);background:oklch(0.26 0.02 55);color:oklch(0.93 0.008 80);font-size:13px;text-align:left;padding:0 12px">Events › Venue</button>
+              <button style="height:34px;border-radius:8px;border:1px solid oklch(0.3 0.01 60);background:transparent;color:oklch(0.86 0.008 80);font-size:13px;text-align:left;padding:0 12px">Gala › Fixed costs</button>
+              <button style="height:34px;border-radius:8px;border:1px solid oklch(0.3 0.01 60);background:transparent;color:oklch(0.86 0.008 80);font-size:13px;text-align:left;padding:0 12px">Something else…</button>
+            </div>
+            <div style="flex:1"></div>
+            <div style="display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-radius:10px;background:oklch(0.24 0.01 60)">
+              <div style="display:flex;font-size:12px;color:oklch(0.7 0.01 70)"><span>Ingesting board-2025-09-30.vtt</span><span style="flex:1"></span><span>62%</span></div>
+              <div style="height:4px;border-radius:2px;background:oklch(0.3 0.01 60)"><div style="width:62%;height:100%;border-radius:2px;background:oklch(0.74 0.12 55)"></div></div>
+            </div>
+          </div>
+          <div style="padding:12px 16px 16px"><div style="height:40px;border-radius:10px;border:1px solid oklch(0.32 0.01 60);background:oklch(0.19 0.008 60);display:flex;align-items:center;padding:0 12px;font-size:13px;color:oklch(0.55 0.01 70)">Ask Ken · / for terminal</div></div>
+        </aside>
+      </div>
+    </div>
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const I = n => `https://unpkg.com/lucide-static@0.460.0/icons/${n}.svg`;
+    const navDef = [
+      {k:"home",i:"house",l:"Home"},{k:"review",i:"inbox",l:"Review",c:3},{k:"ingests",i:"file-input",l:"Ingest",c:1},{k:"files",i:"folder-open",l:"Files",d:true},
+      {h:"Explore"},{k:"map",i:"network",l:"Map"},{k:"timeline",i:"clock",l:"Timeline"},
+      {h:"Team"},{k:"team",i:"users-round",l:"People"},{k:"record",i:"mic",l:"Record"},{k:"families",i:"bell",l:"Families",c:2}
+    ];
+    const mk = (on, off, onBg, w) => navDef.map(n => n.h ? {head:n.h} : {label:n.l,icon:I(n.i),count:n.c||0,dot:!!n.d,
+      color:n.k==="home"?on:off,bg:n.k==="home"?onBg:"transparent",weight:n.k==="home"?600:w});
+    const navA = mk("oklch(0.38 0.08 175)","oklch(0.38 0.01 60)","oklch(0.92 0.03 175)",500);
+    const navB = mk("#fff","oklch(0.8 0.01 260)","oklch(0.32 0.04 268)",500);
+    const navC = navDef.filter(n=>!n.h).map(n=>({label:n.l,icon:I(n.i),count:n.c||0,color:n.k==="home"?"oklch(0.2 0.02 55)":"oklch(0.68 0.01 70)",bg:n.k==="home"?"oklch(0.74 0.12 55)":"transparent"}));
+    const raw = [
+      {id:"OPS-131",title:"Move the shift rota to the new sheet",detail:"volunteers",state:"blocked",due:"2d late",late:true},
+      {title:"Call Marcus about the catering quote",detail:"from the board meeting",due:"Today",today:true},
+      {id:"OPS-142",title:"Confirm venue insurance for the gala",detail:"events",state:"in progress",due:"Fri"},
+      {title:"Send Priya feedback on the handbook",detail:"handbook",due:"Tomorrow"},
+      {id:"OPS-139",title:"Update the donor thank-you template",detail:"comms",state:"review",due:"Oct 8"},
+      {title:"Book a room for Tuesday standup",detail:"ops",due:"Mon",done:true}
+    ];
+    const list = raw.map(t => ({...t, id:t.id||"", state:t.state||"", cbRadius:t.id?"5px":"9px",
+      cbBorder:t.done?"oklch(0.48 0.09 175)":"oklch(0.82 0.01 80)",cbBg:t.done?"oklch(0.48 0.09 175)":"transparent",
+      cbBorderB:t.done?"oklch(0.48 0.17 268)":"oklch(0.82 0.01 260)",cbBgB:t.done?"oklch(0.48 0.17 268)":"transparent",
+      cbBorderC:t.done?"oklch(0.74 0.12 55)":"oklch(0.4 0.01 60)",cbBgC:t.done?"oklch(0.74 0.12 55)":"transparent",
+      color:t.done?"oklch(0.6 0.01 60)":"oklch(0.23 0.01 60)",colorB:t.done?"oklch(0.6 0.015 260)":"oklch(0.21 0.02 260)",colorC:t.done?"oklch(0.55 0.01 70)":"oklch(0.93 0.008 80)",
+      deco:t.done?"line-through":"none",dueWeight:(t.late||t.today)?600:400,
+      dueColor:t.late?"oklch(0.52 0.15 28)":t.today?"oklch(0.45 0.09 175)":"oklch(0.5 0.01 60)",
+      dueColorB:t.late?"oklch(0.55 0.17 25)":t.today?"oklch(0.48 0.17 268)":"oklch(0.5 0.015 260)",
+      dueColorC:t.late?"oklch(0.72 0.14 30)":t.today?"oklch(0.76 0.11 55)":"oklch(0.62 0.01 70)"}));
+    const needsRaw = [
+      {kind:"Conflict",icon:"git-compare",title:"Handbook disagrees with Ways of Working",body:"Shift swaps: 48h notice vs. 24h. Pick which one stands.",primary:"Compare",secondary:"Later",hue:28},
+      {kind:"Ken asked",icon:"message-circle-question",title:"Which budget line for the venue deposit?",body:"Asked in Budget deposit chat, 20 min ago.",primary:"Answer",secondary:"Open chat",hue:75},
+      {kind:"From Dana",icon:"user-round-plus",title:"Review grant draft section 3",body:"Due Oct 6. Accept to add it to your list.",primary:"Accept",secondary:"Not mine",hue:268},
+      {kind:"Ruling",icon:"gavel",title:"Adopt the new volunteer sign-in flow",body:"From the board meeting. You're the decider.",primary:"Accept",secondary:"Drop",hue:175}
+    ];
+    const needs = needsRaw.map(n=>({...n,icon:I(n.icon),kindColor:`oklch(0.5 0.11 ${n.hue})`,kindColorB:`oklch(0.48 0.14 ${n.hue})`,tint:`oklch(0.95 0.03 ${n.hue})`,kindColorC:`oklch(0.76 0.11 ${n.hue})`}));
+    const recents = [
+      ["Volunteer Handbook.docx","file-text","oklch(0.48 0.1 255)","handbook","12m"],
+      ["Q4 Budget.xlsx","file-spreadsheet","oklch(0.5 0.1 150)","finance","1h"],
+      ["Board meeting notes.md","notebook-text","oklch(0.45 0.01 60)","governance","3h"],
+      ["Grant draft v4.pdf","file-type","oklch(0.52 0.15 28)","grants","1d"]
+    ].map(([name,ic,color,repo,at])=>({name,icon:I(ic),color,repo,at}));
+    return { navA, navB, navC, list, needs, needs4:needs, recents, sources:["Volunteer Handbook.docx","Q4 Budget.xlsx","board-2025-09-30.vtt"] };
+  }
+}
+</script>
+</body>
+</html>

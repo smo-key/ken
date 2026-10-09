@@ -1,10 +1,11 @@
-//! On-device meeting recorder: capture the microphone ("Me") and/or macOS
-//! system audio ("Them"), write each active source to a 16 kHz mono WAV, then
-//! (on stop) transcribe with Whisper and merge the channels into one labeled
+//! On-device meeting recorder: capture the microphone ("Me") and/or system
+//! audio ("Them"), write each active source to a 16 kHz mono WAV, then (on
+//! stop) transcribe with Whisper and merge the channels into one labeled
 //! markdown transcript. Everything in this file is pure and hardware-free —
-//! the platform capture backends live in `mac.rs` behind the `CaptureSource`
-//! seam, so the state machine, meter math, resampling, and merge are all tested
-//! with synthesized samples.
+//! the capture backends live behind the `CaptureSource` seam: the microphone
+//! in `cpal.rs` (every OS), system audio in `mac.rs` (ScreenCaptureKit) and
+//! `win.rs` (WASAPI loopback). So the state machine, meter math, resampling,
+//! and merge are all tested with synthesized samples.
 
 use std::path::Path;
 use std::time::Duration;
@@ -13,8 +14,11 @@ use serde::Serialize;
 
 use crate::{transcript, Error, Result};
 
+pub mod cpal;
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(windows)]
+pub mod win;
 
 /// The two capture channels. `Mic` is labeled "Me", `System` is "Them".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -39,10 +43,98 @@ pub enum PermissionStatus {
 }
 
 /// System Settings deep links (macOS) for the inline permission guidance.
-pub const MIC_SETTINGS_URL: &str =
+pub const MAC_MIC_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-pub const SCREEN_SETTINGS_URL: &str =
+pub const MAC_SCREEN_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+/// Windows Settings › Privacy & security › Microphone.
+pub const WIN_MIC_SETTINGS_URL: &str = "ms-settings:privacy-microphone";
+
+/// Where this OS lets a person allow the microphone; empty where it has no
+/// such page.
+pub fn mic_settings_url() -> &'static str {
+    if cfg!(target_os = "macos") {
+        MAC_MIC_SETTINGS_URL
+    } else if cfg!(windows) {
+        WIN_MIC_SETTINGS_URL
+    } else {
+        ""
+    }
+}
+
+/// Where this OS lets a person allow system audio (macOS: Screen Recording);
+/// empty where nothing needs allowing.
+pub fn screen_settings_url() -> &'static str {
+    if cfg!(target_os = "macos") {
+        MAC_SCREEN_SETTINGS_URL
+    } else {
+        ""
+    }
+}
+
+/// Whether a settings link may be opened from the app: only this OS's own
+/// privacy pages.
+pub fn is_settings_url(url: &str) -> bool {
+    !url.is_empty() && (url == mic_settings_url() || url == screen_settings_url())
+}
+
+/// What this machine can record: a microphone, system audio, and why not
+/// when one of them is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Support {
+    pub mic: bool,
+    pub system: bool,
+    pub reason: Option<String>,
+}
+
+/// [`Support`] from what was found: a microphone, whether this OS records
+/// system audio at all, and an output device to record it from.
+pub fn support_of(mic_device: bool, system_os: bool, output_device: bool) -> Support {
+    let mut why: Vec<&str> = Vec::new();
+    if !mic_device {
+        why.push("No microphone is connected.");
+    }
+    if !system_os {
+        why.push("System audio is recorded on Windows and macOS only.");
+    } else if !output_device {
+        why.push("No speaker or headset is connected, so there is no system audio to record.");
+    }
+    Support {
+        mic: mic_device,
+        system: system_os && output_device,
+        reason: (!why.is_empty()).then(|| why.join(" ")),
+    }
+}
+
+/// What this machine can record now.
+pub fn support() -> Support {
+    let mic = cpal::has_input();
+    if cfg!(target_os = "macos") {
+        // ScreenCaptureKit captures system audio without an output device.
+        support_of(mic, true, true)
+    } else if cfg!(windows) {
+        support_of(mic, true, cpal::has_output())
+    } else {
+        support_of(mic, false, false)
+    }
+}
+
+/// Silence to write before a block so a channel that delivers nothing while
+/// nothing plays (WASAPI loopback) keeps time with the recording clock:
+/// what the clock says should be written by the end of this block, less
+/// what was written and the block itself. Gaps under 100 ms are callback
+/// jitter and left alone. `written` and `block` are 16 kHz samples.
+pub fn silence_gap(written: u64, clock_ms: u64, block: usize) -> usize {
+    let due = clock_ms * TARGET_RATE as u64 / 1000;
+    let have = written + block as u64;
+    let gap = due.saturating_sub(have);
+    if gap < TARGET_RATE as u64 / 10 {
+        0
+    } else {
+        gap as usize
+    }
+}
 
 /// Root-mean-square level of a sample block, in [0, 1] for normalized audio —
 /// what the live meter shows. Empty block reads as silence.
@@ -230,6 +322,24 @@ pub fn ingest_frames(
     let out = resampler.process(&mono);
     let level = rms(&out);
     (out, level)
+}
+
+/// The frontmatter a recording's transcript starts with in an inbox, so
+/// the ingest knows it is a recording and who made it, and where its audio
+/// was kept when it was. `when` is `YYYY-MM-DD HH:MM`.
+pub fn recording_frontmatter(when: &str, by: Option<&str>, audio: &[String]) -> String {
+    let mut s = format!("---\nkind: recording\nrecorded: {when}\n");
+    if let Some(by) = by.map(str::trim).filter(|b| !b.is_empty()) {
+        s.push_str(&format!("by: {by}\n"));
+    }
+    if !audio.is_empty() {
+        s.push_str("audio:\n");
+        for a in audio {
+            s.push_str(&format!("  - \"{}\"\n", a.replace('\\', "/").replace('"', "\\\"")));
+        }
+    }
+    s.push_str("---\n\n");
+    s
 }
 
 /// Body used when the storage choice is "audio" (WAVs kept, no transcription).
@@ -733,6 +843,52 @@ mod tests {
         assert_eq!(unique_name(dir.path(), stem, "md"), format!("{stem}.md"));
         std::fs::write(dir.path().join(format!("{stem}.md")), b"x").unwrap();
         assert_eq!(unique_name(dir.path(), stem, "md"), format!("{stem} 2.md"));
+    }
+
+    #[test]
+    fn loopback_silence_is_padded_to_the_clock() {
+        // 2 s of clock, nothing written yet, a 10 ms block arrives: pad to 2 s.
+        assert_eq!(silence_gap(0, 2_000, 160), 32_000 - 160);
+        // On time (jitter under 100 ms): nothing.
+        assert_eq!(silence_gap(31_000, 2_000, 160), 0);
+        // Ahead of the clock: nothing.
+        assert_eq!(silence_gap(40_000, 2_000, 160), 0);
+    }
+
+    #[test]
+    fn support_says_what_is_missing() {
+        let all = support_of(true, true, true);
+        assert!(all.mic && all.system && all.reason.is_none());
+        let no_out = support_of(true, true, false);
+        assert!(no_out.mic && !no_out.system);
+        assert!(no_out.reason.unwrap().contains("No speaker"));
+        let linux = support_of(false, false, true);
+        assert!(!linux.mic && !linux.system);
+        let why = linux.reason.unwrap();
+        assert!(why.contains("No microphone") && why.contains("Windows and macOS only"));
+    }
+
+    #[test]
+    fn only_this_os_settings_pages_open() {
+        assert!(!is_settings_url(""));
+        assert!(!is_settings_url("file:///etc/passwd"));
+        if cfg!(windows) {
+            assert!(is_settings_url("ms-settings:privacy-microphone"));
+            assert!(!is_settings_url(MAC_MIC_SETTINGS_URL));
+        }
+        if cfg!(target_os = "macos") {
+            assert!(is_settings_url(MAC_SCREEN_SETTINGS_URL));
+            assert!(!is_settings_url(WIN_MIC_SETTINGS_URL));
+        }
+    }
+
+    #[test]
+    fn a_recording_says_what_it_is() {
+        let fm = recording_frontmatter("2026-10-01 14:02", Some("Chris Staud"), &[r"C:\data\recordings\a - Me.wav".into()]);
+        assert!(fm.starts_with("---\nkind: recording\nrecorded: 2026-10-01 14:02\nby: Chris Staud\n"));
+        assert!(fm.contains("  - \"C:/data/recordings/a - Me.wav\"\n"));
+        assert!(fm.ends_with("---\n\n"));
+        assert!(!recording_frontmatter("2026-10-01 14:02", None, &[]).contains("audio:"));
     }
 
     #[test]

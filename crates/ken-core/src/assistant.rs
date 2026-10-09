@@ -55,8 +55,35 @@ pub fn parse_oneshot_output(stdout: &str) -> ParsedOutput {
             truncate(text, 2000)
         ));
     };
+    parse_output_value(&value, text)
+}
 
-    let event = match &value {
+/// The events of `--output-format stream-json --verbose` stdout, one JSON
+/// object a line, in order. A line that is not JSON (a warning the CLI
+/// printed) is skipped.
+pub fn parse_stream_events(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// [`parse_oneshot_output`] for stream-json stdout: the same terminal result,
+/// read from the events as the array shape is.
+pub fn parse_stream_output(stdout: &str) -> ParsedOutput {
+    let events = parse_stream_events(stdout);
+    if events.is_empty() {
+        return parse_oneshot_output(stdout);
+    }
+    parse_output_value(&serde_json::Value::Array(events), stdout.trim())
+}
+
+/// The terminal result in parsed output, either shape; `text` is what was
+/// received, quoted when it is unusable.
+fn parse_output_value(value: &serde_json::Value, text: &str) -> ParsedOutput {
+    let event = match value {
         serde_json::Value::Array(events) => {
             match events
                 .iter()
@@ -75,7 +102,7 @@ pub fn parse_oneshot_output(stdout: &str) -> ParsedOutput {
                 },
             }
         }
-        serde_json::Value::Object(_) => Some(&value),
+        serde_json::Value::Object(_) => Some(value),
         _ => None,
     };
     let Some(event) = event else {
@@ -144,46 +171,266 @@ pub fn oneshot(
     timeout: Duration,
     cancel: &CancelToken,
 ) -> Result<OneshotOutcome> {
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &["--permission-mode".into(), "acceptEdits".into()])
+}
+
+/// A session that only reads its prompt and answers it: no tools at all,
+/// and the `model` named (`opus`), else the CLI's default. For a judgement
+/// over text the prompt already holds (`supersede`).
+pub fn oneshot_answer(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    model: Option<&str>,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec!["--tools".into(), String::new()];
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+/// [`oneshot`] that may also read `dirs`. Claude Code reads nothing outside
+/// the folder it runs from unless told, and a workspace's repos can sit
+/// anywhere (set-up keeps the workspace itself in Ken's app data).
+pub fn oneshot_in(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec!["--permission-mode".into(), "acceptEdits".into()];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+/// The tools a [`look`] may use: reading and searching, nothing that writes
+/// or runs.
+pub const LOOK_TOOLS: &str = "Read,Grep,Glob,LS";
+
+/// The prompt for a [`look`]: the question, the folders to search as
+/// (name, id, root), what Ken's search ranked (`folder/path`, best first),
+/// and how to cite across them.
+pub fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, std::path::PathBuf)], leads: &[String]) -> String {
+    let mut p = format!(
+        "Question: {query}\n\nKen's search index found nothing strong for this, which does not mean it isn't there. \
+Look for the answer yourself with Grep, Glob and Read in these folders:\n"
+    );
+    for (name, id, root) in folders {
+        p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
+    }
+    if !leads.is_empty() {
+        p.push_str("\nKen's search ranked these files, best first. One may hold the answer or sit next to it: read them first.\n");
+        for lead in leads.iter().take(8) {
+            p.push_str(&format!("- {lead}\n"));
+        }
+    }
+    p.push_str(
+        "\nOn what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. \
+When the question is about how something works, open the code that does it and cite that file, with the doc beside it \
+if it helps. Code often sits deeper than a doc's path says (under a pack, `src/` or `backend/`): find a named \
+file with Glob `**/<name>` across every folder before deciding it is elsewhere. Glob and Grep search only the \
+folder you start in unless given a path, so pass each folder above as the path.\n\
+\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
+If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
+`SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
+    );
+    p
+}
+
+/// A read-only session that searches `dirs` itself: the fallback when Ken's
+/// index found nothing, so "not there" is only said after looking. It may
+/// read and search every folder given and write nothing.
+pub fn look(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec![
+        "--permission-mode".into(),
+        "default".into(),
+        "--allowedTools".into(),
+        LOOK_TOOLS.into(),
+        "--disallowedTools".into(),
+        "Edit,MultiEdit,Write,NotebookEdit,Bash".into(),
+    ];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+/// One chat turn run headless, as Ken's chat is set up: its guide, Ken's MCP
+/// server (`mcp_config`) with the tools the chat may use without asking,
+/// the read-only file tools over `dirs`, and nothing that writes or runs.
+/// For measuring the chat's answers; the app's chat streams instead.
+pub fn chat_oneshot(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    chat_oneshot_with(binary, project_root, dirs, mcp_config, prompt, timeout, cancel, true)
+}
+
+/// [`chat_oneshot`]; with `look` false, Ken's MCP tools only (no file
+/// tools, no folders added), to measure what Ken's own search answers.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_oneshot_with(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    look: bool,
+) -> Result<OneshotOutcome> {
+    let args = chat_args(project_root, dirs, mcp_config, look);
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+/// [`chat_oneshot_with`] over `--output-format stream-json --verbose`, so
+/// every event comes back with the outcome: each tool call Claude made and
+/// what it returned, in order, for measuring how an answer was found. On a
+/// timeout the events are those printed before it.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_oneshot_traced(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    look: bool,
+) -> Result<(OneshotOutcome, Vec<serde_json::Value>)> {
+    let args = chat_args(project_root, dirs, mcp_config, look);
+    run_oneshot_events(binary, project_root, prompt, timeout, cancel, &args, true)
+}
+
+/// The access a headless chat turn gets: its guide, Ken's MCP server and the
+/// tools it may use without asking, and with `look` the read-only file tools
+/// over `dirs`.
+fn chat_args(project_root: &Path, dirs: &[std::path::PathBuf], mcp_config: &Path, look: bool) -> Vec<String> {
+    let mut allowed: Vec<String> = crate::chat::KEN_MCP_ALLOWED
+        .iter()
+        .filter(|t| **t != "open_in_ken")
+        .map(|t| format!("mcp__ken__{t}"))
+        .collect();
+    if look {
+        allowed.push(LOOK_TOOLS.to_string());
+    }
+    let disallowed = if look { "Edit,MultiEdit,Write,NotebookEdit,Bash".to_string() } else { format!("Edit,MultiEdit,Write,NotebookEdit,Bash,{LOOK_TOOLS}") };
+    let dirs: &[std::path::PathBuf] = if look { dirs } else { &[] };
+    // Without `look` the file tools are refused, and the guide's rule 4 still
+    // sends Claude to them: 45 refused calls over 32 questions, measured
+    // 2026-10-07. Say so up front.
+    let mut guide = crate::chat::KEN_GUIDE.replace('\n', " ");
+    if !look {
+        guide.push_str(" This turn has no file tools: Grep, Glob and Read are off. Search and read with Ken's tools only.");
+    }
+    let mut args: Vec<String> = vec![
+        "--permission-mode".into(),
+        "default".into(),
+        "--append-system-prompt".into(),
+        guide,
+        "--mcp-config".into(),
+        mcp_config.to_string_lossy().into_owned(),
+        "--allowedTools".into(),
+        allowed.join(","),
+        "--disallowedTools".into(),
+        disallowed,
+    ];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args
+}
+
+fn run_oneshot(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    access: &[String],
+) -> Result<OneshotOutcome> {
+    run_oneshot_events(binary, project_root, prompt, timeout, cancel, access, false).map(|(outcome, _)| outcome)
+}
+
+/// [`run_oneshot`], with the session's events when `stream` (stream-json
+/// output); without it the events are empty.
+fn run_oneshot_events(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    access: &[String],
+    stream: bool,
+) -> Result<(OneshotOutcome, Vec<serde_json::Value>)> {
     if !runner::is_executable(binary) {
-        return Ok(OneshotOutcome::Failed(
-            runner::MISSING_CLAUDE_HELP.to_string(),
+        return Ok((
+            OneshotOutcome::Failed(runner::MISSING_CLAUDE_HELP.to_string()),
+            Vec::new(),
         ));
     }
     let session_id = uuid::Uuid::new_v4().to_string();
-    let child = std::process::Command::new(binary)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            &session_id,
-        ])
+    // The prompt goes in on stdin: on Windows an argument with a line break
+    // cannot reach the `.cmd` launcher at all (see `proc::spawn_with_input`).
+    let mut cmd = std::process::Command::new(binary);
+    if stream {
+        // stream-json in print mode needs --verbose.
+        cmd.args(["-p", "--output-format", "stream-json", "--verbose"]);
+    } else {
+        cmd.args(["-p", "--output-format", "json"]);
+    }
+    cmd.args(access)
+        .args(["--session-id", &session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", binary.display())))?;
 
+    let events = |output: &str| if stream { parse_stream_events(output) } else { Vec::new() };
     let outcome = match drive_child(child, timeout, Duration::from_millis(100), cancel) {
-        DriveResult::Exited(status, output, stderr) => match parse_oneshot_output(&output) {
-            ParsedOutput::Success(text) if status.success() => OneshotOutcome::Completed(text),
-            // A good result event but a non-zero exit can't happen in
-            // practice; treat status as authoritative.
-            ParsedOutput::Success(_) => OneshotOutcome::Failed(with_stderr(
-                format!("the session exited with status {status:?}"),
-                &stderr,
-            )),
-            ParsedOutput::Error(msg) | ParsedOutput::Unusable(msg) => {
-                OneshotOutcome::Failed(with_stderr(msg, &stderr))
-            }
-        },
-        DriveResult::Cancelled => OneshotOutcome::Cancelled,
-        DriveResult::TimedOut(_) => OneshotOutcome::TimedOut,
-        DriveResult::WaitFailed(e) => OneshotOutcome::Failed(format!("wait failed: {e}")),
+        DriveResult::Exited(status, output, stderr) => {
+            let parsed = if stream { parse_stream_output(&output) } else { parse_oneshot_output(&output) };
+            let outcome = match parsed {
+                ParsedOutput::Success(text) if status.success() => OneshotOutcome::Completed(text),
+                // A good result event but a non-zero exit can't happen in
+                // practice; treat status as authoritative.
+                ParsedOutput::Success(_) => OneshotOutcome::Failed(with_stderr(
+                    format!("the session exited with status {status:?}"),
+                    &stderr,
+                )),
+                ParsedOutput::Error(msg) | ParsedOutput::Unusable(msg) => {
+                    OneshotOutcome::Failed(with_stderr(msg, &stderr))
+                }
+            };
+            (outcome, events(&output))
+        }
+        DriveResult::Cancelled => (OneshotOutcome::Cancelled, Vec::new()),
+        DriveResult::TimedOut(output) => (OneshotOutcome::TimedOut, events(&output)),
+        DriveResult::WaitFailed(e) => (OneshotOutcome::Failed(format!("wait failed: {e}")), Vec::new()),
     };
     Ok(outcome)
 }
@@ -222,7 +469,7 @@ pub(crate) fn drive_child(
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.is_cancelled() {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             join();
             return DriveResult::Cancelled;
         }
@@ -235,7 +482,7 @@ pub(crate) fn drive_child(
             }
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     join();
                     return DriveResult::TimedOut(out_buf.lock().unwrap().clone());
                 }
@@ -298,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_returns_result_text() {
         let (dir, bin) = setup("complete");
         let text = "The **cutover** moved to Sept 12.\nSOURCES: notes/a.md, People.md";
@@ -314,6 +562,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_default_result_without_file() {
         let (dir, bin) = setup("complete");
         let outcome = oneshot(
@@ -328,6 +577,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_failure_reports_detail() {
         let (dir, bin) = setup("headless-fail");
         let outcome = oneshot(
@@ -347,6 +597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_cancel_kills_session() {
         let (dir, bin) = setup("hang");
         let cancel = CancelToken::new();
@@ -367,6 +618,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_timeout_kills_session() {
         let (dir, bin) = setup("hang");
         let outcome = oneshot(
@@ -403,6 +655,39 @@ mod tests {
             parse_oneshot_output(r#"{"is_error": false, "result": "done"}"#),
             ParsedOutput::Success("done".into())
         );
+    }
+
+    /// stream-json stdout: one event a line, tool calls and their results
+    /// between the init and the result.
+    const CLI_STREAM: &str = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"abc","tools":["Read"]}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__ken__route_query","input":{"query":"who decides"}}]}}"#,
+        "\n",
+        "a warning the CLI printed\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"1. doc people/README.md"}]}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Chris decides."}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"Chris decides.","duration_ms":900,"num_turns":2}"#,
+        "\n"
+    );
+
+    #[test]
+    fn stream_events_keep_every_json_line_in_order() {
+        let events = parse_stream_events(CLI_STREAM);
+        let types: Vec<&str> = events.iter().filter_map(|e| e.get("type").and_then(|t| t.as_str())).collect();
+        assert_eq!(types, ["system", "assistant", "user", "assistant", "result"]);
+        assert_eq!(events[1]["message"]["content"][0]["input"]["query"], "who decides");
+    }
+
+    #[test]
+    fn stream_output_reads_the_result_event() {
+        assert_eq!(parse_stream_output(CLI_STREAM), ParsedOutput::Success("Chris decides.".into()));
+        // Cut off before the result: the last assistant text, as for the array.
+        let cut: String = CLI_STREAM.lines().take(5).map(|l| format!("{l}\n")).collect();
+        assert_eq!(parse_stream_output(&cut), ParsedOutput::Success("Chris decides.".into()));
+        assert!(matches!(parse_stream_output("not json at all"), ParsedOutput::Unusable(_)));
     }
 
     #[test]
@@ -492,6 +777,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_recovers_assistant_text_when_no_result_event() {
         // Exit 0 + assistant text, no result wrapper → Completed with the text.
         let (dir, bin) = setup("headless-array-noresult");
@@ -510,6 +796,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_fails_when_no_result_and_nonzero_exit() {
         // The recovery must not mask a real failure: non-zero exit → Failed.
         let (dir, bin) = setup("headless-array-noresult-nonzero");
@@ -553,6 +840,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_reads_array_output_end_to_end() {
         let (dir, bin) = setup("headless-array");
         let outcome = oneshot(
@@ -569,6 +857,7 @@ mod tests {
     /// A child that floods stderr must not deadlock on the pipe buffer:
     /// without a stderr drain thread this test only ends at the timeout.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_survives_stderr_flood() {
         let (dir, bin) = setup("stderr-flood");
         let outcome = oneshot(
@@ -583,6 +872,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_failure_includes_stderr() {
         let (dir, bin) = setup("headless-stderr-fail");
         let outcome = oneshot(
