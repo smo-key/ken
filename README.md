@@ -3,11 +3,12 @@
 A desktop app that turns an ordinary folder into a team knowledge base.
 Point Ken at your folder — notes, Word docs, spreadsheets, PDFs — and it
 indexes everything, watches for changes, and makes every fact findable:
-full-text search with AI quick answers, AI-maintained structured documents,
-Claude chats, a daily digest, deep web research, a knowledge map and
-timeline, an MCP server for your agents, and Git/shared-drive sync with
-conflict review. Specs live in `openspec/` and
-`docs/superpowers/specs/`.
+search by keyword and by meaning with AI quick answers, a knowledge base
+Claude keeps from the sources you give it and checks against the code,
+Claude chats, a daily digest, deep web research, a project graph and a
+log (the project's risks, actions, issues, decisions and milestones), an MCP knowledge server for your agents, and Git/shared-drive sync with
+conflict review. Specs live in `docs/superpowers/specs/`, and the
+knowledge layer's plan of record in `docs/knowledge-core/DECISIONS.md`.
 
 ## Install
 
@@ -42,10 +43,12 @@ previews) works without it.
 - **Walking skeleton** — project create/open, live indexing (md/txt/code,
   docx, xlsx, pptx, pdf, images), ⌘K full-text search, WYSIWYG markdown
   editing, in-app preview of PDF/Word/Excel/images.
-- **AI ingests** — recipes that keep structured documents (People,
-  Decisions, Requirements…) fresh as files change, run through your local
-  Claude Code CLI with review rules: human edits win, big refreshes wait
-  for approval. Template library included.
+- **Ingest** — drop a source (a meeting note, a doc, a transcript) in the
+  knowledge base's inbox and Claude, through your local Claude Code CLI,
+  writes it up as a dated note, updates the pages it changes a section at a
+  time, and drafts the rulings, risks, issues and tickets it finds for one
+  click each. An edit that contradicts a ruling or the code, or rewrites
+  much of a page, waits for you; each ingest is one commit.
 - **Chat drawer** — talk to your project's knowledge: friendly chat by
   default, the real Claude terminal one keystroke away, same session in
   both. Pins, status badges, and live views into running ingests.
@@ -102,17 +105,19 @@ transcripts are cached under `.ken/transcripts/` (never written next to your
 files) and their text is folded into the search index.
 
 The repo is a Cargo workspace: `crates/ken-core` (all domain logic —
-scanning, extraction, index, search, watching), `crates/ken-mcp` (MCP
-sidecar, stub for now), `src-tauri` (Tauri 2 shell), and `src/` (Svelte 5
+scanning, extraction, index, search, watching), `crates/ken-mcp` (the MCP
+knowledge server; with `--personal`, the tasks and memory tools Ken's own chat
+adds), `src-tauri` (Tauri 2 shell), and `src/` (Svelte 5
 frontend). Design reference: `docs/design/design-tokens.md` and
 `docs/design/ken-prototype-v2.dc.html`.
 
-Ken stores its index in the OS app-data directory, never inside your
-project folder; the only thing Ken writes to your folder is `.ken/`
-(plain-text project config) and any documents you edit.
+Ken stores its index and each repo's settings in the OS app-data
+directory, never inside your project folder. It writes to a code repo only
+the documents you edit there; in the knowledge base it also writes the
+pages it keeps, each change a commit.
 
 ## Specs
 
-Specs are managed with [OpenSpec](https://github.com/Fission-AI/OpenSpec):
-`openspec list` shows active changes; each change carries its proposal,
-design, delta specs, and task list under `openspec/changes/`.
+Design specs are in `docs/superpowers/specs/`. The knowledge layer is
+planned in `docs/knowledge-core/DECISIONS.md`, which implements the
+Knowledge, Drift and Decisions pages of Ways of Working.

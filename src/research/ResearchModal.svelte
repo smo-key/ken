@@ -59,13 +59,8 @@
   {/if}
 
   <label>
-    What should Ken research on the web?
-    <textarea
-      bind:value={question}
-      onkeydown={onKeydown}
-      rows="3"
-      placeholder="e.g. How are similar teams handling knowledge handover when someone leaves?"
-    ></textarea>
+    Question
+    <textarea bind:value={question} onkeydown={onKeydown} rows="3"></textarea>
   </label>
 
   <div class="two-col">
@@ -78,7 +73,7 @@
       </select>
     </label>
     <label>
-      Folder <span class="soft">(editable)</span>
+      Folder
       <input bind:value={outputDir} class="mono-input" placeholder="research" />
     </label>
   </div>
@@ -140,10 +135,6 @@
     font-weight: 600;
     color: var(--ink-secondary);
   }
-  .soft {
-    font-weight: 400;
-    color: var(--ink-tertiary);
-  }
   input,
   textarea,
   select {
@@ -152,10 +143,13 @@
     color: var(--ink);
     border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: var(--surface);
+    background-color: var(--surface);
     padding: 8px 12px;
     outline: none;
     resize: vertical;
+  }
+  select {
+    padding-right: 30px;
   }
   .mono-input {
     font-family: var(--font-mono);

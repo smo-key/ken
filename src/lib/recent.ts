@@ -102,3 +102,27 @@ export function saveRecents(projectId: string, list: RecentEntry[]): void {
     /* storage full or unavailable — history is best-effort */
   }
 }
+
+/** One file in Home's recent list across the workspace's repos. */
+export interface WorkspaceRecent {
+  projectId: string;
+  path: string;
+  at: number;
+}
+
+/** Every workspace repo's open history merged, newest first. `known`, when
+ *  given, is that repo's indexed paths: entries outside it are dropped
+ *  (deleted or excluded since). */
+export function mergeWorkspaceRecents(
+  lists: { projectId: string; entries: RecentEntry[]; known: Set<string> | null }[],
+  limit = RECENT_LIMIT,
+): WorkspaceRecent[] {
+  return lists
+    .flatMap((l) =>
+      l.entries
+        .filter((e) => !l.known || l.known.has(e.path))
+        .map((e) => ({ projectId: l.projectId, path: e.path, at: e.at })),
+    )
+    .sort((a, b) => b.at - a.at)
+    .slice(0, limit);
+}

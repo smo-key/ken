@@ -148,15 +148,11 @@
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
         referrerpolicy="no-referrer"
       ></iframe>
-      <div class="hint">
-        Some sites refuse to be shown inside another app — use Open in browser if
-        the page stays blank.
-      </div>
     {:else}
       <div class="empty">
         {stored === ""
-          ? "Paste a web address above to link it here."
-          : "This shortcut points somewhere Ken can't show — use Open in browser."}
+          ? "No address"
+          : "Can't show this here"}
       </div>
     {/if}
   {/if}

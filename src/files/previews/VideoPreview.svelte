@@ -219,24 +219,19 @@
           <div class="note">
             <p class="lead">Transcribing this video…</p>
             <ProgressBar pct={genPct} label={`Transcribing… ${genPct}%`} />
-            <p>The transcript and captions will appear here when it finishes.</p>
           </div>
         {:else}
           <PreviewLoading
             label={genPhase === "extracting"
               ? "Preparing audio…"
               : "Transcribing this video…"}
-            detail="On-device transcription is running in the background. The transcript and captions will appear here when it finishes."
           />
         {/if}
       {:else if status === "none"}
         <div class="note">
           <p class="lead">No transcript</p>
           {#if missingModel}
-            <p>
-              Generating a transcript needs the on-device speech model. Download
-              it once and Ken will transcribe this video right after.
-            </p>
+            <p>Needs the speech model</p>
             <ModelDownloadDialog
               status={missingModel}
               onInstalled={onModelInstalled}
@@ -251,7 +246,7 @@
           {/if}
         </div>
       {:else if cues.length === 0}
-        <div class="note">This transcript has no text.</div>
+        <div class="note">No text</div>
       {:else if timed}
         <ul class="cues">
           {#each cues as cue, i (i)}

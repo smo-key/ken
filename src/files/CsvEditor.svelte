@@ -29,7 +29,8 @@
     return grid;
   }
 
-  let rows = $state<string[][]>(toGrid(initial));
+  // The file the grid opened with; edits live here from then on.
+  let rows = $state<string[][]>(untrack(() => toGrid(initial)));
   const cols = $derived(rows[0]?.length ?? 0);
 
   // Guard: an editable input per cell doesn't survive six-figure row counts

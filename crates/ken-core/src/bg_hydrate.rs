@@ -57,9 +57,11 @@ pub fn wants_background_index(row: &FileRow, excluded: bool) -> bool {
     }
     // Raster images carry no extractable text (has_content() is false) but the
     // OCR pipeline makes their pixels searchable — worth pulling down under the
-    // same limits OCR itself enforces (no SVG, ≤ MAX_OCR_IMAGE_BYTES).
+    // same limits OCR itself enforces (no SVG, ≤ MAX_OCR_IMAGE_BYTES), and
+    // only where the OS can OCR at all.
     if kind == FileKind::Image {
-        return !scan::is_vector_image(&row.rel_path)
+        return crate::ocr::available()
+            && !scan::is_vector_image(&row.rel_path)
             && row.size >= 0
             && row.size <= scan::MAX_OCR_IMAGE_BYTES;
     }
@@ -71,13 +73,14 @@ pub fn wants_background_index(row: &FileRow, excluded: bool) -> bool {
 }
 
 /// The project's cloud-only documents worth pulling down now, as rel paths.
-/// Filters on `project.is_excluded` here (not only in the scanner) because the
+/// Filters on the excluded folders here (not only in the scanner) because the
 /// worker reads the index directly, where a just-excluded folder's rows can
 /// still be present until the next rescan removes them.
 pub fn pending_documents(files: &[FileRow], project: &Project) -> Vec<String> {
+    let excluded = project.excluded_folders();
     files
         .iter()
-        .filter(|f| wants_background_index(f, project.is_excluded(&f.rel_path)))
+        .filter(|f| wants_background_index(f, crate::project::in_folders(&excluded, &f.rel_path)))
         .map(|f| f.rel_path.clone())
         .collect()
 }
@@ -179,6 +182,19 @@ mod tests {
             &row("photos/whiteboard.JPG", scan::STATUS_CLOUD_ONLY, 4096),
             false,
         ));
+    }
+
+    /// Without an OCR engine an online-only image has nothing to give search,
+    /// so it is not downloaded.
+    #[test]
+    fn skips_images_where_the_os_cannot_ocr() {
+        crate::ocr::tests::force(false);
+        assert!(!wants_background_index(
+            &row("decks/arch-diagram.png", scan::STATUS_CLOUD_ONLY, 4096),
+            false,
+        ));
+        // Documents still come down.
+        assert!(wants_background_index(&row("plan.md", scan::STATUS_CLOUD_ONLY, 120), false));
     }
 
     /// Images the OCR pipeline itself would reject are not worth the bandwidth:

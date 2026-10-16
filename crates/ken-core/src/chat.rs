@@ -26,13 +26,30 @@ pub enum ChatUpdate {
     /// the UI and the answer command share:
     /// `{"requestId":…,"toolUseId":…,"questions":[…]}`.
     Question { chat_id: String, payload: String },
+    /// Claude wants to edit a file: an [`EditProposal`] as JSON, for the
+    /// user to accept or decline change by change. The CLI waits.
+    EditProposal { chat_id: String, payload: String },
+    /// A piece of the reply as it streams. Not kept: the whole reply follows
+    /// as a `Message`, which replaces what streamed.
+    Delta { chat_id: String, text: String },
+    /// Claude called a tool: a card to keep. `payload` is
+    /// `{"toolUseId":…,"name":…,"summary":…,"status":"running"}`.
+    Tool { chat_id: String, payload: String },
+    /// A tool's result, for the card with that `tool_use_id`.
+    ToolResult { chat_id: String, tool_use_id: String, is_error: bool, preview: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedEvent {
     Init,
     AssistantText(String),
-    Activity(String),
+    /// A piece of the reply as it is written (`--include-partial-messages`).
+    /// The whole text follows as `AssistantText`, which replaces it.
+    TextDelta(String),
+    /// Claude called a tool: its id, name, and a one-line summary.
+    Tool { id: String, name: String, summary: String },
+    /// A tool's result came back.
+    ToolDone { id: String, is_error: bool, preview: String },
     TurnResult { is_error: bool },
     /// A `can_use_tool` permission request the CLI expects an answer to.
     ControlRequest {
@@ -48,52 +65,79 @@ pub enum ParsedEvent {
 /// permission decision.
 const ASK_TOOL: &str = "AskUserQuestion";
 
-/// Parse one stream-json stdout line. Tolerant: unknown shapes → Other.
+/// Parse one stream-json stdout line into its first event. Tolerant:
+/// unknown shapes → Other.
 pub fn parse_event(line: &str) -> ParsedEvent {
+    parse_events(line).into_iter().next().unwrap_or(ParsedEvent::Other)
+}
+
+/// Every event in one stream-json stdout line, in order: an assistant
+/// message can carry text and several tool calls, and a user message
+/// several tool results.
+pub fn parse_events(line: &str) -> Vec<ParsedEvent> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return ParsedEvent::Other;
+        return vec![ParsedEvent::Other];
     };
-    match v.get("type").and_then(Value::as_str) {
-        Some("system") => ParsedEvent::Init,
-        Some("result") => ParsedEvent::TurnResult {
+    let blocks = || {
+        v.pointer("/message/content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let str_of = |b: &Value, k: &str| b.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let events: Vec<ParsedEvent> = match v.get("type").and_then(Value::as_str) {
+        Some("system") => vec![ParsedEvent::Init],
+        Some("result") => vec![ParsedEvent::TurnResult {
             is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-        },
-        Some("assistant") => {
-            let blocks = v
-                .pointer("/message/content")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            // One event usually carries one block; prefer text, else tool.
-            for b in &blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            if !t.trim().is_empty() {
-                                return ParsedEvent::AssistantText(t.to_string());
-                            }
-                        }
-                    }
-                    Some("tool_use") => {
-                        // The question card renders AskUserQuestion; an
-                        // activity line for it would just be noise.
-                        if b.get("name").and_then(Value::as_str) == Some(ASK_TOOL) {
-                            continue;
-                        }
-                        return ParsedEvent::Activity(summarize_tool(b));
-                    }
-                    _ => {}
+        }],
+        Some("stream_event") => {
+            // Only the main conversation streams into the transcript; a
+            // subagent's partial text (parent_tool_use_id set) does not.
+            let top = v.get("parent_tool_use_id").is_none_or(Value::is_null);
+            let delta = v.pointer("/event/delta");
+            match delta {
+                Some(d) if top && d.get("type").and_then(Value::as_str) == Some("text_delta") => {
+                    let t = str_of(d, "text");
+                    if t.is_empty() { vec![] } else { vec![ParsedEvent::TextDelta(t)] }
                 }
+                _ => vec![],
             }
-            ParsedEvent::Other
         }
+        Some("assistant") => blocks()
+            .iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let t = str_of(b, "text");
+                    (!t.trim().is_empty()).then_some(ParsedEvent::AssistantText(t))
+                }
+                // The question card renders AskUserQuestion; a tool card for
+                // it would just be noise.
+                Some("tool_use") if b.get("name").and_then(Value::as_str) != Some(ASK_TOOL) => {
+                    Some(ParsedEvent::Tool {
+                        id: str_of(b, "id"),
+                        name: b.get("name").and_then(Value::as_str).unwrap_or("Tool").to_string(),
+                        summary: summarize_tool(b),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        Some("user") => blocks()
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .map(|b| ParsedEvent::ToolDone {
+                id: str_of(b, "tool_use_id"),
+                is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                preview: result_preview(b.get("content")),
+            })
+            .collect(),
         Some("control_request") => {
             let req = v.get("request");
             if req.and_then(|r| r.get("subtype")).and_then(Value::as_str) != Some("can_use_tool") {
-                return ParsedEvent::Other;
+                return vec![ParsedEvent::Other];
             }
             let req = req.unwrap();
-            ParsedEvent::ControlRequest {
+            vec![ParsedEvent::ControlRequest {
                 request_id: v
                     .get("request_id")
                     .and_then(Value::as_str)
@@ -110,28 +154,271 @@ pub fn parse_event(line: &str) -> ParsedEvent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-            }
+            }]
         }
-        _ => ParsedEvent::Other,
+        _ => vec![],
+    };
+    if events.is_empty() { vec![ParsedEvent::Other] } else { events }
+}
+
+/// The start of a tool result, for its card: text only, at most a few lines.
+fn result_preview(content: Option<&Value>) -> String {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    // A search's hits (`3. [code · service] repo:src/a.ts:12 `saveWorld`
+    // (ken://…)`): the card lists each hit's line without its snippet, so it
+    // shows what was found, and a code hit's symbol beside its path
+    // (knowledge-core decision 26).
+    let hits: Vec<&str> = text.lines().filter(|l| is_hit_line(l)).collect();
+    if hits.len() > 1 {
+        let mut out = hits.iter().take(HIT_LINES).copied().collect::<Vec<_>>().join("\n");
+        if out.chars().count() > 1200 {
+            out = out.chars().take(1200).collect::<String>() + "…";
+        } else if hits.len() > HIT_LINES {
+            out.push_str("\n…");
+        }
+        return out;
     }
+    let mut out: String = text.lines().take(8).collect::<Vec<_>>().join("\n");
+    if out.chars().count() > 600 {
+        out = out.chars().take(600).collect::<String>() + "…";
+    } else if text.lines().count() > 8 {
+        out.push_str("\n…");
+    }
+    out
+}
+
+/// Most hit lines a search's card keeps.
+const HIT_LINES: usize = 10;
+
+/// Whether a line of a tool result is one of Ken's search hits: numbered,
+/// with a ken:// address in brackets (`2. [doc] repo:a.md:4 (ken://…)`).
+fn is_hit_line(line: &str) -> bool {
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && line[digits..].starts_with(". ") && line.contains(" (ken://")
 }
 
 /// "Read notes/meeting.md" — a human-readable one-liner for a tool_use block.
 fn summarize_tool(block: &Value) -> String {
-    let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+    let raw = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+    let name = match ken_mcp_tool(raw) {
+        Some(t) => format!("Ken {}", t.replace('_', " ")),
+        None => raw.to_string(),
+    };
     let input = block.get("input");
     let arg = input.and_then(|i| {
-        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path"]
+        // `name` is the symbol Ken's code tools look up: the card shows it.
+        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path", "name", "description"]
             .iter()
             .find_map(|k| i.get(k).and_then(Value::as_str))
     });
     match arg {
         Some(a) => {
-            let a = if a.len() > 80 { &a[..80] } else { a };
+            // By characters: a byte cut can land inside one and panic.
+            let a: String = a.chars().take(80).collect();
             format!("{name} {a}")
         }
-        None => name.to_string(),
+        None => name,
     }
+}
+
+/// Tools whose permission request is an edit for the user to review as a
+/// diff, accepting or declining each change, instead of a write that just
+/// happens.
+pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
+
+/// What every chat session is told about working inside Ken, appended to
+/// Claude Code's own system prompt. The app's rules (knowledge-core decision
+/// 1), plus three of the knowledge server's `instructions` said again in
+/// short (rule 4): how to weigh a hit's label, that the knowledge base
+/// settles what the team decided and a ruling is settled, and that a
+/// difference from the code is said with both cited. The chat's answers were
+/// measured with those in the guide; they stay until a measurement shows the
+/// instructions alone carry them. Rule 8 keeps the tools' names out of what
+/// the person reads.
+pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
+knowledge base, docs and code. Rules for this app:\n\
+1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
+decline each change. If they decline some, the tool result says which; read the file again before editing it further, \
+and do not retry a declined change unless they ask.\n\
+2. Cite your sources so they can click them. Every fact that comes from a file gets a Markdown link to that file, \
+project-relative, with the line when you know it: [Save.md, line 12](Platform/Save.md#L12), or a heading: \
+[Save format](Platform/Save.md#save-format). A hit from Ken's tools that carries a ken:// address is linked \
+by that address, with #L<line> when it has a line. A file in another of the workspace's repos is linked by that \
+repo's ken:// address (each turn lists them), never a project-relative path; write a space in a path as %20. \
+Never open files or switch the person's screen yourself; a link \
+is how they go there.\n\
+3. Ken's knowledge server is how you search the team's knowledge base and code, and its instructions say how to weigh \
+what it finds. Start with mcp__ken__search, read a hit with mcp__ken__read, and for code use \
+mcp__ken__code_definition, mcp__ken__code_usages, mcp__ken__code_outline and mcp__ken__code_imports before Grep and \
+Glob. mcp__ken__related, mcp__ken__history, mcp__ken__tickets and mcp__ken__repos say what something is tied to, \
+when and why it changed, the work in flight and done, and which repos there are. Ken's tools and Grep, Glob and Read \
+cover every question about the files; do not run shell commands to look at them. When Ken finds nothing that \
+answers, look yourself with Grep, Glob and Read in this project and the workspace's other repos (you may read them \
+all; Glob and Grep search only the folder you start in unless given one, so pass each repo's folder as the path) \
+before saying something isn't there, and say where you looked.\n\
+4. Weigh each hit by its label (kind · tier or role · date): a binding ruling or rule over a current page, a current \
+page over a record (a ticket, note or draft), a later ruling over an earlier one. The knowledge base settles what the \
+team decided, and a ruling is settled: do not reopen it. When the code differs from the knowledge base or a ruling, say \
+so and cite both.\n\
+5. The knowledge base changes through a person. A ruling the person states goes in with \
+mcp__ken__propose_decision and a source they want kept with mcp__ken__add_source: both wait in Ken's Inbox (the \
+ruling for one click into the decisions log, the source for the next ingest), so say that it waits. An answer worth \
+keeping is filed back the same way: offer to add it with mcp__ken__add_source, and ingest makes it pages. Edit a page \
+of the knowledge base only when they ask, as a reviewed edit.\n\
+6. The person's list is Ken's, not yours. Their tasks are read with mcp__ken-personal__task_list; add or change a \
+task with mcp__ken-personal__task_create and mcp__ken-personal__task_update when they ask, and say what you added. \
+Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds the person's standing \
+notes: follow them, add one with mcp__ken-personal__memory_write only when the person asks you to remember \
+something, and keep a finding they want kept with mcp__ken-personal__journal_append.\n\
+7. mcp__ken-personal__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or \
+show something.\n\
+8. Tell the person what you did, never which tool did it: \"I searched the knowledge base\", \"it waits in the \
+Inbox\". Never name a tool, yours or Ken's, to them, and call the team's pages the knowledge base, not the wiki.";
+
+/// The server name Ken's chat gives its knowledge server, `ken-mcp`
+/// (`mcp__ken__search`): the same name Claude Code is told to register.
+pub const KEN_SERVER: &str = "ken";
+
+/// The server name Ken's chat gives the personal tool set, `ken-mcp
+/// --personal` (`mcp__ken-personal__task_list`). Only Ken's own chat
+/// registers it.
+pub const PERSONAL_SERVER: &str = "ken-personal";
+
+/// The knowledge server's tools (knowledge-core decision 22), which the chat
+/// may use without asking: they read Ken's index and the repos, and the two
+/// that write only queue for a person (`propose_decision` files a ready
+/// ruling in the Inbox, `add_source` puts a source in the inbox for ingest).
+pub const KEN_MCP_ALLOWED: [&str; 12] = [
+    "search",
+    "read",
+    "related",
+    "code_definition",
+    "code_usages",
+    "code_outline",
+    "code_imports",
+    "history",
+    "tickets",
+    "propose_decision",
+    "add_source",
+    "repos",
+];
+
+/// The personal tool set the chat may use without asking: the person's own
+/// Your day list and Ken's memory and journal when they ask (each write is
+/// dated and says who made it), and opening a file for them when they ask.
+pub const KEN_PERSONAL_ALLOWED: [&str; 6] = ["task_list", "task_create", "task_update", "memory_write", "journal_append", "open_in_ken"];
+
+/// Tools of Claude Code's own that the chat process does not get: no shell
+/// (Ken's tools and Read, Grep and Glob cover the files), no web, and no task
+/// lists of its own (the person's list is Ken's). Notebook edits are not
+/// reviewed as diffs, so they are off too.
+pub const CHAT_DISALLOWED: [&str; 10] = [
+    "Bash",
+    "PowerShell",
+    "WebFetch",
+    "WebSearch",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet",
+    "TodoWrite",
+    "NotebookEdit",
+];
+
+/// The bare name of a tool of Ken's knowledge server or its personal tool
+/// set, as Claude Code names them (`mcp__ken__search`,
+/// `mcp__ken-personal__task_list`).
+fn ken_mcp_tool(tool: &str) -> Option<&str> {
+    tool.strip_prefix("mcp__ken__").or_else(|| tool.strip_prefix("mcp__ken-personal__"))
+}
+
+/// An edit Claude asked to make, worked out against the file as it is now,
+/// for the user to review: the text before and the text after.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditProposal {
+    pub request_id: String,
+    pub tool_use_id: String,
+    pub tool: String,
+    /// The file, absolute, as the tool named it.
+    pub path: String,
+    /// Relative to the project, when inside it.
+    pub rel_path: Option<String>,
+    pub base: String,
+    pub proposed: String,
+    /// The tool's own input, sent back unchanged when every change is accepted.
+    pub input: Value,
+    /// `accepted` · `declined` · `partial`, once decided.
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// What the decision told Claude, once decided.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+fn replace_once(text: &str, old: &str, new: &str, all: bool) -> std::result::Result<String, String> {
+    if old.is_empty() {
+        return Err("the text to replace is empty".into());
+    }
+    let n = text.matches(old).count();
+    match (n, all) {
+        (0, _) => Err("the text to replace is not in the file".into()),
+        (1, _) | (_, true) => Ok(if all { text.replace(old, new) } else { text.replacen(old, new, 1) }),
+        (n, false) => Err(format!("the text to replace appears {n} times; it must be unique")),
+    }
+}
+
+/// Work out an edit tool's result against the file on disk: the text before
+/// and after. `Err` says why it cannot apply (the CLI would fail it too).
+pub fn propose_edit(project_root: &Path, tool: &str, input: &Value) -> std::result::Result<(String, Option<String>, String, String), String> {
+    let path = input.get("file_path").and_then(Value::as_str).ok_or("the edit names no file")?;
+    let abs = if Path::new(path).is_absolute() { PathBuf::from(path) } else { project_root.join(path) };
+    let rel = abs.strip_prefix(project_root).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
+    let base = std::fs::read_to_string(&abs).unwrap_or_default();
+    // Claude Code reads and edits text with LF line ends. A file saved with
+    // CRLF (most of a Windows checkout with core.autocrlf) would never match
+    // a multi-line edit, so the edit is worked out on LF text and the result
+    // is put back in the file's own line ends.
+    let crlf = base.contains("\r\n");
+    let lf = |s: &str| if crlf { s.replace("\r\n", "\n") } else { s.to_string() };
+    let text = lf(&base);
+    let proposed = match tool {
+        "Write" => lf(input.get("content").and_then(Value::as_str).unwrap_or_default()),
+        "Edit" => {
+            let old = lf(input.get("old_string").and_then(Value::as_str).unwrap_or_default());
+            let new = lf(input.get("new_string").and_then(Value::as_str).unwrap_or_default());
+            let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            replace_once(&text, &old, &new, all)?
+        }
+        "MultiEdit" => {
+            let mut text = text.clone();
+            for e in input.get("edits").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let old = lf(e.get("old_string").and_then(Value::as_str).unwrap_or_default());
+                let new = lf(e.get("new_string").and_then(Value::as_str).unwrap_or_default());
+                let all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+                text = replace_once(&text, &old, &new, all)?;
+            }
+            text
+        }
+        other => return Err(format!("{other} is not an edit")),
+    };
+    let proposed = if crlf { proposed.replace("\n", "\r\n") } else { proposed };
+    Ok((abs.to_string_lossy().to_string(), rel, base, proposed))
+}
+
+fn control_reply(request_id: &str, response: Value) -> Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": request_id, "response": response }
+    })
 }
 
 /// The stable tier aliases Claude Code resolves to the latest model of each
@@ -182,6 +469,72 @@ pub fn build_context_preamble(focused: Option<&str>, open: &[String]) -> Option<
     ))
 }
 
+/// Cap on how many sibling projects we name, for the same reason
+/// `MAX_CONTEXT_FILES` exists.
+const MAX_SCOPE_PROJECTS: usize = 12;
+
+/// Build the cross-project scope preamble for an "all projects" (or group)
+/// chat.
+///
+/// Ken's chat is a Claude Code session whose cwd is the FOCUSED project, so
+/// widening scope is a matter of telling the session which sibling folders
+/// it may read — it can open absolute paths once those folders are trusted.
+/// That falls out of the architecture rather than fighting it, and it gives
+/// exactly the ruling this feature was specified under: **read across every
+/// project in scope, write only inside the focused one** unless the user
+/// names another. A session that could freely edit seven repos would turn
+/// one misread instruction into seven repos' worth of damage.
+///
+/// Returns `None` when there is nothing to widen to (no siblings), so a
+/// single-project workspace sends exactly what it sends today.
+/// How to link a file in each repo of the workspace, as (name, id), for a
+/// chat turn: a project-relative link resolves only in the chat's own
+/// project, so a file read in a sibling needs its repo's address. None
+/// outside a workspace.
+pub fn build_cite_preamble(members: &[(String, uuid::Uuid)]) -> Option<String> {
+    if members.len() < 2 {
+        return None;
+    }
+    let mut s = String::from("[Links to files in the workspace's repos:");
+    for (name, id) in members.iter().take(MAX_SCOPE_PROJECTS) {
+        s.push_str(&format!("\n- {name}: ken://{id}/<path>#L<line>"));
+    }
+    s.push(']');
+    Some(s)
+}
+
+pub fn build_scope_preamble(
+    focused_name: &str,
+    focused_root: &str,
+    siblings: &[(String, String)],
+    group_name: Option<&str>,
+) -> Option<String> {
+    if siblings.is_empty() {
+        return None;
+    }
+    let shown = siblings.len().min(MAX_SCOPE_PROJECTS);
+    let mut lines = String::new();
+    for (name, root) in &siblings[..shown] {
+        lines.push_str(&format!("\n- {name}: {root}"));
+    }
+    if siblings.len() > shown {
+        lines.push_str(&format!("\n- … and {} more", siblings.len() - shown));
+    }
+    let scope_label = match group_name {
+        Some(g) => format!("the \"{g}\" group of projects"),
+        None => "every project in this workspace".to_string(),
+    };
+    Some(format!(
+        "[Scope — this question is about {scope_label}, not just one. \
+         Besides the current project ({focused_name}, at {focused_root}) you \
+         may READ files in these sibling projects by absolute path when they \
+         are relevant:{lines}\n\
+         Make edits only inside {focused_name} unless the user explicitly \
+         names another project to change. If answering needs a file from a \
+         sibling, read it rather than guessing.]"
+    ))
+}
+
 /// Ensure Claude Code treats `project_root` as a trusted folder before we spawn
 /// it. On a first interactive run in an unseen folder the CLI shows a blocking
 /// "Do you trust the files in this folder?" onboarding dialog (it records the
@@ -190,29 +543,109 @@ pub fn build_context_preamble(focused: Option<&str>, open: &[String]) -> Option<
 /// the folder is one the user already chose as a Ken project, pre-accepting the
 /// trust is honest consent — and it is scoped to exactly this project's path(s)
 /// so it never affects the user's other Claude usage. Best-effort: any IO/parse
-/// failure is swallowed so a chat still spawns (it just may hit the prompt).
+/// failure is swallowed so a session still spawns (it just may hit the prompt).
+///
+/// Only the interactive TUI needs this (`attach_terminal`, the runner's hidden
+/// TUI); print mode (`-p`) never shows the dialog. The file is shared with
+/// every running Claude Code, so it is written only when a flag is missing,
+/// through a temp file and a rename, and never when it cannot be parsed (a
+/// half-written file must not be replaced by one holding only our keys).
 pub fn ensure_folder_trusted(project_root: &Path) {
-    let Some(cfg_path) = claude_config_path() else { return };
+    if let Some(cfg_path) = claude_config_path() {
+        trust_folder_in(&cfg_path, project_root);
+    }
+}
 
-    // The CLI keys the map by the process cwd. Register both the path we pass
-    // and its canonical (symlink-resolved) form, so we match whichever the
-    // spawned process ends up reporting as its cwd.
-    let mut keys = vec![project_root.to_string_lossy().into_owned()];
-    if let Ok(canon) = std::fs::canonicalize(project_root) {
-        let canon = canon.to_string_lossy().into_owned();
-        if !keys.contains(&canon) {
-            keys.push(canon);
+/// [`ensure_folder_trusted`] against the config file at `cfg_path`.
+fn trust_folder_in(cfg_path: &Path, project_root: &Path) {
+    let (keys, stale) = trust_keys(project_root);
+    let existing = match std::fs::read(cfg_path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(_) => return,
+    };
+    if !needs_trust_write(&existing, &keys, &stale) {
+        return;
+    }
+    let updated = apply_folder_trust(existing, &keys, &stale);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&updated) {
+        let _ = write_atomically(cfg_path, &bytes);
+    }
+}
+
+/// The keys Claude Code reads for `project_root` (the path as given and its
+/// canonical form, in Claude Code's own spelling), and the keys older Ken
+/// versions wrote on Windows that Claude Code never reads (backslashes, the
+/// `\\?\` prefix), to be dropped when they hold nothing but Ken's flags.
+fn trust_keys(project_root: &Path) -> (Vec<String>, Vec<String>) {
+    let raw = project_root.to_string_lossy().into_owned();
+    let canonical = crate::setup::plain_canonical(project_root).to_string_lossy().into_owned();
+    let mut keys = Vec::new();
+    for p in [&raw, &canonical] {
+        let k = claude_config_key(p, cfg!(windows));
+        if !keys.contains(&k) {
+            keys.push(k);
         }
     }
-
-    let existing = std::fs::read(&cfg_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .unwrap_or(Value::Null);
-    let updated = apply_folder_trust(existing, &keys);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&updated) {
-        let _ = std::fs::write(&cfg_path, bytes);
+    let mut stale = Vec::new();
+    if cfg!(windows) {
+        let verbatim = std::fs::canonicalize(project_root)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for p in [raw, canonical, verbatim] {
+            if !p.is_empty() && !keys.contains(&p) && !stale.contains(&p) {
+                stale.push(p);
+            }
+        }
     }
+    (keys, stale)
+}
+
+/// A folder's key in `~/.claude.json` as Claude Code writes it: the path its
+/// process sees as the cwd. On Windows that has no `\\?\` prefix and uses
+/// forward slashes (`C:/Code/ken`); elsewhere it is the path unchanged.
+pub(crate) fn claude_config_key(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    let plain = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    };
+    plain.replace('\\', "/")
+}
+
+const TRUST_FLAGS: [&str; 2] = ["hasTrustDialogAccepted", "hasCompletedProjectOnboarding"];
+
+/// Whether `cfg` lacks a trust flag for any of `keys`, or still holds one of
+/// Ken's own `stale` entries.
+fn needs_trust_write(cfg: &Value, keys: &[String], stale: &[String]) -> bool {
+    let projects = cfg.get("projects");
+    let missing = keys.iter().any(|k| {
+        let entry = projects.and_then(|p| p.get(k));
+        TRUST_FLAGS.iter().any(|f| entry.and_then(|e| e.get(*f)) != Some(&Value::Bool(true)))
+    });
+    missing || stale.iter().any(|k| projects.and_then(|p| p.get(k)).is_some_and(is_only_ken_flags))
+}
+
+/// An entry holding nothing but the flags Ken writes (so Ken wrote it).
+fn is_only_ken_flags(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|o| o.keys().all(|k| TRUST_FLAGS.contains(&k.as_str())))
+}
+
+/// Replace `path` with `bytes` through a temp file in the same folder and a
+/// rename, so a reader never sees a half-written file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.ken-{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Locate Claude Code's `.claude.json`. Honors `CLAUDE_CONFIG_DIR` (which the
@@ -222,14 +655,20 @@ fn claude_config_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join(".claude.json"));
     }
+    // Unit tests that start a hidden TUI (runner, research, ingest) never
+    // write into the developer's own ~/.claude.json.
+    if cfg!(test) {
+        return None;
+    }
     dirs::home_dir().map(|h| h.join(".claude.json"))
 }
 
 /// Set the trust/onboarding flags for exactly `path_keys` in a parsed
-/// `~/.claude.json` value, creating the `projects` map and entries as needed
-/// and leaving every other key (and every other project) untouched. Pure so it
-/// is unit-tested without a real home directory.
-fn apply_folder_trust(mut cfg: Value, path_keys: &[String]) -> Value {
+/// `~/.claude.json` value, creating the `projects` map and entries as needed,
+/// drop the `stale` entries that hold only Ken's flags, and leave every other
+/// key (and every other project) untouched. Pure so it is unit-tested without
+/// a real home directory.
+fn apply_folder_trust(mut cfg: Value, path_keys: &[String], stale: &[String]) -> Value {
     if !cfg.is_object() {
         cfg = Value::Object(serde_json::Map::new());
     }
@@ -241,6 +680,8 @@ fn apply_folder_trust(mut cfg: Value, path_keys: &[String]) -> Value {
         *projects = Value::Object(serde_json::Map::new());
     }
     let projects = projects.as_object_mut().unwrap();
+    // `retain` keeps the order of the person's other entries.
+    projects.retain(|k, v| !(stale.contains(k) && is_only_ken_flags(v)));
     for key in path_keys {
         let entry = projects
             .entry(key.clone())
@@ -267,6 +708,12 @@ struct Conversation {
 pub struct ChatEngine {
     binary: PathBuf,
     project_root: PathBuf,
+    /// Ken's MCP server for this project, as a Claude Code `--mcp-config`
+    /// file, when ken-mcp was found.
+    mcp_config: Mutex<Option<PathBuf>>,
+    /// The workspace's other repos, readable in chat without asking
+    /// (`--add-dir`), so a search Ken's index missed can be done by hand.
+    read_dirs: Mutex<Vec<PathBuf>>,
     live: Arc<Mutex<HashMap<String, Conversation>>>,
     on_update: Arc<dyn Fn(ChatUpdate) + Send + Sync>,
 }
@@ -280,9 +727,22 @@ impl ChatEngine {
         ChatEngine {
             binary,
             project_root,
+            mcp_config: Mutex::new(None),
+            read_dirs: Mutex::new(Vec::new()),
             live: Arc::new(Mutex::new(HashMap::new())),
             on_update: Arc::new(on_update),
         }
+    }
+
+    /// Give new chat sessions Ken's MCP server (a `--mcp-config` file).
+    pub fn set_mcp_config(&self, path: Option<PathBuf>) {
+        *self.mcp_config.lock().unwrap() = path;
+    }
+
+    /// The other folders a chat may read (the workspace's repos). Edits
+    /// there still come back as proposals to review, like any edit.
+    pub fn set_read_dirs(&self, dirs: Vec<PathBuf>) {
+        *self.read_dirs.lock().unwrap() = dirs;
     }
 
     pub fn is_live(&self, chat_id: &str) -> bool {
@@ -309,17 +769,27 @@ impl ChatEngine {
                 .stdin
                 .clone()
         };
-        {
-            let mut stdin = stdin.lock().unwrap();
-            writeln!(stdin, "{payload}")
-                .and_then(|_| stdin.flush())
-                .map_err(|e| Error::Other(format!("chat send failed: {e}")))?;
-        }
+        // Working before the write, never after: on Windows the write can
+        // wait until the CLI reads its stdin, and a short turn can finish in
+        // that time, so a "working" sent afterwards would land after "done"
+        // and leave the chat looking busy for good.
         (self.on_update)(ChatUpdate::Status {
             chat_id: chat_id.to_string(),
             status: "working".into(),
             detail: None,
         });
+        let written = {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}").and_then(|_| stdin.flush())
+        };
+        if let Err(e) = written {
+            (self.on_update)(ChatUpdate::Status {
+                chat_id: chat_id.to_string(),
+                status: "error".into(),
+                detail: None,
+            });
+            return Err(Error::Other(format!("chat send failed: {e}")));
+        }
         Ok(())
     }
 
@@ -355,26 +825,74 @@ impl ChatEngine {
                 .stdin
                 .clone()
         };
+        // Working first, as in `send`.
+        (self.on_update)(ChatUpdate::Status {
+            chat_id: chat_id.to_string(),
+            status: "working".into(),
+            detail: None,
+        });
+        let written = {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}").and_then(|_| stdin.flush())
+        };
+        if let Err(e) = written {
+            (self.on_update)(ChatUpdate::Status {
+                chat_id: chat_id.to_string(),
+                status: "error".into(),
+                detail: None,
+            });
+            return Err(Error::Other(format!("answer failed: {e}")));
+        }
+        Ok(())
+    }
+
+    /// Answer a pending edit: `allow` lets the CLI make the edit exactly as
+    /// it asked; otherwise it is denied with `message`, which says what the
+    /// user declined (and what Ken applied itself, for a partial accept).
+    pub fn answer_edit(&self, chat_id: &str, proposal: &EditProposal, allow: bool, message: &str) -> Result<()> {
+        let response = if allow {
+            serde_json::json!({ "behavior": "allow", "updatedInput": proposal.input, "toolUseID": proposal.tool_use_id })
+        } else {
+            serde_json::json!({ "behavior": "deny", "message": message })
+        };
+        let payload = control_reply(&proposal.request_id, response);
+        let stdin = {
+            let live = self.live.lock().unwrap();
+            live.get(chat_id)
+                .ok_or_else(|| Error::Other("this chat is no longer running".into()))?
+                .stdin
+                .clone()
+        };
+        // Working first, as in `send`.
+        (self.on_update)(ChatUpdate::Status {
+            chat_id: chat_id.to_string(),
+            status: "working".into(),
+            detail: None,
+        });
         {
             let mut stdin = stdin.lock().unwrap();
             writeln!(stdin, "{payload}")
                 .and_then(|_| stdin.flush())
                 .map_err(|e| Error::Other(format!("answer failed: {e}")))?;
         }
-        (self.on_update)(ChatUpdate::Status {
-            chat_id: chat_id.to_string(),
-            status: "working".into(),
-            detail: None,
-        });
         Ok(())
     }
 
     /// Stop a chat's conversation process (mode switch, archive, shutdown).
     pub fn stop(&self, chat_id: &str) {
-        if let Some(mut conv) = self.live.lock().unwrap().remove(chat_id) {
-            let _ = conv.child.kill();
+        let stopped = self.live.lock().unwrap().remove(chat_id);
+        if let Some(mut conv) = stopped {
+            crate::proc::kill_tree(&mut conv.child);
             let _ = conv.child.wait();
+            self.stopped(chat_id);
         }
+    }
+
+    /// A chat whose process Ken ended: removed from `live` first, so its
+    /// reader sees no death to report, and a reply cut off mid-turn would
+    /// otherwise show "working" for good.
+    fn stopped(&self, chat_id: &str) {
+        (self.on_update)(ChatUpdate::Status { chat_id: chat_id.to_string(), status: "done".into(), detail: None });
     }
 
     pub fn stop_all(&self) {
@@ -402,17 +920,19 @@ impl ChatEngine {
                 .map(|(id, _)| id.clone())
             {
                 if let Some(mut conv) = live.remove(&oldest) {
-                    let _ = conv.child.kill();
+                    crate::proc::kill_tree(&mut conv.child);
                     let _ = conv.child.wait();
+                    self.stopped(&oldest);
                 }
             }
         }
 
-        // Pre-accept folder trust so a first run in a fresh project doesn't hit
-        // the blocking onboarding gate (scoped to this project's path only).
-        ensure_folder_trusted(&self.project_root);
-
+        // Print mode (`-p`) never shows the trust dialog, so no folder trust
+        // is written here; only the interactive TUI needs it (attach_terminal,
+        // the runner's hidden TUI).
         let mut cmd = Command::new(&self.binary);
+        // No console window for the chat process (see `proc::quiet`).
+        crate::proc::quiet(&mut cmd);
         cmd.args([
             "-p",
             "--input-format",
@@ -420,13 +940,28 @@ impl ChatEngine {
             "--output-format",
             "stream-json",
             "--verbose",
+            // The reply streams in as it is written, not all at once.
+            "--include-partial-messages",
+            // Default, not acceptEdits: every Edit/MultiEdit/Write comes back
+            // as a permission request, which Ken shows as a diff to accept or
+            // decline change by change.
             "--permission-mode",
-            "acceptEdits",
+            "default",
             // Routes permission requests to our stdin/stdout control channel,
             // which is what makes AskUserQuestion reach the user at all.
             "--permission-prompt-tool",
             "stdio",
         ]);
+        // One line: on Windows the CLI is a `.cmd` launcher, and a line break
+        // in any argument to one fails the spawn.
+        cmd.arg("--append-system-prompt").arg(KEN_GUIDE.replace('\n', " "));
+        cmd.arg("--disallowedTools").arg(CHAT_DISALLOWED.join(","));
+        if let Some(cfg) = self.mcp_config.lock().unwrap().clone() {
+            cmd.arg("--mcp-config").arg(cfg);
+        }
+        for dir in self.read_dirs.lock().unwrap().iter().filter(|d| **d != self.project_root) {
+            cmd.arg("--add-dir").arg(dir);
+        }
         // Only forward a validated stable alias; anything else falls back to the
         // CLI's own default model.
         if let Some(alias) = model.and_then(valid_model_alias) {
@@ -444,6 +979,7 @@ impl ChatEngine {
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {}: {e}", self.binary.display())))?;
+        crate::proc::track(&child);
         let stdin = child.stdin.take().ok_or_else(|| Error::Other("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
         let stderr = child.stderr.take();
@@ -454,11 +990,13 @@ impl ChatEngine {
         let live_map = self.live.clone();
         let id = chat_id.to_string();
         let pump_stdin = stdin.clone();
+        let root = self.project_root.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut saw_result = false;
             for line in reader.lines().map_while(|l| l.ok()) {
-                match parse_event(&line) {
+                for event in parse_events(&line) {
+                match event {
                     ParsedEvent::AssistantText(text) => {
                         saw_result = false;
                         on_update(ChatUpdate::Message {
@@ -467,12 +1005,20 @@ impl ChatEngine {
                             content: text,
                         });
                     }
-                    ParsedEvent::Activity(summary) => {
-                        on_update(ChatUpdate::Message {
-                            chat_id: id.clone(),
-                            role: "activity".into(),
-                            content: summary,
+                    ParsedEvent::TextDelta(text) => {
+                        on_update(ChatUpdate::Delta { chat_id: id.clone(), text });
+                    }
+                    ParsedEvent::Tool { id: tool_use_id, name, summary } => {
+                        let payload = serde_json::json!({
+                            "toolUseId": tool_use_id,
+                            "name": name,
+                            "summary": summary,
+                            "status": "running",
                         });
+                        on_update(ChatUpdate::Tool { chat_id: id.clone(), payload: payload.to_string() });
+                    }
+                    ParsedEvent::ToolDone { id: tool_use_id, is_error, preview } => {
+                        on_update(ChatUpdate::ToolResult { chat_id: id.clone(), tool_use_id, is_error, preview });
                     }
                     ParsedEvent::TurnResult { is_error } => {
                         saw_result = true;
@@ -504,6 +1050,60 @@ impl ChatEngine {
                                 status: "needs_input".into(),
                                 detail: None,
                             });
+                        } else if let Some(tool) = ken_mcp_tool(&tool_name) {
+                            // Ken's tools run: they read, queue for a person,
+                            // or keep the person's own list when they ask.
+                            // Anything else is for the person to do in Ken.
+                            let response = if KEN_MCP_ALLOWED.contains(&tool) || KEN_PERSONAL_ALLOWED.contains(&tool) {
+                                serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id })
+                            } else {
+                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} is not one of Ken's tools the chat may use; the person does that in Ken.") })
+                            };
+                            let reply = control_reply(&request_id, response);
+                            let mut w = pump_stdin.lock().unwrap();
+                            let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
+                        } else if tool_name == "NotebookEdit" {
+                            // Notebooks keep the old behaviour: allowed as asked.
+                            let reply = control_reply(
+                                &request_id,
+                                serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id }),
+                            );
+                            let mut w = pump_stdin.lock().unwrap();
+                            let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
+                        } else if EDIT_TOOLS.contains(&tool_name.as_str()) {
+                            match propose_edit(&root, &tool_name, &input) {
+                                Ok((path, rel_path, base, proposed)) => {
+                                    let proposal = EditProposal {
+                                        request_id,
+                                        tool_use_id,
+                                        tool: tool_name,
+                                        path,
+                                        rel_path,
+                                        base,
+                                        proposed,
+                                        input,
+                                        decision: None,
+                                        note: None,
+                                    };
+                                    on_update(ChatUpdate::EditProposal {
+                                        chat_id: id.clone(),
+                                        payload: serde_json::to_string(&proposal).unwrap_or_default(),
+                                    });
+                                    on_update(ChatUpdate::Status {
+                                        chat_id: id.clone(),
+                                        status: "needs_input".into(),
+                                        detail: None,
+                                    });
+                                }
+                                Err(why) => {
+                                    let reply = control_reply(
+                                        &request_id,
+                                        serde_json::json!({ "behavior": "deny", "message": format!("This edit cannot apply: {why}. Read the file again and retry.") }),
+                                    );
+                                    let mut w = pump_stdin.lock().unwrap();
+                                    let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
+                                }
+                            }
                         } else {
                             // Every other permission request is denied, which
                             // preserves the headless behavior this session had
@@ -527,6 +1127,7 @@ impl ChatEngine {
                         }
                     }
                     ParsedEvent::Init | ParsedEvent::Other => {}
+                }
                 }
             }
             // Stdout closed: process ended. Mid-turn death is an error the
@@ -733,6 +1334,121 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_turn_says_how_to_link_each_repos_files() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert_eq!(build_cite_preamble(&[("wiki".into(), a)]), None, "one project: relative links work");
+        let p = build_cite_preamble(&[("wiki".into(), a), ("Project Documents".into(), b)]).unwrap();
+        assert!(p.contains(&format!("- Project Documents: ken://{b}/<path>#L<line>")), "{p}");
+        assert!(KEN_GUIDE.contains("%20") && KEN_GUIDE.contains("never a project-relative path"));
+    }
+
+    /// The guide keeps the app's rules (decision 1), and says again the three
+    /// knowledge rules the chat was measured with, until a measurement shows
+    /// the server's instructions alone carry them.
+    #[test]
+    fn the_guide_keeps_the_apps_rules_and_the_three_measured_ones() {
+        let guide = KEN_GUIDE.replace('\n', " ");
+        for word in ["shown to the person as a diff", "Cite your sources", "wait in Ken's Inbox", "The person's list is Ken's"] {
+            assert!(guide.contains(word), "{word}");
+        }
+        for rule in ["Weigh each hit by its label", "The knowledge base settles what the team decided", "a ruling is settled", "say so and cite both"] {
+            assert!(guide.contains(rule), "{rule}");
+        }
+        assert!(guide.contains("An answer worth keeping"), "answers are filed back through add_source (decision 33)");
+        assert!(guide.contains("Never name a tool"), "the person hears what was done, not a tool's name");
+        assert!(!guide.contains("wiki,") && !guide.contains("The wiki"), "the knowledge base, not the wiki");
+    }
+
+    #[test]
+    fn every_ken_tool_the_guide_names_is_one_the_chat_may_use() {
+        let named = |prefix: &str| -> Vec<String> {
+            KEN_GUIDE
+                .split(prefix)
+                .skip(1)
+                .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_string())
+                .collect()
+        };
+        let knowledge = named(&format!("mcp__{KEN_SERVER}__"));
+        for tool in &knowledge {
+            assert!(KEN_MCP_ALLOWED.contains(&tool.as_str()), "{tool} is named in the guide but not allowed");
+        }
+        // Every knowledge tool is named; no old name is.
+        for tool in KEN_MCP_ALLOWED {
+            assert!(knowledge.iter().any(|t| t == tool), "{tool} is not in the guide");
+        }
+        let personal = named(&format!("mcp__{PERSONAL_SERVER}__"));
+        assert!(personal.len() >= 5, "{personal:?}");
+        for tool in &personal {
+            assert!(KEN_PERSONAL_ALLOWED.contains(&tool.as_str()), "{tool} is named in the guide but not allowed");
+        }
+        for gone in ["route_query", "semantic_search", "read_document", "find_definition", "related_files", "ticket_list"] {
+            assert!(!KEN_GUIDE.contains(gone), "{gone}");
+        }
+        assert_eq!(ken_mcp_tool("mcp__ken-personal__task_list"), Some("task_list"));
+        assert_eq!(ken_mcp_tool("mcp__ken__search"), Some("search"));
+        assert_eq!(ken_mcp_tool("mcp__other__search"), None);
+    }
+
+    #[test]
+    fn a_multi_line_edit_on_a_crlf_file_matches_and_keeps_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "# Title\r\n\r\nFirst line.\r\nSecond line.\r\n").unwrap();
+        let input = serde_json::json!({
+            "file_path": file.to_string_lossy(),
+            "old_string": "First line.\nSecond line.",
+            "new_string": "First line.\nA new second line.",
+        });
+        let (_, _, base, proposed) = propose_edit(dir.path(), "Edit", &input).expect("the LF edit matches the CRLF file");
+        assert!(base.contains("\r\n"));
+        assert_eq!(proposed, "# Title\r\n\r\nFirst line.\r\nA new second line.\r\n");
+        // An LF file is left as it is.
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let input = serde_json::json!({ "file_path": file.to_string_lossy(), "old_string": "two", "new_string": "three" });
+        assert_eq!(propose_edit(dir.path(), "Edit", &input).unwrap().3, "one\nthree\n");
+    }
+
+    #[test]
+    fn scope_preamble_none_without_siblings() {
+        assert_eq!(build_scope_preamble("ken", "/w/ken", &[], None), None);
+    }
+
+    #[test]
+    fn scope_preamble_names_siblings_and_pins_writes_to_the_focused_project() {
+        let siblings = vec![
+            ("realms".to_string(), "/w/realms".to_string()),
+            ("realms-tools".to_string(), "/w/realms-tools".to_string()),
+        ];
+        let p = build_scope_preamble("ken", "/w/ken", &siblings, None).unwrap();
+        assert!(p.contains("/w/realms-tools"), "sibling path missing: {p}");
+        assert!(p.contains("every project in this workspace"));
+        // The read/write asymmetry is the whole safety property.
+        assert!(p.contains("READ"), "read permission not stated: {p}");
+        assert!(
+            p.contains("edits only inside ken"),
+            "write restriction not stated: {p}"
+        );
+    }
+
+    #[test]
+    fn scope_preamble_names_the_group_when_scoped_to_one() {
+        let siblings = vec![("realms-tools".to_string(), "/w/realms-tools".to_string())];
+        let p = build_scope_preamble("realms", "/w/realms", &siblings, Some("Shattered Realms"))
+            .unwrap();
+        assert!(p.contains("\"Shattered Realms\" group"), "{p}");
+        assert!(!p.contains("every project in this workspace"));
+    }
+
+    #[test]
+    fn scope_preamble_caps_long_lists() {
+        let siblings: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("p{i}"), format!("/w/p{i}")))
+            .collect();
+        let p = build_scope_preamble("ken", "/w/ken", &siblings, None).unwrap();
+        assert!(p.contains("and 18 more"), "list not capped: {p}");
+    }
+
+    #[test]
     fn context_preamble_empty_when_nothing_open() {
         assert_eq!(build_context_preamble(None, &[]), None);
         assert_eq!(build_context_preamble(Some("a.md"), &[]), None);
@@ -775,7 +1491,7 @@ mod tests {
                 "/other/proj": { "hasTrustDialogAccepted": true, "lastCost": 1.5 }
             }
         });
-        let out = apply_folder_trust(existing, &["/ken/proj".to_string()]);
+        let out = apply_folder_trust(existing, &["/ken/proj".to_string()], &[]);
         // Our project is now trusted.
         assert_eq!(out["projects"]["/ken/proj"]["hasTrustDialogAccepted"], true);
         assert_eq!(out["projects"]["/ken/proj"]["hasCompletedProjectOnboarding"], true);
@@ -786,10 +1502,79 @@ mod tests {
 
     #[test]
     fn folder_trust_from_empty_config_is_idempotent() {
-        let a = apply_folder_trust(Value::Null, &["/p".to_string()]);
-        let b = apply_folder_trust(a.clone(), &["/p".to_string()]);
+        let a = apply_folder_trust(Value::Null, &["/p".to_string()], &[]);
+        let b = apply_folder_trust(a.clone(), &["/p".to_string()], &[]);
         assert_eq!(a, b);
         assert_eq!(b["projects"]["/p"]["hasTrustDialogAccepted"], true);
+    }
+
+    /// Claude Code on Windows keys a folder by its plain path with forward
+    /// slashes; on macOS and Linux by the path as it is.
+    #[test]
+    fn trust_keys_are_written_in_claude_codes_form() {
+        assert_eq!(claude_config_key(r"C:\ken-eval\ATT\ATT-Wiki", true), "C:/ken-eval/ATT/ATT-Wiki");
+        assert_eq!(claude_config_key(r"\\?\C:\Code\ken", true), "C:/Code/ken");
+        assert_eq!(claude_config_key(r"\\?\UNC\server\share\repo", true), "//server/share/repo");
+        assert_eq!(claude_config_key("/Users/a/My Repo", false), "/Users/a/My Repo");
+    }
+
+    /// Nothing is written when every flag is already set, and the entries old
+    /// Ken versions wrote under keys Claude Code never reads are dropped, but
+    /// only when they hold nothing besides Ken's flags.
+    #[test]
+    fn trust_write_is_skipped_when_set_and_drops_only_kens_stale_entries() {
+        let keys = vec!["C:/Code/ken".to_string()];
+        let stale = vec![r"C:\Code\ken".to_string(), r"\\?\C:\Code\ken".to_string()];
+        let set = serde_json::json!({ "projects": { "C:/Code/ken": {
+            "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true, "lastCost": 2.0 } } });
+        assert!(!needs_trust_write(&set, &keys, &stale));
+        assert!(needs_trust_write(&Value::Null, &keys, &stale));
+        let half = serde_json::json!({ "projects": { "C:/Code/ken": { "hasTrustDialogAccepted": false } } });
+        assert!(needs_trust_write(&half, &keys, &stale));
+
+        let mut with_stale = set.clone();
+        with_stale["projects"][r"C:\Code\ken"] =
+            serde_json::json!({ "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true });
+        with_stale["projects"][r"\\?\C:\Code\ken"] =
+            serde_json::json!({ "hasTrustDialogAccepted": true, "allowedTools": ["Read"] });
+        assert!(needs_trust_write(&with_stale, &keys, &stale));
+        let out = apply_folder_trust(with_stale, &keys, &stale);
+        assert!(out["projects"].get(r"C:\Code\ken").is_none(), "Ken's own stale entry is dropped");
+        assert_eq!(out["projects"][r"\\?\C:\Code\ken"]["allowedTools"][0], "Read", "an entry with more in it stays");
+        assert_eq!(out["projects"]["C:/Code/ken"]["lastCost"], 2.0);
+    }
+
+    /// The write goes through a temp file and leaves no temp file behind; a
+    /// config that does not parse is never replaced.
+    #[test]
+    fn trust_is_written_atomically_and_never_over_an_unparsable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = dir.path().join(".claude.json");
+
+        // No config yet: one is written, and no temp file is left behind.
+        trust_folder_in(&path, &repo);
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let key = claude_config_key(&crate::setup::plain_canonical(&repo).to_string_lossy(), cfg!(windows));
+        assert_eq!(cfg["projects"][&key]["hasTrustDialogAccepted"], true, "got {cfg}");
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "repo")
+            .collect();
+        assert_eq!(names, vec![".claude.json".to_string()], "no temp file left behind");
+
+        // Already trusted: the file is not rewritten.
+        std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        trust_folder_in(&path, &repo);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A half-written config is left alone.
+        std::fs::write(&path, b"{\"projects\": {").unwrap();
+        trust_folder_in(&path, &repo);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"projects\": {");
     }
 
     #[test]
@@ -813,7 +1598,7 @@ mod tests {
             parse_event(
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.md"}}]}}"#
             ),
-            ParsedEvent::Activity("Read a.md".into())
+            ParsedEvent::Tool { id: String::new(), name: "Read".into(), summary: "Read a.md".into() }
         );
         // Unknown types are tolerated.
         assert_eq!(parse_event(r#"{"type":"mystery"}"#), ParsedEvent::Other);
@@ -846,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_question_tool_use_is_not_an_activity_line() {
+    fn ask_user_question_tool_use_is_not_a_tool_card() {
         // The question card replaces the activity line, so the tool_use block
         // must be skipped — and other blocks in the same event still scanned.
         assert_eq!(
@@ -859,8 +1644,64 @@ mod tests {
             parse_event(
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{}},{"type":"tool_use","name":"Read","input":{"file_path":"a.md"}}]}}"#
             ),
-            ParsedEvent::Activity("Read a.md".into())
+            ParsedEvent::Tool { id: String::new(), name: "Read".into(), summary: "Read a.md".into() }
         );
+    }
+
+    #[test]
+    fn a_message_yields_every_block_in_order() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Grep","input":{"pattern":"save"}},{"type":"tool_use","id":"t2","name":"mcp__ken__search","input":{"query":"save format"}}]}}"#;
+        assert_eq!(
+            parse_events(line),
+            vec![
+                ParsedEvent::AssistantText("Looking.".into()),
+                ParsedEvent::Tool { id: "t1".into(), name: "Grep".into(), summary: "Grep save".into() },
+                ParsedEvent::Tool { id: "t2".into(), name: "mcp__ken__search".into(), summary: "Ken search save format".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_results_and_text_deltas_parse() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"no such file"}]}]}}"#;
+        assert_eq!(
+            parse_events(line),
+            vec![ParsedEvent::ToolDone { id: "t1".into(), is_error: true, preview: "no such file".into() }]
+        );
+        let delta = r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}}"#;
+        assert_eq!(parse_events(delta), vec![ParsedEvent::TextDelta("Hel".into())]);
+        // A subagent's stream and a tool's input stream are not reply text.
+        let sub = r#"{"type":"stream_event","parent_tool_use_id":"t9","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}}"#;
+        assert_eq!(parse_events(sub), vec![ParsedEvent::Other]);
+        let json = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        assert_eq!(parse_events(json), vec![ParsedEvent::Other]);
+    }
+
+    #[test]
+    fn a_long_result_is_cut_for_its_card_and_a_long_arg_by_characters() {
+        let long = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("
+");
+        let preview = result_preview(Some(&Value::String(long)));
+        assert!(preview.starts_with("line 1
+line 2") && preview.ends_with("…"), "{preview}");
+        assert!(!preview.contains("line 9"));
+        let wide = serde_json::json!({ "name": "Grep", "input": { "pattern": "é".repeat(100) } });
+        assert_eq!(summarize_tool(&wide).chars().count(), "Grep ".len() + 80);
+    }
+
+    /// A search's card lists its hits, each code hit with its symbol beside
+    /// its path, and a code tool's card names the symbol it looked up.
+    #[test]
+    fn a_search_card_lists_its_hits_and_their_symbols() {
+        let result = "Route: every source (1 searched).\nSources: game (searched)\n\n1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]\n   export function saveWorld(w: string) {\n   next: code_usages saveWorld · code_outline src/world.ts · code_imports src/world.ts\n2. [doc · reference · 2026-09-01] game:README.md:1 (ken://a/README.md#L1) [keyword]\n   # Game";
+        let preview = result_preview(Some(&Value::String(result.into())));
+        assert_eq!(preview.lines().count(), 2, "{preview}");
+        assert!(preview.starts_with("1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld`"), "{preview}");
+        assert!(!preview.contains("export function"), "no snippets: {preview}");
+        let find = serde_json::json!({ "name": "mcp__ken__code_definition", "input": { "name": "save_world" } });
+        assert_eq!(summarize_tool(&find), "Ken code definition save_world");
+        let task = serde_json::json!({ "name": "mcp__ken-personal__task_create", "input": { "title": "Ship it" } });
+        assert_eq!(summarize_tool(&task), "Ken task create");
     }
 
     fn control_responses(dir: &Path) -> Vec<Value> {
@@ -872,6 +1713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn ask_user_question_round_trip() {
         let (dir, engine, rx) = engine("ask-question");
         engine.send("chat-q", "askq please", false, None).unwrap();
@@ -894,10 +1736,9 @@ mod tests {
         assert_eq!(v["toolUseId"], "toolu_fake1");
         assert_eq!(v["questions"][0]["question"], "Favorite color?");
         assert_eq!(v["questions"][0]["options"][1]["label"], "Blue");
-        // No activity line for the AskUserQuestion tool_use itself.
+        // No tool card for the AskUserQuestion tool_use itself.
         assert!(!seen.iter().any(|u| matches!(u,
-            ChatUpdate::Message { role, content, .. }
-                if role == "activity" && content.contains("AskUserQuestion"))));
+            ChatUpdate::Tool { payload, .. } if payload.contains("AskUserQuestion"))));
         // The turn pauses for the user.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline
@@ -945,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn other_permission_requests_are_auto_denied() {
         let (dir, engine, rx) = engine("ask-question");
         engine.send("chat-b", "askbash now", false, None).unwrap();
@@ -961,6 +1803,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn answer_question_on_unknown_chat_errors() {
         let (_d, engine, _rx) = engine("ask-question");
         assert!(engine
@@ -975,6 +1818,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn send_receive_turn() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-1", "Who owns billing?", false, None).unwrap();
@@ -989,16 +1833,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_becomes_activity_line() {
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
+    fn tool_use_becomes_a_tool_card() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-2", "usetool please", false, None).unwrap();
         let updates = collect_until_done(&rx, 15);
         assert!(updates.iter().any(|u| matches!(u,
-            ChatUpdate::Message { role, content, .. }
-                if role == "activity" && content == "Read notes/meeting.md")));
+            ChatUpdate::Tool { payload, .. } if payload.contains("Read notes/meeting.md"))));
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn second_turn_reuses_process_and_death_recovers_with_resume() {
         let (_d, engine, rx) = engine("stream-die");
         // First turn completes, then the fake dies (exit 7).
@@ -1017,6 +1862,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn blocked_stdin_does_not_freeze_the_engine() {
         // A fake that stops draining stdin mid-session: a large send() will
         // wedge on the pipe write. The engine must not hold its `live` map
@@ -1204,6 +2050,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn terminal_attach_round_trip() {
         isolate_claude_config();
         let dir = tempfile::tempdir().unwrap();
@@ -1224,5 +2071,38 @@ mod tests {
         }
         assert!(!pty.is_alive());
         drop(rx);
+    }
+    #[test]
+    fn an_edit_is_worked_out_against_the_file_as_it_is() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("Platform")).unwrap();
+        std::fs::write(root.join("Platform/Save.md"), "# Save\n\nSaves are files.\nOne per region.\n").unwrap();
+        let file = root.join("Platform/Save.md").to_string_lossy().to_string();
+
+        let edit = serde_json::json!({ "file_path": file, "old_string": "Saves are files.", "new_string": "Saves are region files." });
+        let (path, rel, base, proposed) = propose_edit(root, "Edit", &edit).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(rel.as_deref(), Some("Platform/Save.md"));
+        assert!(base.contains("Saves are files.") && proposed.contains("Saves are region files."));
+
+        let multi = serde_json::json!({ "file_path": "Platform/Save.md", "edits": [
+            { "old_string": "# Save", "new_string": "# Saving" },
+            { "old_string": "One per region.", "new_string": "One file per region." }
+        ]});
+        let (_, _, _, proposed) = propose_edit(root, "MultiEdit", &multi).unwrap();
+        assert_eq!(proposed, "# Saving\n\nSaves are files.\nOne file per region.\n");
+
+        let new = serde_json::json!({ "file_path": "Platform/New.md", "content": "# New\n" });
+        let (_, rel, base, proposed) = propose_edit(root, "Write", &new).unwrap();
+        assert_eq!((rel.as_deref(), base.as_str(), proposed.as_str()), (Some("Platform/New.md"), "", "# New\n"));
+
+        let missing = serde_json::json!({ "file_path": "Platform/Save.md", "old_string": "not there", "new_string": "x" });
+        assert!(propose_edit(root, "Edit", &missing).unwrap_err().contains("not in the file"));
+        std::fs::write(root.join("twice.md"), "a a").unwrap();
+        let twice = serde_json::json!({ "file_path": "twice.md", "old_string": "a", "new_string": "b" });
+        assert!(propose_edit(root, "Edit", &twice).unwrap_err().contains("2 times"));
+        let all = serde_json::json!({ "file_path": "twice.md", "old_string": "a", "new_string": "b", "replace_all": true });
+        assert_eq!(propose_edit(root, "Edit", &all).unwrap().3, "b b");
     }
 }

@@ -1,144 +1,137 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type RegistryEntryStatus } from "../lib/api";
+  import { api, type RecentWorkspace } from "../lib/api";
+  import { timeAgo } from "../lib/format";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import SetupFlow from "./SetupFlow.svelte";
 
+  // Ken works in workspaces: this screen opens one it knows, or sets up a
+  // new one (its name, where the knowledge base is saved, its sources).
   let error = $state<string | null>(null);
+  let setupOpen = $state(false);
 
-  async function forgetId(id: string) {
-    await api.forgetProject(id);
-    await app.refreshRegistry();
+  // Workspaces opened before, newest first: open one again in a click.
+  let recentWorkspaces = $state<RecentWorkspace[]>([]);
+  async function loadRecentWorkspaces() {
+    try {
+      recentWorkspaces = await api.listRecentWorkspaces();
+    } catch {
+      recentWorkspaces = [];
+    }
   }
-
-  function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
+  async function openRecentWorkspace(ws: RecentWorkspace) {
+    if (!ws.available) return;
+    error = null;
+    try {
+      await app.openWorkspace(ws.path);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  // A folder picked to open that holds no workspace: said plainly, with the
+  // way to make one.
+  let noWorkspaceAt = $state<string | null>(null);
+  async function openWorkspaceFolder() {
+    error = null;
+    noWorkspaceAt = null;
+    const folder = await openDialog({ directory: true, title: "Choose the workspace's folder" });
+    if (typeof folder !== "string") return;
+    try {
+      await app.openWorkspace(folder);
+    } catch (e) {
+      if (String(e).includes(".ken-workspace")) noWorkspaceAt = folder;
+      else error = String(e);
+    }
+  }
+  async function forgetWorkspace(id: string) {
+    await api.forgetWorkspace(id);
+    await loadRecentWorkspaces();
+  }
+  function workspaceMenu(e: MouseEvent, ws: RecentWorkspace) {
     e.preventDefault();
     const x = e.clientX;
     const y = e.clientY;
     openContextMenu(x, y, [
-      {
-        label: "Open",
-        icon: FolderOpen,
-        disabled: !entry.available,
-        onSelect: () => openExisting(entry.path, entry.available),
-      },
+      { label: "Open", icon: FolderOpen, disabled: !ws.available, onSelect: () => openRecentWorkspace(ws) },
       "separator",
       {
-        label: "Remove from Ken…",
+        label: "Remove from this list",
         icon: Trash2,
         danger: true,
-        onSelect: () =>
-          openConfirm(x, y, {
-            title: `Remove “${entry.name}”?`,
-            body: "Removes it from Ken's list — the folder and its files stay on disk.",
-            confirmLabel: "Remove from Ken",
-            onConfirm: () => void forgetId(entry.id),
-          }),
+        onSelect: () => void forgetWorkspace(ws.id),
       },
     ]);
   }
-  let pendingPath = $state<string | null>(null);
-  let pendingName = $state("");
 
-  async function chooseFolder() {
-    error = null;
-    const folder = await openDialog({
-      directory: true,
-      title: "Choose the folder that holds your knowledge",
-    });
-    if (typeof folder !== "string") return;
-    pendingPath = folder;
-    pendingName = folder.split("/").pop() ?? "My project";
-  }
-
-  async function confirmCreate() {
-    if (!pendingPath) return;
-    try {
-      await app.createProject(pendingPath, pendingName.trim() || "My project");
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function openExisting(path: string, available: boolean) {
-    if (!available) return;
-    error = null;
-    try {
-      await app.openProject(path);
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function forget(id: string, e: MouseEvent) {
-    e.stopPropagation();
-    await api.forgetProject(id);
-    await app.refreshRegistry();
-  }
+  onMount(() => {
+    void loadRecentWorkspaces();
+  });
 </script>
 
 <div class="wrap" data-tauri-drag-region>
   <div class="panel">
+    <!-- The brand as the sidebar shows it: the K on its ink tile, the name in
+         the interface's sans. -->
     <div class="brand">
-      <KenMark size={36} />
-      <span class="wordmark">Ken</span>
+      <KenMark size={30} />
+      <span class="t-heading">Ken</span>
     </div>
-    <h1>Your team's knowledge, in one calm place.</h1>
-    <p class="lede">
-      Point Ken at a folder — notes, documents, spreadsheets, anything. Ken
-      reads it, keeps watch, and makes every fact findable.
-    </p>
+    <h1 class="t-title">Your team's knowledge, in one calm place.</h1>
 
-    {#if pendingPath}
-      <div class="confirm">
-        <div class="mono path">{pendingPath}</div>
-        <label>
-          Project name
-          <input
-            bind:value={pendingName}
-            onkeydown={(e) => {
-              e.stopPropagation();
-              if (e.key === "Enter") confirmCreate();
-            }}
-          />
-        </label>
-        <div class="confirm-actions">
-          <button class="btn btn-primary" onclick={confirmCreate}>Create project</button>
-          <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
-        </div>
-      </div>
+    {#if setupOpen}
+      <SetupFlow onclose={() => (setupOpen = false)} />
     {:else}
-      <button class="btn btn-primary big" onclick={chooseFolder}>Choose a folder…</button>
+      <!-- Ken works in workspaces: open one Ken already knows, or set up a
+           new one. Set-up is offered on a fresh install too: confirming it
+           turns the workspace feature on. Two real options: stacked cards,
+           equal weight, so neither wins by emphasis. -->
+      <div class="choices">
+        <button class="k-card choice" onclick={openWorkspaceFolder}>
+          <span class="t-heading">Open a workspace</span>
+        </button>
+        <button class="k-card choice" onclick={() => (setupOpen = true)}>
+          <span class="t-heading">Set up a new workspace</span>
+        </button>
+      </div>
+      {#if noWorkspaceAt}
+        <div class="k-notice danger">
+          <span class="grow">No Ken workspace in {noWorkspaceAt}.</span>
+          <button class="btn btn-small" onclick={() => { noWorkspaceAt = null; setupOpen = true; }}>Set one up</button>
+        </div>
+      {/if}
     {/if}
 
     {#if error}
-      <div class="error">{error}</div>
+      <div class="k-notice danger">{error}</div>
     {/if}
 
-    {#if app.registry.length > 0 && !pendingPath}
-      <div class="recent-label">Recent projects</div>
-      <div class="recents">
-        {#each app.registry as entry (entry.id)}
+    {#if recentWorkspaces.length > 0 && !setupOpen}
+      <div class="t-label recent-label">Recent workspaces</div>
+      <div class="k-card recents">
+        {#each recentWorkspaces as ws (ws.id)}
           <button
             class="recent"
-            class:unavailable={!entry.available}
-            onclick={() => openExisting(entry.path, entry.available)}
-            oncontextmenu={(e) => rowMenu(e, entry)}
+            class:unavailable={!ws.available}
+            onclick={() => openRecentWorkspace(ws)}
+            oncontextmenu={(e) => workspaceMenu(e, ws)}
           >
-            <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
+            <span class="badge">{ws.name.charAt(0).toUpperCase()}</span>
             <span class="info">
-              <span class="name">{entry.name}</span>
-              <span class="mono path-small">{entry.path}</span>
-              {#if !entry.available}
-                <span class="missing">Folder not found</span>
+              <span class="name">{ws.name}</span>
+              <span class="mono path">{ws.path}</span>
+              {#if ws.available}
+                <span class="t-small">{timeAgo(ws.openedAt)}</span>
+              {:else}
+                <span class="t-small missing">Folder not found</span>
               {/if}
             </span>
-            {#if !entry.available}
-              <span class="forget" role="button" tabindex="0" onclick={(e) => forget(entry.id, e)} onkeydown={() => {}}>Remove</span>
+            {#if !ws.available}
+              <span class="btn btn-small btn-danger" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
             {/if}
           </button>
         {/each}
@@ -151,144 +144,100 @@
   .wrap {
     height: 100vh;
     display: flex;
+    /* A too-tall panel (Features expanded, long candidate list) must stay
+       reachable: `align-items: center` alone clips it at BOTH ends with no
+       scroll. `safe center` degrades to `flex-start` once it would overflow;
+       the plain `center` above it is the fallback for engines without it. */
     align-items: center;
+    align-items: safe center;
     justify-content: center;
-    /* Gentle lined paper: faint rules every 28px on the paper ground. */
-    background:
-      repeating-linear-gradient(
-        to bottom,
-        transparent,
-        transparent 27px,
-        var(--rule-line) 27px,
-        var(--rule-line) 28px
-      ),
-      var(--paper);
+    overflow-y: auto;
+    /* The app's own ground, as every screen behind the sidebar has. */
+    background: var(--bg);
   }
   .panel {
     width: 460px;
+    max-width: 100%;
+    /* Never let the centering flexbox compress the panel — it scrolls instead. */
+    flex: none;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     padding: 32px;
   }
   .brand {
     display: flex;
     align-items: center;
-    gap: 12px;
-  }
-  .wordmark {
-    font-family: var(--font-script);
-    font-size: 26px;
-    line-height: 1;
-    color: var(--ink);
-    /* Script baseline sits low; nudge up so it aligns with the mark. */
-    transform: translateY(-3px);
+    gap: 10px;
   }
   h1 {
-    margin: 6px 0 0;
-    font-family: var(--font-serif);
-    font-size: 30px;
-    font-weight: 500;
-    line-height: 1.2;
-    letter-spacing: -0.01em;
+    margin: 8px 0 0;
   }
-  .lede {
-    margin: 0;
-    font-size: 14px;
-    line-height: 1.7;
-    color: var(--ink-secondary);
-  }
-  .big {
-    height: 40px;
-    font-size: 14px;
-    align-self: flex-start;
-    margin-top: 6px;
-  }
-  .confirm {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 16px 18px;
+  .choices {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
   }
-  .path {
-    font-size: 12px;
-    color: var(--ink-secondary);
-    word-break: break-all;
-  }
-  label {
+  .choice {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-secondary);
-  }
-  input {
-    height: 36px;
-    padding: 0 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border-strong);
-    background: var(--surface);
-    font-size: 14px;
+    gap: 4px;
+    width: 100%;
+    padding: 14px 16px;
+    font: inherit;
+    text-align: left;
     color: var(--ink);
+  }
+  .choice:hover {
+    border-color: var(--line-strong);
+  }
+  .choice:focus-visible {
     outline: none;
-    font-family: inherit;
-  }
-  input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
-  .confirm-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .error {
-    font-size: 13px;
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 7%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
-    border-radius: 10px;
-    padding: 10px 14px;
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
   .recent-label {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--ink-tertiary);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-top: 10px;
+    margin-top: 8px;
   }
   .recents {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    overflow: hidden;
   }
   .recent {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 9px 10px;
-    border-radius: 9px;
-    border: 1px solid var(--border);
-    background: var(--surface);
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    font: inherit;
     text-align: left;
-    font-size: 13px;
+    color: var(--ink);
+  }
+  .recent:last-child {
+    border-bottom: none;
   }
   .recent:hover {
-    background: var(--sunken);
+    background: color-mix(in oklch, var(--line-soft) 55%, transparent);
+  }
+  .recent:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
   .recent.unavailable {
     opacity: 0.7;
   }
+  /* The workspace's initial, as the workspace switcher draws it. */
   .badge {
     width: 26px;
     height: 26px;
     border-radius: 7px;
     background: var(--ink);
-    color: var(--paper);
+    color: var(--bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -303,22 +252,20 @@
     flex: 1;
   }
   .name {
+    font-size: 13.5px;
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .path-small {
-    font-size: 11px;
-    color: var(--ink-tertiary);
+  .path {
+    font-size: 11.5px;
+    color: var(--ink-3);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .missing {
-    font-size: 11.5px;
-    color: var(--danger);
-  }
-  .forget {
-    font-size: 12px;
-    font-weight: 600;
     color: var(--danger);
   }
 </style>

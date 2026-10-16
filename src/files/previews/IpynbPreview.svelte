@@ -30,7 +30,7 @@
   {:else if cells === null}
     <PreviewLoading label="Rendering notebook…" />
   {:else if cells.length === 0}
-    <div class="note">This notebook has no cells.</div>
+    <div class="note">No cells</div>
   {:else}
     <div class="nb" bind:this={nb}>
       {#each cells as cell, i (i)}

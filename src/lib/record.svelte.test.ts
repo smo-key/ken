@@ -28,6 +28,7 @@ const modelStatus: ModelStatus = {
 vi.mock("./api", () => ({
   api: {
     recordInputDevices: vi.fn(async () => []),
+    recordSupport: vi.fn(async () => ({ mic: true, system: true, reason: null })),
     recordPermissions: vi.fn(async () => ({
       mic: "granted",
       screen: "granted",
@@ -56,7 +57,7 @@ vi.mock("./api", () => ({
   },
 }));
 
-import { record } from "./record.svelte";
+import { isRecordingPath, record, recordClock } from "./record.svelte";
 import { api } from "./api";
 
 // Drive the elapsed clock deterministically: fake setInterval/clearInterval and
@@ -174,6 +175,8 @@ describe("record store — transcription-model gate", () => {
     await record.start();
 
     expect(api.recordStart).toHaveBeenCalledTimes(1);
+    // The transcript goes to the knowledge base's Raw/: no team to name.
+    expect(vi.mocked(api.recordStart).mock.calls[0]).toHaveLength(3);
     expect(record.error).toBeNull();
   });
 
@@ -190,5 +193,45 @@ describe("record store — transcription-model gate", () => {
     await Promise.resolve();
 
     expect(record.modelReady).toBe(true);
+  });
+});
+
+describe("record store — what the machine can capture", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(api.recordSupport).mockResolvedValue({ mic: true, system: true, reason: null });
+  });
+
+  it("turns system audio off where it cannot be captured", async () => {
+    vi.mocked(api.recordSupport).mockResolvedValue({ mic: true, system: false, reason: "No loopback device" });
+    listeners.state?.({ phase: "idle", elapsedMs: 0, mic: false, system: false });
+    record.systemOn = true;
+    await record.init();
+    expect(record.systemSupported).toBe(false);
+    expect(record.systemOn).toBe(false);
+    expect(record.support?.reason).toBe("No loopback device");
+  });
+
+  it("keeps the transcript only by default", async () => {
+    vi.resetModules();
+    const { record: fresh } = await import("./record.svelte");
+    expect(fresh.storage).toBe("transcript");
+  });
+});
+
+describe("isRecordingPath", () => {
+  it("knows a recording from a video", () => {
+    expect(isRecordingPath("Recordings/take.md")).toBe(true);
+    expect(isRecordingPath("Research/Ingestion/Raw/2026-10-01 14.02 Recording.md")).toBe(true);
+    expect(isRecordingPath("Videos/clip.md")).toBe(false);
+    expect(isRecordingPath("Research/Ingestion/Raw/2026-10-01 14.02 Note - plan.md")).toBe(false);
+  });
+});
+
+describe("recordClock", () => {
+  it("reads minutes and seconds", () => {
+    expect(recordClock(0)).toBe("0:00");
+    expect(recordClock(192_000)).toBe("3:12");
+    expect(recordClock(3_725_000)).toBe("62:05");
   });
 });

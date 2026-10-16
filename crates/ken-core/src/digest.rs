@@ -6,37 +6,30 @@
 use crate::db::{Db, RunRow};
 use crate::Result;
 
-/// What today's digest can talk about — all of it already known to the
-/// index. Derived review kinds (stale ingests, failed files) are
-/// intentionally not folded in; stored items carry the "waiting on you"
-/// color the paragraph needs.
+/// What today's digest can talk about: what changed, all of it already
+/// known to the index. What waits on the person (the Inbox, their tasks and
+/// tickets) is not given: the digest is written once a day, and Home's
+/// Needs-you column shows that live (Chris, 2026-10-15).
 #[derive(Debug, Clone, Default)]
 pub struct DigestSources {
     /// Project-relative paths changed in the window, newest first.
     pub changed_files: Vec<String>,
     /// Ingest runs that finished in the window, newest first.
     pub finished_runs: Vec<RunRow>,
-    /// Titles of open stored review items.
-    pub waiting: Vec<String>,
 }
 
 impl DigestSources {
     /// Nothing to say — store the quiet fallback instead of calling AI.
     pub fn is_quiet(&self) -> bool {
-        self.changed_files.is_empty()
-            && self.finished_runs.is_empty()
-            && self.waiting.is_empty()
+        self.changed_files.is_empty() && self.finished_runs.is_empty()
     }
 }
-
-/// Stored verbatim as the digest on days with nothing to report.
-pub const QUIET_DIGEST: &str = "A quiet day — nothing new since yesterday.";
 
 /// How many changed paths the prompt lists at most.
 const MAX_PROMPT_FILES: usize = 20;
 
 /// Collect digest inputs: files whose indexed mtime is at or past
-/// `since`, runs finished since then, and open stored review items.
+/// `since`, and runs finished since then.
 pub fn gather(db: &Db, since: i64) -> Result<DigestSources> {
     let mut changed: Vec<(String, i64)> = db
         .list_files()?
@@ -48,13 +41,13 @@ pub fn gather(db: &Db, since: i64) -> Result<DigestSources> {
     Ok(DigestSources {
         changed_files: changed.into_iter().map(|(p, _)| p).collect(),
         finished_runs: db.runs_finished_since(since)?,
-        waiting: db
-            .list_open_review_items()?
-            .into_iter()
-            .map(|i| i.title)
-            .collect(),
     })
 }
+
+/// What a digest never says: it is written once a day, so what waits on
+/// the person, or a count of it, would go stale; Home shows that live.
+const NOT_WAITING: &str = "Never mention the Inbox, what is waiting on the user, or their tasks and \
+tickets, and give no count of them: the digest is written once a day, and Ken shows those live.";
 
 /// The morning-digest prompt: one warm paragraph plus a SOURCES line.
 pub fn compose_digest_prompt(project_name: &str, sources: &DigestSources) -> String {
@@ -62,7 +55,7 @@ pub fn compose_digest_prompt(project_name: &str, sources: &DigestSources) -> Str
         "You are Ken, writing the user's morning digest for the project \
 \"{project_name}\".\n\n\
 Write ONE warm, concrete paragraph (at most 120 words) in plain language \
-summarizing what changed in the last day and what's waiting on the user. \
+summarizing what changed in the last day. {NOT_WAITING} \
 You may use **bold** for the few things that matter most. No headings, \
 no lists, no preamble — just the paragraph. You may read files in this \
 project if a path below needs more context; never modify anything.\n\n\
@@ -97,13 +90,60 @@ What the index saw in the last 24 hours:\n"
             None => p.push_str(&format!("- {}: {}\n", run.slug, run.status)),
         }
     }
+    p
+}
 
-    p.push_str("\nWaiting on the user (open review items):\n");
-    if sources.waiting.is_empty() {
-        p.push_str("- nothing\n");
-    }
-    for title in &sources.waiting {
-        p.push_str(&format!("- {title}\n"));
+/// The workspace digest's quiet fallback: nothing changed in any repo.
+pub const QUIET_WORKSPACE_DIGEST: &str = "A quiet day: nothing new in the workspace's repos since yesterday.";
+
+/// How many changed paths one repo contributes to the workspace prompt.
+const MAX_FILES_PER_REPO: usize = 10;
+
+/// Nothing to say for the whole workspace.
+pub fn workspace_is_quiet(repos: &[(String, DigestSources)]) -> bool {
+    repos.iter().all(|(_, s)| s.is_quiet())
+}
+
+/// The workspace digest prompt (Home): one paragraph across every repo of
+/// the workspace, run from the folder that holds the repos so every path is
+/// `<repo>/<path>`. It summarises what changed; what waits on the person
+/// is Home's to show ([`NOT_WAITING`]).
+pub fn compose_workspace_digest_prompt(workspace: &str, repos: &[(String, DigestSources)]) -> String {
+    let mut p = format!(
+        "You are Ken, writing the morning digest for the workspace \"{workspace}\": one \
+paragraph across all of its repos.\n\n\
+Write ONE plain, concrete paragraph (at most 120 words) summarising what changed \
+in the last day across the repos. {NOT_WAITING} Dry and to the point: no greeting, \
+no exclamation marks, no headings, no lists. You may use **bold** for the few things \
+that matter most. You may read files below this folder if a path needs more \
+context; never modify anything.\n\n\
+After the paragraph, on its own final line, write exactly:\n\
+SOURCES: repo/path1, repo/path2\n\
+naming up to 5 of the paths below the digest draws on, each as \
+<repo>/<path> (omit the line if none apply).\n"
+    );
+
+    for (repo, s) in repos {
+        p.push_str(&format!("\nRepo {repo}:\n"));
+        if s.is_quiet() {
+            p.push_str("- nothing new\n");
+            continue;
+        }
+        for path in s.changed_files.iter().take(MAX_FILES_PER_REPO) {
+            p.push_str(&format!("- changed: {repo}/{path}\n"));
+        }
+        if s.changed_files.len() > MAX_FILES_PER_REPO {
+            p.push_str(&format!(
+                "- …and {} more changed\n",
+                s.changed_files.len() - MAX_FILES_PER_REPO
+            ));
+        }
+        for run in &s.finished_runs {
+            match &run.summary {
+                Some(sum) => p.push_str(&format!("- ingest {}: {} — {}\n", run.slug, run.status, sum)),
+                None => p.push_str(&format!("- ingest {}: {}\n", run.slug, run.status)),
+            }
+        }
     }
     p
 }
@@ -175,19 +215,16 @@ mod tests {
 
     #[test]
     fn gather_windows_and_orders() {
-        let mut db = seeded();
+        let db = seeded();
         let s = gather(&db, 500).unwrap();
         // Newest changed file first; the old one is outside the window.
         assert_eq!(s.changed_files, vec!["vendor/Contract v3.pdf", "notes/fresh.md"]);
         assert_eq!(s.finished_runs.len(), 1);
         assert_eq!(s.finished_runs[0].slug, "people");
-        assert_eq!(s.waiting, vec!["Merge conflict — Decisions.md"]);
         assert!(!s.is_quiet());
 
-        // Open review items are timeless — still not quiet outside the
-        // window until they're resolved.
-        assert!(!gather(&db, 10_000).unwrap().is_quiet());
-        db.resolve_review_item(1, 990).unwrap();
+        // An open review item is no news: outside the window the day is
+        // quiet, whatever waits in the Inbox.
         assert!(gather(&db, 10_000).unwrap().is_quiet());
     }
 
@@ -204,7 +241,9 @@ mod tests {
         // The inputs.
         assert!(prompt.contains("- notes/fresh.md"));
         assert!(prompt.contains("- people: fresh — Updated 1 document."));
-        assert!(prompt.contains("- Merge conflict — Decisions.md"));
+        // What waits is Home's to show, never the digest's.
+        assert!(!prompt.contains("Merge conflict"), "{prompt}");
+        assert!(prompt.contains("Never mention the Inbox"), "{prompt}");
     }
 
     #[test]
@@ -212,7 +251,7 @@ mod tests {
         let prompt = compose_digest_prompt("Atlas", &DigestSources::default());
         assert!(prompt.contains("Files changed:\n- none"));
         assert!(prompt.contains("Ingest runs finished:\n- none"));
-        assert!(prompt.contains("open review items):\n- nothing"));
+        assert!(!prompt.contains("Waiting on the user"), "{prompt}");
     }
 
     #[test]
@@ -225,6 +264,34 @@ mod tests {
         assert!(prompt.contains("- notes/f19.md"));
         assert!(!prompt.contains("- notes/f20.md"));
         assert!(prompt.contains("…and 10 more"));
+    }
+
+    #[test]
+    fn workspace_prompt_names_every_repo_with_repo_relative_paths() {
+        let db = seeded();
+        let s = gather(&db, 500).unwrap();
+        let repos = vec![("att-opmodel".to_string(), s), ("Project Docs".to_string(), DigestSources::default())];
+        let prompt = compose_workspace_digest_prompt("ATT", &repos);
+        assert!(prompt.contains("\"ATT\""));
+        assert!(prompt.contains("SOURCES: repo/path1"));
+        assert!(prompt.contains("- changed: att-opmodel/notes/fresh.md"));
+        assert!(prompt.contains("Repo Project Docs:\n- nothing new"));
+        assert!(!workspace_is_quiet(&repos));
+        assert!(workspace_is_quiet(&[("a".into(), DigestSources::default())]));
+    }
+
+    /// The digest is written once a day, so it never states what waits on
+    /// the person or how much: no Inbox item, task or ticket reaches its
+    /// prompt, and the prompt says not to mention them (Chris, 2026-10-15).
+    #[test]
+    fn the_digest_summarises_what_changed_and_never_what_waits() {
+        let db = seeded();
+        let repos = vec![("att".to_string(), gather(&db, 500).unwrap())];
+        let prompt = compose_workspace_digest_prompt("ATT", &repos);
+        assert!(prompt.contains("summarising what changed"), "{prompt}");
+        assert!(prompt.contains("Never mention the Inbox, what is waiting on the user, or their tasks"), "{prompt}");
+        assert!(!prompt.contains("Merge conflict") && !prompt.contains("waiting on the user:"), "{prompt}");
+        assert!(!prompt.contains("plate today") && !prompt.contains("are due"), "{prompt}");
     }
 
     #[test]

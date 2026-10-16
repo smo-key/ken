@@ -20,7 +20,7 @@
     align-items: center;
     justify-content: center;
     background: var(--ink);
-    color: var(--paper);
+    color: var(--bg);
     flex: none;
     user-select: none;
   }

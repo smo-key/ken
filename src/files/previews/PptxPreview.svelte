@@ -615,7 +615,7 @@
     {#if loading}
       <PreviewLoading label="Rendering deck…" />
     {:else}
-      <div class="note">No slides found in this deck.</div>
+      <div class="note">No slides</div>
     {/if}
   {:else}
     <div class="deck" bind:this={deck}>

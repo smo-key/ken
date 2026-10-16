@@ -1,0 +1,19 @@
+{
+  "workspace": "{{workspace_name}}",
+  "key": "{{KEY}}",
+  "_key_note": "Ticket ids are KEY-001, KEY-002 ... issued in order, never reused.",
+  "repos": {
+    "{{wiki_repo}}": { "kind": "wiki", "base": "main" }
+  },
+  "_repos_note": "The sources this knowledge base covers. kind: code | reference, or wiki for this repo. base: the branch drift measures against (origin/<base> where it was fetched, else the local branch); without one, drift uses the remote's default branch, or the upstream of a checkout the default does not contain. A reference repo may carry pin (the commit read) and upstream. A code repo may carry roles: a path pattern to a role, such as \"src/net/**\": \"protocol\", proposed in the Inbox when the repo is added and written here once a person accepts; the longest pattern wins, and a file no rule names gets a built-in role (service, controller, repository ...).",
+  "ignore": [],
+  "_ignore_note": "Index rules, the one place to write them: a path is indexed or it isn't. One gitignore-style pattern a line: a bare line leaves a path out (\"assets/raw/\"), a ! line brings one back (\"!tests/\"). These hold for every source; a repos entry may carry its own ignore list too. Built in and fixed: VCS folders, dependencies, build output, secrets, tests, minified and generated files, binaries and archives. A source's older .kenignore lines and project.json excluded folders are moved into its repos entry once, the first time Ken scans it (the entry then says ignoreMoved: true), and are not read after; the files are left as they were.",
+  "controls": [],
+  "_controls_note": "A few known questions per source, each with the file it must return near the top: { \"question\": \"how are worlds saved\", \"expect\": \"src/world/Save.java\", \"source\": \"Game\" }. No source means this repo. Proposed in the Inbox when a source is added and written here once a person accepts, run after every rebuild, counted in the health line.",
+  "search": {
+    "weights": {}
+  },
+  "_search_note": "search.weights: a path pattern to a tier (binding, current, reference, record, superseded) or a number added to a hit's score; the longest pattern wins.",
+  "drift": {},
+  "_drift_note": "Drift runs when a cited repo's branch moves, and at least weekly for pages whose sources do not move. All optional: controlMoved (a page known to have moved since its check) and controlClean (a page known to be clean) void a run that reads them wrong; minPages voids a run that examines fewer pages; fetch: false measures against the remote branches as last fetched."
+}

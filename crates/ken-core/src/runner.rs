@@ -56,29 +56,117 @@ impl CancelToken {
     }
 }
 
+/// File names to try for the claude CLI in a given directory, most-preferred
+/// first.
+///
+/// On Windows `npm install -g` drops THREE launchers side by side: `claude`
+/// (a `#!/bin/sh` script for Git Bash), `claude.cmd`, and `claude.ps1`. Only
+/// the `.cmd` is runnable by `CreateProcess`; handing it the extensionless
+/// one fails at spawn with "%1 is not a valid Win32 application" (os error
+/// 193) — and `is_executable` can't catch that, since on Windows it is just
+/// an `is_file` check and the shell script is very much a file. So the bare
+/// name must be tried LAST here rather than first.
+///
+/// `.cmd` is safe to hand to `std::process::Command`: since the fix for
+/// CVE-2024-24576, std routes `.bat`/`.cmd` through `cmd.exe` with its own
+/// argument escaping rather than refusing them.
+#[cfg(windows)]
+const CLAUDE_NAMES: &[&str] = &["claude.cmd", "claude.exe", "claude.bat", "claude"];
+#[cfg(not(windows))]
+const CLAUDE_NAMES: &[&str] = &["claude"];
+
 /// Find the claude CLI: PATH first, then the usual install locations that
 /// GUI apps' skinny PATH misses.
 pub fn discover_claude() -> Option<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("claude");
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
+    candidate_dirs().iter().find_map(|dir| first_runnable(dir))
+}
+
+/// The folders [`discover_claude`] looks in, in order: PATH, then where each
+/// installer puts the CLI.
+fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        // Claude Code's own installer (`~/.local/bin`, on Windows too) and
+        // its older local install.
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".claude").join("local"));
     }
-    let home = dirs::home_dir()?;
-    for candidate in [
-        home.join(".local/bin/claude"),
-        home.join(".claude/local/claude"),
-        PathBuf::from("/opt/homebrew/bin/claude"),
-        PathBuf::from("/usr/local/bin/claude"),
-    ] {
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
+    #[cfg(not(windows))]
+    dirs.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+    // Ken launches as a GUI app, whose PATH routinely misses npm's global
+    // bin — the very place the CLI lands on Windows.
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("npm"));
     }
-    None
+    // `winget install Anthropic.ClaudeCode` links the exe into Links when it
+    // can, and always leaves it in its package folder.
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let winget = PathBuf::from(local).join("Microsoft").join("WinGet");
+        dirs.push(winget.join("Links"));
+        dirs.extend(winget_package_dirs(&winget.join("Packages")));
+    }
+    dirs
+}
+
+/// WinGet's package folders for Claude Code (`Anthropic.ClaudeCode_<source>`)
+/// under `packages`, sorted so the result does not depend on the disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn winget_package_dirs(packages: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(packages)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("Anthropic.ClaudeCode_"))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// The first [`CLAUDE_NAMES`] entry in `dir` that exists and looks runnable.
+fn first_runnable(dir: &Path) -> Option<PathBuf> {
+    // npm's launchers side by side are one install: when its `.cmd` points
+    // at an exe that is gone, its `claude` shell script does too.
+    let cmd = dir.join("claude.cmd");
+    if cfg!(windows) && cmd.is_file() && !launcher_target_exists(&cmd) {
+        return None;
+    }
+    CLAUDE_NAMES.iter().find_map(|name| {
+        let candidate = dir.join(name);
+        (is_executable(&candidate) && launcher_target_exists(&candidate)).then_some(candidate)
+    })
+}
+
+/// A `.cmd`/`.bat` launcher is only runnable if what it launches is there.
+/// npm's shim runs `"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"`,
+/// and an update that stalls halfway leaves that exe renamed to
+/// `claude.exe.old.<n>`: the shim remains and every run fails with "is not
+/// recognized". A launcher that names no `%dp0%` path is taken on trust.
+fn launcher_target_exists(launcher: &Path) -> bool {
+    let is_batch = launcher
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if !is_batch {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(launcher) else { return true };
+    let Some(dir) = launcher.parent() else { return true };
+    let targets: Vec<PathBuf> = text
+        .split('"')
+        .filter_map(|quoted| {
+            let rel = quoted.strip_prefix("%dp0%").or_else(|| quoted.strip_prefix("%~dp0"))?;
+            let rel = rel.trim_start_matches(['\\', '/']);
+            (!rel.is_empty()).then(|| dir.join(rel.replace('\\', std::path::MAIN_SEPARATOR_STR)))
+        })
+        .collect();
+    targets.is_empty() || targets.iter().any(|t| t.is_file())
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -97,24 +185,76 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Claude Code stores sessions under `~/.claude/projects/<path-with-slashes-
-/// as-dashes>/<session-id>.jsonl`; existence means the session got past its
-/// startup gates.
+/// Claude Code stores sessions under `~/.claude/projects/<encoded cwd>/
+/// <session-id>.jsonl`; existence means the session got past its startup
+/// gates. The folder is looked up under the path as given and its plain
+/// canonical form, then, since session ids are unique, in any project folder
+/// (Claude Code shortens very long names with a hash).
 pub fn session_file_exists(project_root: &Path, session_id: &str) -> bool {
     let Some(home) = dirs::home_dir() else {
         return true; // can't check — assume fine rather than false-alarm
     };
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let encoded = canonical.to_string_lossy().replace(['/', '\\'], "-");
-    home.join(".claude/projects")
-        .join(encoded)
-        .join(format!("{session_id}.jsonl"))
-        .is_file()
+    let projects = home.join(".claude").join("projects");
+    let file = format!("{session_id}.jsonl");
+    let raw = project_root.to_string_lossy().into_owned();
+    let canonical = crate::setup::plain_canonical(project_root).to_string_lossy().into_owned();
+    if [raw, canonical].iter().any(|p| projects.join(claude_project_dir_name(p)).join(&file).is_file()) {
+        return true;
+    }
+    std::fs::read_dir(&projects)
+        .map(|entries| entries.flatten().any(|e| e.path().join(&file).is_file()))
+        .unwrap_or(false)
 }
 
-pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with:  npm install -g @anthropic-ai/claude-code  — then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+/// The folder name Claude Code gives a project under `~/.claude/projects`:
+/// the cwd with every character outside `[A-Za-z0-9]` replaced by `-`, taken
+/// from the plain path (no Windows `\\?\` prefix). `C:\Code\ken` becomes
+/// `C--Code-ken`; `/Users/a/My.Repo` becomes `-Users-a-My-Repo`.
+pub fn claude_project_dir_name(path: &str) -> String {
+    let plain = path.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}"));
+    let plain = plain.as_deref().unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path));
+    plain.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// What to do when Claude Code is not found, for this OS.
+#[cfg(windows)]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with:  winget install Anthropic.ClaudeCode  or Claude Code's installer in PowerShell:  irm https://claude.ai/install.ps1 | iex  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+#[cfg(target_os = "macos")]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with Claude Code's installer:  curl -fsSL https://claude.ai/install.sh | bash  or with Homebrew:  brew install --cask claude-code  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with Claude Code's installer:  curl -fsSL https://claude.ai/install.sh | bash  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+
+/// npm installs of Claude Code that discovery passed over because the
+/// launcher points at an exe that is gone (an update that stopped halfway).
+pub fn broken_claude_launchers() -> Vec<PathBuf> {
+    candidate_dirs()
+        .into_iter()
+        .map(|d| d.join("claude.cmd"))
+        .filter(|cmd| cfg!(windows) && cmd.is_file() && !launcher_target_exists(cmd))
+        .fold(Vec::new(), |mut v, p| {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+            v
+        })
+}
+
+/// The help to show about Claude Code: [`MISSING_CLAUDE_HELP`] when it is not
+/// found, plus a line for each broken npm install that was skipped. Empty when
+/// Claude Code is found and nothing was skipped.
+pub fn claude_help(found: bool) -> String {
+    let mut lines = Vec::new();
+    if !found {
+        lines.push(MISSING_CLAUDE_HELP.to_string());
+    }
+    for launcher in broken_claude_launchers() {
+        lines.push(format!(
+            "Skipped {}: Claude Code's npm install there is half-updated (its claude.exe is missing). Reinstall it with npm install -g @anthropic-ai/claude-code, or uninstall it.",
+            launcher.display()
+        ));
+    }
+    lines.join("\n")
+}
 
 /// Run one agent session to completion. Synchronous — call from a worker
 /// thread. `on_blocked` fires (once per event) when the agent signals it is
@@ -139,6 +279,41 @@ pub fn run_session(
     }
 }
 
+/// The prompt argument for an interactive session. A `.cmd`/`.bat` launcher
+/// (how npm installs claude on Windows) runs through cmd.exe, which ends the
+/// command at a line break and expands `%VAR%` even inside quotes, so a
+/// multi-line prompt would arrive cut to its first line. Then the prompt goes
+/// in a file and the argument is a one-line pointer to it; the file's folder
+/// is returned so the session can be allowed to read it.
+fn tui_prompt_arg(binary: &Path, session_id: &str, prompt: &str) -> Result<(String, Option<PathBuf>)> {
+    let batch = binary
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let plain = !prompt.contains(['\n', '\r', '%', '"', '^', '&', '|', '<', '>']);
+    if !batch || plain {
+        return Ok((prompt.to_string(), None));
+    }
+    let dir = std::env::temp_dir().join("ken-prompts");
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("prompt file: {e}")))?;
+    let file = dir.join(format!("{session_id}.md"));
+    std::fs::write(&file, prompt).map_err(|e| Error::Other(format!("prompt file: {e}")))?;
+    let arg = format!(
+        "Your full instructions are in the file {}. Read that file now and follow it exactly.",
+        file.display()
+    );
+    Ok((arg, Some(file)))
+}
+
+/// Deletes a file when dropped (the prompt file, once its session is over).
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn run_hidden_tui(
     cfg: &RunnerConfig,
     project_root: &Path,
@@ -148,6 +323,8 @@ fn run_hidden_tui(
     cancel: &CancelToken,
     on_blocked: &mut impl FnMut(),
 ) -> Result<RunOutcome> {
+    // A hidden PTY cannot answer Claude Code's "trust this folder?" dialog.
+    crate::chat::ensure_folder_trusted(project_root);
     let rx = hooks.subscribe(session_id);
     let result = (|| {
         let pty = native_pty_system();
@@ -160,14 +337,15 @@ fn run_hidden_tui(
             })
             .map_err(|e| Error::Other(format!("pty: {e}")))?;
 
+        let (prompt_arg, prompt_file) = tui_prompt_arg(&cfg.binary, session_id, prompt)?;
+        let _cleanup = prompt_file.as_ref().map(|f| RemoveOnDrop(f.clone()));
         let mut cmd = CommandBuilder::new(&cfg.binary);
-        cmd.args([
-            "--session-id",
-            session_id,
-            "--permission-mode",
-            "acceptEdits",
-            prompt,
-        ]);
+        cmd.args(["--session-id", session_id, "--permission-mode", "acceptEdits"]);
+        if let Some(dir) = prompt_file.as_ref().and_then(|f| f.parent()) {
+            cmd.arg("--add-dir");
+            cmd.arg(dir);
+        }
+        cmd.arg(&prompt_arg);
         cmd.cwd(project_root);
         let mut child = pair
             .slave
@@ -305,22 +483,13 @@ fn run_headless(
     prompt: &str,
     cancel: &CancelToken,
 ) -> Result<RunOutcome> {
-    let child = std::process::Command::new(&cfg.binary)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            session_id,
-        ])
+    // The prompt on stdin, never an argument (see `proc::spawn_with_input`).
+    let mut cmd = std::process::Command::new(&cfg.binary);
+    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
 
     use assistant::DriveResult;
@@ -380,9 +549,9 @@ fn run_headless_streaming(
     mut on_activity: impl FnMut(&str) + Send + 'static,
 ) -> Result<RunOutcome> {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(&cfg.binary)
-        .args([
-            "-p", prompt,
+    let mut cmd = std::process::Command::new(&cfg.binary);
+    cmd.args([
+            "-p",
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", "acceptEdits",
@@ -390,9 +559,8 @@ fn run_headless_streaming(
         ])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let mut child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
 
     let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
@@ -410,13 +578,19 @@ fn run_headless_streaming(
                         on_activity(&truncate(one, 120).to_string());
                     }
                 }
-                ParsedEvent::Activity(s) => on_activity(&s),
+                ParsedEvent::Tool { summary, .. } => on_activity(&summary),
                 ParsedEvent::TurnResult { is_error } => {
                     *result_w.lock().unwrap() = Some(is_error);
                 }
                 // Headless runs never enable the permission control channel,
                 // so a control request here is nothing to act on.
-                ParsedEvent::Init | ParsedEvent::ControlRequest { .. } | ParsedEvent::Other => {}
+                // Headless runs don't ask for partial messages, and a tool's
+                // result isn't activity.
+                ParsedEvent::Init
+                | ParsedEvent::ControlRequest { .. }
+                | ParsedEvent::TextDelta(_)
+                | ParsedEvent::ToolDone { .. }
+                | ParsedEvent::Other => {}
             }
         }
     });
@@ -427,7 +601,7 @@ fn run_headless_streaming(
     let deadline = Instant::now() + cfg.timeout;
     let outcome = loop {
         if cancel.is_cancelled() {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             break RunOutcome::Cancelled;
         }
         match child.try_wait() {
@@ -444,7 +618,7 @@ fn run_headless_streaming(
             }
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     break RunOutcome::TimedOut(err_buf.lock().unwrap().clone());
                 }
                 std::thread::sleep(Duration::from_millis(150));
@@ -509,6 +683,10 @@ for ((i=0; i<${#args[@]}; i++)); do
     *) if [ -z "$PROMPT" ]; then PROMPT="${args[$i]}"; fi;;
   esac
 done
+# Like the real CLI: `-p` with no prompt argument reads the prompt on stdin.
+if [ "$HEADLESS" = "1" ] && [ "$STREAM_INPUT" != "1" ] && [ -z "$PROMPT" ]; then
+  PROMPT=$(cat)
+fi
 
 # Conversation mode: JSONL in, events out. One assistant reply per user line.
 if [ "$STREAM_INPUT" = "1" ]; then
@@ -694,6 +872,9 @@ case "$BEHAVIOR" in
     exit 0;;
 esac
 "#;
+        // Unix only in practice: the tests that run it are ignored on Windows,
+        // where a generated launcher chaining cmd → bash → curl reads as
+        // malware to endpoint security (it quarantined files on a dev box).
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
         {
@@ -709,6 +890,130 @@ mod tests {
     use super::test_support::write_fake_claude;
     use super::*;
     use crate::hooks::{install_hooks, HookListener};
+
+    #[test]
+    fn a_launcher_whose_exe_is_gone_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
+        let cmd = dir.path().join("claude.cmd");
+        std::fs::write(&cmd, shim).unwrap();
+        let bin = dir.path().join("node_modules/@anthropic-ai/claude-code/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A stalled update: only the renamed old exe is left.
+        std::fs::write(bin.join("claude.exe.old.1785513710531"), "x").unwrap();
+        assert!(!launcher_target_exists(&cmd));
+        if cfg!(windows) {
+            // npm's shell-script launcher beside it is the same broken install.
+            std::fs::write(dir.path().join("claude"), "#!/bin/sh\n").unwrap();
+            assert_eq!(first_runnable(dir.path()), None, "the whole folder is passed over");
+        }
+        std::fs::write(bin.join("claude.exe"), "x").unwrap();
+        assert!(launcher_target_exists(&cmd));
+        // No %dp0% target to check: taken on trust, as is anything not batch.
+        let plain = dir.path().join("other.cmd");
+        std::fs::write(&plain, "@node cli.js %*\r\n").unwrap();
+        assert!(launcher_target_exists(&plain));
+        assert!(launcher_target_exists(&dir.path().join("claude.exe")));
+    }
+
+    #[test]
+    fn a_multiline_prompt_reaches_a_cmd_launcher_as_a_file() {
+        let prompt = "Research this.\nWrite to 100% of OUTPUT_FILE=a.md";
+        let (arg, file) = tui_prompt_arg(Path::new(r"C:\npm\claude.cmd"), "sess-pf", prompt).unwrap();
+        let file = file.expect("a batch launcher gets a prompt file");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), prompt);
+        assert!(!arg.contains('\n') && !arg.contains('%'), "{arg}");
+        assert!(arg.contains(&file.display().to_string()));
+        drop(RemoveOnDrop(file.clone()));
+        assert!(!file.exists(), "the prompt file goes when the session ends");
+    }
+
+    #[test]
+    fn other_prompts_stay_on_the_command_line() {
+        let multi = "one\ntwo";
+        assert_eq!(tui_prompt_arg(Path::new("/usr/local/bin/claude"), "s", multi).unwrap(), (multi.to_string(), None));
+        assert_eq!(tui_prompt_arg(Path::new(r"C:\npm\claude.cmd"), "s", "plain").unwrap(), ("plain".to_string(), None));
+    }
+
+    /// The exact layout `npm install -g @anthropic-ai/claude-code` leaves on
+    /// Windows: an extensionless `#!/bin/sh` launcher beside `claude.cmd`.
+    /// Picking the former is what produced "%1 is not a valid Win32
+    /// application (os error 193)" when the morning digest tried to run.
+    #[test]
+    #[cfg(windows)]
+    fn windows_discovery_prefers_the_cmd_over_npms_shell_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("claude"), "#!/bin/sh\nexec node foo\n").unwrap();
+        std::fs::write(dir.path().join("claude.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("claude.ps1"), "# ps\n").unwrap();
+
+        let found = first_runnable(dir.path()).expect("a launcher is present");
+        assert_eq!(
+            found.file_name().unwrap(),
+            "claude.cmd",
+            "the shell script cannot be spawned by CreateProcess"
+        );
+    }
+
+    /// With only the shell launcher present there is nothing better to
+    /// return, so discovery still yields it rather than reporting the CLI
+    /// missing — the spawn error is more informative than "not installed".
+    #[test]
+    #[cfg(windows)]
+    fn windows_discovery_falls_back_to_the_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("claude"), "#!/bin/sh\n").unwrap();
+        let found = first_runnable(dir.path()).expect("the bare name is a last resort");
+        assert_eq!(found.file_name().unwrap(), "claude");
+    }
+
+    /// An empty directory must not produce a candidate.
+    #[test]
+    fn discovery_skips_a_directory_with_no_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(first_runnable(dir.path()).is_none());
+    }
+
+    /// `winget install Anthropic.ClaudeCode` leaves claude.exe in its package
+    /// folder even when it could not link it into WinGet\Links.
+    #[test]
+    fn winget_package_folders_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(dir.path().join("Git.Git_Microsoft.Winget.Source_8wekyb3d8bbwe")).unwrap();
+        std::fs::write(pkg.join("claude.exe"), "x").unwrap();
+        assert_eq!(winget_package_dirs(dir.path()), vec![pkg.clone()]);
+        if cfg!(windows) {
+            assert_eq!(first_runnable(&pkg), Some(pkg.join("claude.exe")));
+        }
+        assert!(winget_package_dirs(&dir.path().join("missing")).is_empty());
+    }
+
+    /// Claude Code names a project's session folder after its cwd with every
+    /// character outside [A-Za-z0-9] made a '-', from the plain path.
+    #[test]
+    fn session_folders_are_named_like_claude_code_names_them() {
+        assert_eq!(claude_project_dir_name(r"C:\ken-eval\ATT\Project Documents"), "C--ken-eval-ATT-Project-Documents");
+        assert_eq!(claude_project_dir_name(r"C:\ken-eval\ATT\.ken-workspace"), "C--ken-eval-ATT--ken-workspace");
+        assert_eq!(claude_project_dir_name(r"\\?\C:\Code\ken"), "C--Code-ken");
+        assert_eq!(claude_project_dir_name("/Users/a/My.Repo"), "-Users-a-My-Repo");
+        assert_eq!(claude_project_dir_name("/Users/a/repo_2"), "-Users-a-repo-2");
+    }
+
+    /// The help names how to install Claude Code on this OS, and npm only as
+    /// the alternative.
+    #[test]
+    fn install_help_is_per_os() {
+        let help = claude_help(false);
+        assert!(help.starts_with(MISSING_CLAUDE_HELP), "{help}");
+        if cfg!(windows) {
+            assert!(MISSING_CLAUDE_HELP.contains("winget install Anthropic.ClaudeCode"));
+        } else {
+            assert!(MISSING_CLAUDE_HELP.contains("claude.ai/install.sh"));
+        }
+        assert!(MISSING_CLAUDE_HELP.contains("npm install -g @anthropic-ai/claude-code"));
+    }
 
     fn setup(behavior: &str) -> (tempfile::TempDir, PathBuf, HookListener) {
         let dir = tempfile::tempdir().unwrap();
@@ -727,6 +1032,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn hidden_tui_completes_on_stop_hook() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -746,6 +1052,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn process_death_is_failure_with_detail() {
         let (dir, bin, hooks) = setup("fail");
         let outcome = run_session(
@@ -765,6 +1072,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn timeout_kills_and_reports() {
         let (dir, bin, hooks) = setup("hang");
         let outcome = run_session(
@@ -781,6 +1089,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn notification_reports_blocked_then_cancel_works() {
         let (dir, bin, hooks) = setup("block");
         let cancel = CancelToken::new();
@@ -805,6 +1114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_completes_and_fails() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -839,6 +1149,7 @@ mod tests {
     /// The v2.x CLI exits 0 and reports failure inside the trailing result
     /// event of a JSON array; an ingest must not be reported as Completed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_honors_error_in_array_result_event() {
         let (dir, bin, hooks) = setup("headless-array-error");
         let outcome = run_session(
@@ -861,6 +1172,7 @@ mod tests {
     /// a final assistant message did its work — report Completed (an ingest is
     /// applied only on Completed), not Failed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_recovers_when_no_result_event_but_exit_zero() {
         let (dir, bin, hooks) = setup("headless-array-noresult");
         let outcome = run_session(
@@ -879,6 +1191,7 @@ mod tests {
     /// Same shape but a non-zero exit is a genuine failure — recovery must not
     /// mask it.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_fails_when_no_result_event_and_nonzero_exit() {
         let (dir, bin, hooks) = setup("headless-array-noresult-nonzero");
         let outcome = run_session(
@@ -895,6 +1208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_reports_activity_and_completes() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -922,6 +1236,7 @@ mod tests {
     /// exit, no stream-json result event — the `(false, None)` arm must report
     /// Failed, never Completed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_fails_on_nonzero_exit_without_result_event() {
         let (dir, bin, hooks) = setup("stream-die-plain");
         let outcome = run_ingest_session(
@@ -939,6 +1254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_maps_error_result_to_failure() {
         let (dir, bin, hooks) = setup("stream-fail");
         let outcome = run_ingest_session(

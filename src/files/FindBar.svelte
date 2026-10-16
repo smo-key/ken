@@ -3,6 +3,7 @@
   import ChevronUp from "@lucide/svelte/icons/chevron-up";
   import X from "@lucide/svelte/icons/x";
   import { find } from "../lib/find.svelte";
+  import { shortcut } from "../lib/platform";
 
   let input = $state<HTMLInputElement | null>(null);
 
@@ -43,7 +44,7 @@
     <button
       class="step"
       aria-label="Previous match"
-      title="Previous match (⇧⏎)"
+      title="Previous match ({shortcut('shift+enter')})"
       disabled={find.total === 0}
       onclick={() => find.previous()}
     >
@@ -52,7 +53,7 @@
     <button
       class="step"
       aria-label="Next match"
-      title="Next match (⏎)"
+      title="Next match ({shortcut('enter')})"
       disabled={find.total === 0}
       onclick={() => find.next()}
     >

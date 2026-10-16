@@ -17,12 +17,15 @@
   import Telescope from "@lucide/svelte/icons/telescope";
   import Terminal from "@lucide/svelte/icons/terminal";
   import X from "@lucide/svelte/icons/x";
+  import Layers from "@lucide/svelte/icons/layers";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { toast } from "../lib/toast.svelte";
   import ResearchModal from "../research/ResearchModal.svelte";
   import ChatResizer from "./ChatResizer.svelte";
   import { app } from "../lib/app.svelte";
   import { clampChatWidth } from "../lib/chatWidth";
   import { shouldSend } from "../lib/keySend";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   // Research runs *are* chats (kind: "research") — they open as a terminal
   // session in this drawer and are cancelled from its foot, so this is where
@@ -40,6 +43,9 @@
         icon: row.pinned ? PinOff : Pin,
         onSelect: () => void chats.pin(row.id, !row.pinned),
       },
+      ...(row.kind === "user"
+        ? [{ label: "Send to Ingest", icon: Layers, onSelect: () => void sendToIngest(row) }]
+        : []),
       "separator",
       {
         label: "Archive",
@@ -47,6 +53,18 @@
         onSelect: () => void chats.archive(row.id),
       },
     ]);
+  }
+
+  // The whole chat, the person's and Ken's turns, into the knowledge base's Raw/.
+  async function sendToIngest(row: ChatRow) {
+    const projectId = app.focused;
+    if (!projectId) return;
+    try {
+      await api.ingestAddChat(projectId, row.id, null);
+      toast.show(`"${row.title}" is in Ingest`);
+    } catch (err) {
+      toast.error("Could not send the chat to Ingest", err);
+    }
   }
 
   function kindIcon(kind: ChatRow["kind"]) {
@@ -264,10 +282,11 @@
 
   <div class="body">
     {#if !chats.activeId}
-      <div class="empty">
-        <p>Chat with Ken about everything this project knows.</p>
-        <button class="btn btn-primary" onclick={() => chats.newChat()}>Start a chat</button>
-      </div>
+      <EmptyState title="No chat open" center>
+        {#snippet action()}
+          <button class="btn btn-primary" onclick={() => chats.newChat()}>Start a chat</button>
+        {/snippet}
+      </EmptyState>
     {:else if inTerminal}
       {#key chats.activeId}
         <TerminalView chatId={chats.activeId} />
@@ -296,13 +315,7 @@
             <button class="mini" onclick={cancelResearch}>Cancel research</button>
           {/if}
         </div>
-        <span class="foot-note">You're in the real Claude terminal.</span>
       {:else if chats.active?.kind === "ingest" || chats.active?.kind === "research"}
-        <span class="foot-note">
-          {chats.active.kind === "research"
-            ? "Research session — opens in the terminal; you can answer its questions there."
-            : "Ingest session — opens in the terminal."}
-        </span>
         {#if researchLive}
           <div class="chat-actions">
             <button class="mini" onclick={cancelResearch}>Cancel research</button>
@@ -314,7 +327,7 @@
             bind:this={replyEl}
             bind:value={draft}
             onkeydown={onKeydown}
-            placeholder="Reply to Ken…  (Enter to send, Shift+Enter for a new line)"
+            placeholder="Reply"
             rows="3"
           ></textarea>
           <!-- Composer controls sit in their own row so a model-selector
@@ -334,6 +347,7 @@
                  upkeep. Applies to the next message/session. -->
             <select
               class="model-select"
+              aria-label="Model"
               title="Model for this chat (applies to your next message)"
               value={chats.active?.model ?? ""}
               onchange={(e) =>
@@ -365,8 +379,8 @@
      defers to it so the drawer holds that fixed width beside the main content. */
   .drawer {
     flex: 0 0 auto;
-    border-left: 1px solid var(--border);
-    background: var(--sunken-2);
+    border-left: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -374,7 +388,7 @@
   }
   .drawer.overlay {
     position: absolute;
-    top: 52px;
+    top: 56px;
     right: 0;
     bottom: 0;
     z-index: 40;
@@ -554,22 +568,6 @@
     background: var(--paper);
     border-top: 1px solid var(--border);
   }
-  .empty {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    padding: 20px;
-  }
-  .empty p {
-    margin: 0;
-    font-size: 13px;
-    color: var(--ink-secondary);
-    text-align: center;
-    line-height: 1.6;
-  }
   .send-error {
     flex: none;
     margin: 8px 12px 0;
@@ -643,8 +641,10 @@
     font-size: 11.5px;
     color: var(--ink-secondary);
     border: 1px solid var(--border);
-    background: transparent;
-    padding: 4px 6px;
+    background-color: transparent;
+    background-position: right 5px center;
+    background-size: 11px;
+    padding: 4px 20px 4px 7px;
     border-radius: 7px;
     max-width: 110px;
   }
@@ -689,9 +689,5 @@
   }
   .mini:hover {
     color: var(--accent);
-  }
-  .foot-note {
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
   }
 </style>

@@ -52,6 +52,6 @@
 <style>
   .boot {
     height: 100vh;
-    background: var(--paper);
+    background: var(--bg);
   }
 </style>

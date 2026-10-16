@@ -1,0 +1,10 @@
+# cmd.exe mis-parses labels and goto in LF batch files.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+# The bundled wiki template is written into new wikis byte for byte.
+crates/ken-core/templates/** text eol=lf
+# Test fixtures are read byte for byte (PDF offsets, sizes, hashes).
+crates/ken-core/fixtures/** -text
+*.pdf binary
+# Node strips a shebang only when the line ends in LF.
+*.mjs text eol=lf

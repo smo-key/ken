@@ -4,6 +4,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import "@xterm/xterm/css/xterm.css";
   import { api } from "../lib/api";
+  import { forFocused } from "../lib/app.svelte";
   import { base64 } from "../lib/mime";
 
   let { chatId }: { chatId: string } = $props();
@@ -45,7 +46,7 @@
     });
 
     unlisten = await api.onChatPtyData((chunk) => {
-      if (chunk.chatId === chatId && term) {
+      if (forFocused(chunk.project_id) && chunk.chatId === chatId && term) {
         term.write(b64ToBytes(chunk.data));
       }
     });

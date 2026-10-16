@@ -269,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn run_research_writes_report_and_completes() {
         let (_p, _a, project, bin, hooks) = rig("complete");
         let rel = plan_report(&project, "research", "Test question?").unwrap();
@@ -291,6 +292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn run_research_failure_leaves_no_report() {
         let (_p, _a, project, bin, hooks) = rig("fail");
         let rel = plan_report(&project, "research", "Test question?").unwrap();
@@ -314,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn run_research_blocked_then_cancel() {
         let (_p, _a, project, bin, hooks) = rig("block");
         let rel = plan_report(&project, "research", "Test question?").unwrap();

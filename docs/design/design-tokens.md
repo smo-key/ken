@@ -10,6 +10,36 @@ and is the authoritative visual reference.
 reads like a well-set document. One accent, warm neutrals, generous
 whitespace.
 
+## Copy rule
+
+A screen shows names, values and verbs. Taken from the SR page how-to
+(Shattered-Realms-Docs, `Engine/How-tos/UI/Building an SR page.md` §3).
+The rule is about visible text. Tooltips are where detail goes (rule 7).
+
+1. **No how-to text.** No sentence on a screen that explains how to use it.
+2. **A subtitle holds a count or an id.** Nothing else: never a sentence,
+   never a path.
+3. **No file paths.** A line that says what an action writes may stay.
+4. **An empty list reads "none".** An empty screen gets a short title
+   ("No file open"), at most one clause of fact, never a how-to. Use
+   `EmptyState` (`src/lib/ui/EmptyState.svelte`); its title is quiet, the
+   body face in the muted ink, never louder than the content.
+5. **Labels, not sentences.** "Controls", "Recent", "no changes".
+6. **A control shows its state itself.** A checkbox, a radio or a badge
+   says it; a sentence does not repeat it.
+7. **Tooltips may carry detail.** A path, a shortcut, what a count means,
+   why a control is disabled, what a hint or icon does. A tooltip never
+   repeats the visible label it sits on: "Add it to the decisions log" on
+   a button reading "Add to the decisions log" goes. (Chris, 2026-10-15:
+   "Tool tips are fine, just content everywhere is not the move.")
+
+Every screen has one title, in `ScreenHeader` (`src/lib/ui/ScreenHeader.svelte`):
+the title, an optional count or id, and on the right the screen's actions and
+its count ("4 of 4"). No lede under it.
+
+Background work stays out of sight: one short status line, and only where it
+blocks.
+
 ## Color
 
 ### Neutrals — paper
@@ -44,6 +74,13 @@ Status colors: 10–14% opacity for fills, full strength for text and dots.
 Clay marks the active nav item, primary buttons, links, selection — nothing
 else. `::selection` is `#E8DCCB`.
 
+### Syntax (the Files code viewer)
+`--syntax-keyword` (accent ink), `--syntax-string` (ok), `--syntax-number`
+(attention ink), `--syntax-comment` (ink 3), `--syntax-type` (info),
+`--syntax-meta` (ink 2), and the danger colour for invalid code. Each is a
+token above, so the dark theme brings its own. Colour only: no weight or
+slant, which could move the text off the caret.
+
 ## Typography
 - **Source Serif 4** (400/500/600): document titles and page headers.
   display 32/500, title 22–24/500, page h1 28–30/500, letter-spacing -0.01em.
@@ -76,6 +113,11 @@ else. `::selection` is `#E8DCCB`.
   `rgba(138,90,68,0.06–0.1)`.
 
 ## App layout (Prototype v2)
+
+The prototype as drawn. Since `knowledge-core` there is no Map, and the
+Timeline is the Log, the project's RAID register
+(`docs/knowledge-core/DECISIONS.md`, decision 37).
+
 - Title bar h52 on `sunken`: traffic lights, project switcher pill (with
   sync dot), centered global search (⌘K, "Search — Ken answers questions
   inline…"), Chats toggle button (clay-tinted, unread dot).

@@ -1,19 +1,29 @@
-//! Sync engine: keeps a shared project folder in step with the team.
-//! Git-backed projects are driven actively — pull on focus, debounced
-//! commit + push after saves — by shelling out to the user's `git` binary
+//! Sync engine: keeps the knowledge base in step with its remote.
+//! A git-backed knowledge base is driven actively (pull on focus, a debounced
+//! commit and push after saves) by shelling out to the user's `git` binary
 //! (their config, their credentials; never a git library, never rebase,
 //! never force). Non-git projects get passive shared-drive damage
 //! detection: conflicted-copy filenames become Review items. Every
 //! conflict either path produces is filed into the stored review-item
 //! substrate with an AI-drafted merge, and surfaced through a
 //! plain-language sync state — the user never sees git vocabulary.
+//!
+//! Ken's commits (knowledge-core decision 36): only in the knowledge base,
+//! only its own changes. A cycle commits exactly the paths Ken wrote there
+//! (`SyncEngine::wrote`) through `git::commit_paths`, never `git add -A`, so
+//! a person's other work in the tree stays theirs. Sync shows that other
+//! work ([`other_changes`]) and commits it only when the person says so,
+//! file by file as they were shown ([`commit_others`]). A code or reference repo
+//! is never committed in or pushed, whatever its `sync` block says. Memory
+//! (`.ken/memory/`) is personal and local: it is kept out of git and never
+//! committed or pushed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -21,13 +31,24 @@ use serde_json::json;
 use crate::db::Db;
 use crate::engine::now_epoch;
 use crate::project::Project;
+use crate::registry::{self, RepoKind};
 use crate::{Error, Result};
 
 pub const COMMIT_MESSAGE: &str = "Ken: update knowledge";
 
 /// Ken's transient files, kept out of the user's repository via
-/// `.git/info/exclude` (non-invasive: no tracked file is touched).
-const EXCLUDE_ENTRIES: &[&str] = &[".ken/.staging/", ".claude/settings.local.json"];
+/// `.git/info/exclude` (non-invasive: no tracked file is touched). Generated
+/// transcripts are this machine's cache (`transcript::cache_dir`).
+/// Memory (`.ken/memory/`) is personal and local, so it is kept out too.
+const EXCLUDE_ENTRIES: &[&str] = &[".ken/.staging/", ".ken/transcripts/", ".ken/memory/", ".claude/settings.local.json"];
+
+/// Paths Ken never commits, even when it wrote them: memory, the staging
+/// area and transcripts belong to this machine, never to the remote.
+fn personal(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    let p = p.trim_start_matches("./");
+    [".ken/memory/", ".ken/.staging/", ".ken/transcripts/", ".ken-workspace/"].iter().any(|d| p.starts_with(d))
+}
 
 // ---------- git primitives ----------
 
@@ -38,7 +59,8 @@ struct GitOut {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<GitOut> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    let out = crate::proc::quiet(&mut cmd)
         .args(args)
         .current_dir(root)
         // Never hang on a credential prompt — fail into the attention state.
@@ -92,16 +114,96 @@ pub fn remote_and_branch(root: &Path) -> (Option<String>, Option<String>) {
     (remote, branch)
 }
 
-/// Project-level sync toggle: `project.json` extra `"sync": {"auto": bool}`.
-/// Defaults to on.
-pub fn sync_auto(project: &Project) -> bool {
-    project
+/// When the repository last pulled and last pushed, as Unix seconds: its
+/// `FETCH_HEAD` is written by every fetch and pull, and the newest "update
+/// by push" in its upstream's reflog is the last push that moved it. None
+/// for either it has not done (or has no upstream for).
+pub fn last_pull_push(root: &Path) -> (Option<i64>, Option<i64>) {
+    let pulled = run_git(root, &["rev-parse", "--git-path", "FETCH_HEAD"])
+        .ok()
+        .filter(|o| o.ok)
+        .map(|o| {
+            let p = PathBuf::from(o.stdout.trim());
+            if p.is_absolute() { p } else { root.join(p) }
+        })
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let pushed = run_git(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"])
+        .ok()
+        .filter(|o| o.ok)
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|upstream| run_git(root, &["reflog", "show", "--date=unix", "--format=%gd%x09%gs", &upstream]).ok())
+        .filter(|o| o.ok)
+        .and_then(|o| {
+            o.stdout.lines().find_map(|l| {
+                let (selector, subject) = l.split_once('\t')?;
+                if !subject.starts_with("update by push") {
+                    return None;
+                }
+                let at = selector.rsplit_once("@{")?.1.trim_end_matches('}');
+                at.parse::<i64>().ok()
+            })
+        });
+    (pulled, pushed)
+}
+
+/// Whether sync runs for a repo: only for the knowledge base (said to be a
+/// wiki, or holding the inbox), and there on unless a person switched it off
+/// (`project.json` extra `"sync": {"auto": false}`). A code or reference repo
+/// never syncs, even with `"auto": true` (decision 36: Ken never commits in
+/// a code repo).
+pub fn sync_auto(project: &Project, kind: &[RepoKind]) -> bool {
+    let knowledge_base = kind.iter().any(|k| k.syncs()) || crate::ingest::has_inbox(&project.root);
+    knowledge_base
+        && project
+            .config
+            .extra
+            .get("sync")
+            .and_then(|v| v.get("auto"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+}
+
+/// Default gap between the first change of a burst and the auto-commit that
+/// follows it. One hour, deliberately: at 30s Ken committed half-finished
+/// edits mid-session. The debounce deadline is set by the FIRST change in a
+/// burst and cannot be pushed back by continued typing (`get_or_insert` in
+/// `engine_loop`), so this means "at most one auto-commit per hour of active
+/// work", not "an hour after you finally stop".
+pub const DEFAULT_PUSH_DEBOUNCE_SECS: u64 = 60 * 60;
+
+/// Default minimum gap between focus-triggered pulls. Left short: a pull
+/// only fires when you switch to a project, and a stale pull means working
+/// against out-of-date teammate state — the opposite of the point.
+pub const DEFAULT_PULL_THROTTLE_SECS: u64 = 60;
+
+/// Read a positive duration from the project's `sync` block, falling back to
+/// `default_secs`. Zero and negative values are rejected rather than
+/// honoured: a zero debounce would commit on every keystroke batch, which is
+/// never what someone means by "faster".
+fn sync_secs(project: &Project, key: &str, default_secs: u64) -> Duration {
+    let secs = project
         .config
         .extra
         .get("sync")
-        .and_then(|v| v.get("auto"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+        .and_then(|v| v.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|s| *s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+/// Build the engine config for a project, honouring its `sync` block:
+/// `{"auto": bool, "pushDebounceSecs": u64, "pullThrottleSecs": u64}`.
+pub fn sync_config_for(project: &Project) -> SyncConfig {
+    SyncConfig {
+        push_debounce: sync_secs(project, "pushDebounceSecs", DEFAULT_PUSH_DEBOUNCE_SECS),
+        pull_throttle: sync_secs(project, "pullThrottleSecs", DEFAULT_PULL_THROTTLE_SECS),
+        ..SyncConfig::default()
+    }
 }
 
 /// Is active git sync in effect for this root? (git repo + remote + auto on)
@@ -109,8 +211,39 @@ pub fn sync_active(root: &Path) -> bool {
     if !is_git_repo(root) {
         return false;
     }
-    let auto = Project::open(root).map(|p| sync_auto(&p)).unwrap_or(true);
+    // No project.json means Ken has not been set up here: never sync.
+    let auto = Project::open(root)
+        .map(|p| sync_auto(&p, &registry::kind_of(root)))
+        .unwrap_or(false);
     auto && remote_and_branch(root).0.is_some()
+}
+
+/// How long a [`sync_active`] answer stays good for in [`engine_loop`]'s
+/// hot path.
+const SYNC_ACTIVE_TTL: Duration = Duration::from_secs(30);
+
+/// [`sync_active`] spawns two `git` processes (`remote` + `rev-parse`), so
+/// calling it once per watcher event is far more expensive than it looks:
+/// a workspace ingesting several git-backed members produces a continuous
+/// stream of `Msg::Changed`, and each one became two process spawns per
+/// member. Whether a repo has a remote and auto-sync on changes on a human
+/// timescale, so the answer is cached for `SYNC_ACTIVE_TTL`.
+///
+/// `force` bypasses the cache for the two explicit user-driven messages
+/// (`PullNow`/`SyncNow`), which are throttled/rare and where acting on a
+/// half-minute-old answer would be visibly wrong — e.g. right after the
+/// user adds a remote and hits Sync now.
+fn sync_active_cached(root: &Path, cache: &mut Option<(Instant, bool)>, force: bool) -> bool {
+    if !force {
+        if let Some((at, active)) = *cache {
+            if at.elapsed() < SYNC_ACTIVE_TTL {
+                return active;
+            }
+        }
+    }
+    let active = sync_active(root);
+    *cache = Some((Instant::now(), active));
+    active
 }
 
 /// Idempotently keep Ken's transient files out of the repo via
@@ -139,23 +272,53 @@ pub fn ensure_excludes(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage and commit everything. Returns true when a commit was made,
-/// false when there was nothing to commit.
-pub fn commit_all(root: &Path) -> Result<bool> {
-    let add = run_git(root, &["add", "-A"])?;
-    if !add.ok {
-        return Err(Error::Other(short_detail(&add)));
+/// Commit Ken's own changes: exactly `paths` (relative to `root`), through
+/// `git::commit_paths`, never `git add -A`. A personal path (memory, staging,
+/// transcripts) is left out. Returns true when a commit was made, false when
+/// none of them changed.
+pub fn commit_own(root: &Path, paths: &[String]) -> Result<bool> {
+    let own: Vec<String> = paths.iter().filter(|p| !personal(p)).cloned().collect();
+    crate::git::commit_paths(root, &own, COMMIT_MESSAGE).map(|c| c.is_some()).map_err(Error::Other)
+}
+
+/// The knowledge base's changes not written through Ken: every file with
+/// uncommitted work (changed, staged, removed or new), less Ken's own writes
+/// waiting for the next cycle (`own`, `SyncEngine::pending`) and the
+/// personal paths sync never commits. A cycle never commits these; sync
+/// shows them and offers "commit my other changes" ([`commit_others`]).
+/// Sorted; empty when `root` is not a git repo.
+pub fn other_changes(root: &Path, own: &[String]) -> Vec<String> {
+    let own: HashSet<String> = own.iter().map(|p| p.replace('\\', "/")).collect();
+    let mut out: Vec<String> = crate::git::uncommitted(root).into_iter().filter(|p| !personal(p) && !own.contains(p)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Commit a person's other changes in the knowledge base, at their word
+/// (Chris, 2026-10-14): exactly `paths`, the files they were shown, each one
+/// that still has uncommitted work; a personal path is left out. The
+/// message names each file. Refused in a repo that is not the knowledge base
+/// (decision 36: Ken never commits in a code repo). The next cycle pushes it
+/// with the rest. Returns the commit; None when none of them had changes.
+pub fn commit_others(root: &Path, paths: &[String]) -> Result<Option<String>> {
+    if !registry::is_library(root) {
+        return Err(Error::Other("Ken commits only in the knowledge base, never in a code repo".into()));
     }
-    // Exit 0 = nothing staged; exit 1 = staged changes exist.
-    let staged = run_git(root, &["diff", "--cached", "--quiet"])?;
-    if staged.ok {
-        return Ok(false);
+    let waiting: HashSet<String> = crate::git::uncommitted(root).into_iter().collect();
+    let mut chosen: Vec<String> =
+        paths.iter().map(|p| p.replace('\\', "/")).filter(|p| !personal(p) && waiting.contains(p)).collect();
+    chosen.sort();
+    chosen.dedup();
+    if chosen.is_empty() {
+        return Ok(None);
     }
-    let commit = run_git(root, &["commit", "-m", COMMIT_MESSAGE])?;
-    if !commit.ok {
-        return Err(Error::Other(short_detail(&commit)));
-    }
-    Ok(true)
+    let subject = match chosen.as_slice() {
+        [one] => format!("Commit a change made outside Ken: {one}"),
+        many => format!("Commit {} changes made outside Ken", many.len()),
+    };
+    let message = format!("{subject}\n\n{}\n", chosen.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"));
+    crate::git::commit_paths(root, &chosen, &message).map_err(Error::Other)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,22 +499,13 @@ Write ONLY the merged file to `{staging}/{rel_path}`. Do not modify any other fi
     );
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let spawned = Command::new(binary)
-        .args([
-            "-p",
-            &prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            &session_id,
-        ])
+    // The prompt on stdin, never an argument (see `proc::spawn_with_input`).
+    let mut cmd = Command::new(binary);
+    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", &session_id])
         .current_dir(root)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let spawned = crate::proc::spawn_with_input(&mut cmd, &prompt);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
@@ -363,7 +517,7 @@ Write ONLY the merged file to `{staging}/{rel_path}`. Do not modify any other fi
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.load(Ordering::Relaxed) || Instant::now() > deadline {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             let _ = child.wait();
             break;
         }
@@ -429,8 +583,8 @@ impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
             binary: None,
-            pull_throttle: Duration::from_secs(60),
-            push_debounce: Duration::from_secs(30),
+            pull_throttle: Duration::from_secs(DEFAULT_PULL_THROTTLE_SECS),
+            push_debounce: Duration::from_secs(DEFAULT_PUSH_DEBOUNCE_SECS),
             draft_timeout: Duration::from_secs(5 * 60),
         }
     }
@@ -443,12 +597,17 @@ enum Msg {
     SyncNow,
     /// Watcher-detected changed paths: conflicted-copy scan + push debounce.
     Changed(Vec<String>),
+    /// Paths Ken itself wrote (a save in the app, a resolved conflict):
+    /// committed by the next cycle, and nothing else is.
+    Wrote(Vec<String>),
     Shutdown,
 }
 
 pub struct SyncEngine {
     tx: Sender<Msg>,
     cancel: Arc<AtomicBool>,
+    /// What Ken wrote since the last commit: the only paths a cycle commits.
+    own: Arc<Mutex<BTreeSet<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     draft_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -476,13 +635,16 @@ impl SyncEngine {
             draft_worker(draft_rx, worker_root, worker_db, worker_cfg, worker_cancel, worker_notify)
         });
 
+        let own = Arc::new(Mutex::new(BTreeSet::new()));
+        let loop_own = own.clone();
         let thread = std::thread::spawn(move || {
-            engine_loop(rx, draft_tx, project_root, db_path, cfg, notify)
+            engine_loop(rx, draft_tx, project_root, db_path, cfg, notify, loop_own)
         });
 
         Ok(SyncEngine {
             tx,
             cancel,
+            own,
             thread: Some(thread),
             draft_thread: Some(draft_thread),
         })
@@ -498,6 +660,18 @@ impl SyncEngine {
 
     pub fn changed(&self, paths: Vec<String>) {
         let _ = self.tx.send(Msg::Changed(paths));
+    }
+
+    /// Ken wrote `paths` (relative to the project root): the next cycle
+    /// commits them, and only them (decision 36). Also counts as a change.
+    pub fn wrote(&self, paths: Vec<String>) {
+        let _ = self.tx.send(Msg::Wrote(paths));
+    }
+
+    /// Ken's own writes waiting for the next cycle's commit: not a person's
+    /// other changes ([`other_changes`]).
+    pub fn pending(&self) -> Vec<String> {
+        self.own.lock().map(|o| o.iter().cloned().collect()).unwrap_or_default()
     }
 }
 
@@ -521,6 +695,7 @@ fn engine_loop(
     db_path: PathBuf,
     cfg: SyncConfig,
     notify: Notify,
+    own: Arc<Mutex<BTreeSet<String>>>,
 ) {
     let Ok(mut db) = Db::open_at(&db_path) else {
         return;
@@ -533,30 +708,42 @@ fn engine_loop(
 
     let mut last_pull: Option<Instant> = None;
     let mut next_push: Option<Instant> = None;
+    // See `sync_active_cached` — without this, every watcher event costs two
+    // `git` spawns.
+    let mut active_cache: Option<(Instant, bool)> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Msg::PullNow) => {
                 let throttled =
                     last_pull.is_some_and(|t| t.elapsed() < cfg.pull_throttle);
-                if sync_active(&root) && !throttled {
+                if sync_active_cached(&root, &mut active_cache, true) && !throttled {
                     last_pull = Some(Instant::now());
-                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true);
+                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &own);
                 }
             }
             Ok(Msg::SyncNow) => {
-                if sync_active(&root) {
+                if sync_active_cached(&root, &mut active_cache, true) {
                     last_pull = Some(Instant::now());
                     next_push = None;
-                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true);
+                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &own);
                 } else {
                     emit_state(&notify, SyncState::Off, None);
                 }
             }
             Ok(Msg::Changed(paths)) => {
                 detect_conflicted_copies(&root, &mut db, &paths, &notify);
-                if sync_active(&root) {
+                if sync_active_cached(&root, &mut active_cache, false) {
                     // Earliest deadline wins.
+                    next_push.get_or_insert(Instant::now() + cfg.push_debounce);
+                }
+            }
+            Ok(Msg::Wrote(paths)) => {
+                detect_conflicted_copies(&root, &mut db, &paths, &notify);
+                if sync_active_cached(&root, &mut active_cache, false) {
+                    if let Ok(mut own) = own.lock() {
+                        own.extend(paths.into_iter().map(|p| p.replace('\\', "/")));
+                    }
                     next_push.get_or_insert(Instant::now() + cfg.push_debounce);
                 }
             }
@@ -566,8 +753,8 @@ fn engine_loop(
 
         if next_push.is_some_and(|t| t <= Instant::now()) {
             next_push = None;
-            if sync_active(&root) {
-                cycle(&root, &mut db, &draft_tx, &cfg, &notify, false);
+            if sync_active_cached(&root, &mut active_cache, false) {
+                cycle(&root, &mut db, &draft_tx, &cfg, &notify, false, &own);
             }
         }
     }
@@ -577,9 +764,9 @@ fn emit_state(notify: &Notify, state: SyncState, detail: Option<String>) {
     (notify)(SyncNotice::State { state, detail });
 }
 
-/// One sync cycle: commit local work, optionally pull (conflicts are
-/// aborted and filed to Review), push (a rejected push pulls once and
-/// retries), then settle the state dot.
+/// One sync cycle: commit what Ken wrote (`own`, cleared once committed),
+/// optionally pull (conflicts are aborted and filed to Review), push (a
+/// rejected push pulls once and retries), then settle the state dot.
 fn cycle(
     root: &Path,
     db: &mut Db,
@@ -587,6 +774,7 @@ fn cycle(
     _cfg: &SyncConfig,
     notify: &Notify,
     do_pull: bool,
+    own: &Mutex<BTreeSet<String>>,
 ) {
     emit_state(notify, SyncState::Syncing, None);
     let _ = ensure_excludes(root);
@@ -605,8 +793,16 @@ fn cycle(
     let mut conflicts: Vec<ConflictInfo> = Vec::new();
     let mut failure: Option<String> = None;
 
-    if let Err(e) = commit_all(root) {
-        failure = Some(e.to_string());
+    let paths: Vec<String> = own.lock().map(|o| o.iter().cloned().collect()).unwrap_or_default();
+    match commit_own(root, &paths) {
+        Ok(_) => {
+            if let Ok(mut own) = own.lock() {
+                for p in &paths {
+                    own.remove(p);
+                }
+            }
+        }
+        Err(e) => failure = Some(e.to_string()),
     }
 
     if failure.is_none() && do_pull {
@@ -649,15 +845,13 @@ fn cycle(
         emit_state(
             notify,
             SyncState::Attention,
-            Some(format!(
-                "Ken couldn't sync this project just now — it will keep trying. ({detail})"
-            )),
+            Some(format!("sync failed: {detail}")),
         );
     } else if has_open_conflicts(db) {
         emit_state(
             notify,
             SyncState::Attention,
-            Some("Some documents have two versions — open Review to choose what stays.".into()),
+            Some("two versions wait in the Inbox".into()),
         );
     } else {
         emit_state(notify, SyncState::Synced, None);
@@ -779,7 +973,7 @@ fn detect_conflicted_copies(
         emit_state(
             notify,
             SyncState::Attention,
-            Some("A conflicting copy needs review — open Review to choose.".into()),
+            Some("a conflicting copy waits in the Inbox".into()),
         );
     }
 }
@@ -869,6 +1063,15 @@ mod tests {
         git(repo, &["config", "user.name", "Ken Test"]);
     }
 
+    /// A Ken project at `repo` that is a knowledge base (it holds the inbox),
+    /// with sync on, as the engine tests need: only a knowledge base syncs.
+    fn sync_on(repo: &Path) {
+        fs::create_dir_all(repo.join(crate::ingest::RAW)).unwrap();
+        let mut p = Project::create(repo, "B").unwrap();
+        p.config.extra.insert("sync".into(), json!({"auto": true}));
+        p.save().unwrap();
+    }
+
     /// A bare origin with two clones, seeded with notes.md on main.
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -876,7 +1079,7 @@ mod tests {
         fs::create_dir(&bare).unwrap();
         git(&bare, &["init", "--bare", "--initial-branch=main"]);
 
-        git(dir.path(), &["clone", "origin.git", "a"]);
+        git(dir.path(), &["clone", "-c", "core.autocrlf=false", "origin.git", "a"]);
         let a = dir.path().join("a");
         set_identity(&a);
         git(&a, &["checkout", "-B", "main"]);
@@ -885,7 +1088,7 @@ mod tests {
         git(&a, &["commit", "-m", "seed"]);
         git(&a, &["push", "-u", "origin", "main"]);
 
-        git(dir.path(), &["clone", "origin.git", "b"]);
+        git(dir.path(), &["clone", "-c", "core.autocrlf=false", "origin.git", "b"]);
         let b = dir.path().join("b");
         set_identity(&b);
 
@@ -897,6 +1100,20 @@ mod tests {
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-m", "edit"]);
         git(repo, &["push"]);
+    }
+
+    #[test]
+    fn last_pull_and_push_come_from_git() {
+        let (_d, _bare, a, b) = fixture();
+        // `a` pushed main when it was seeded; `b` has only cloned.
+        let (_, a_pushed) = last_pull_push(&a);
+        assert!(a_pushed.is_some_and(|t| t > 0));
+        assert_eq!(last_pull_push(&b), (None, None));
+        commit_push(&a, "fresh.md", "from teammate\n");
+        assert_eq!(pull(&b, |_| false).unwrap(), PullOutcome::Clean);
+        let (b_pulled, b_pushed) = last_pull_push(&b);
+        assert!(b_pulled.is_some_and(|t| t > 0));
+        assert_eq!(b_pushed, None);
     }
 
     #[test]
@@ -969,11 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_all_and_push_edge_cases() {
+    fn commit_own_and_push_edge_cases() {
         let (_d, _bare, _a, b) = fixture();
-        assert!(!commit_all(&b).unwrap(), "clean tree → no commit");
+        assert!(!commit_own(&b, &[]).unwrap(), "nothing written, no commit");
+        assert!(!commit_own(&b, &["notes.md".into()]).unwrap(), "unchanged, no commit");
         fs::write(b.join("new.md"), "x\n").unwrap();
-        assert!(commit_all(&b).unwrap());
+        assert!(commit_own(&b, &["new.md".into()]).unwrap());
         assert_eq!(push(&b).unwrap(), PushOutcome::Pushed);
 
         // A repo without a remote skips the push.
@@ -1024,6 +1242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn draft_merge_uses_fake_claude() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_claude(dir.path(), "complete");
@@ -1048,11 +1267,172 @@ mod tests {
     fn sync_auto_reads_project_extra() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = Project::create(dir.path(), "X").unwrap();
-        assert!(sync_auto(&p), "defaults on");
         p.config
             .extra
             .insert("sync".into(), json!({"auto": false}));
-        assert!(!sync_auto(&p));
+        assert!(!sync_auto(&p, &[RepoKind::Wiki]), "an explicit off beats the kind");
+        p.config
+            .extra
+            .insert("sync".into(), json!({"auto": true}));
+        assert!(sync_auto(&p, &[RepoKind::Wiki]));
+        assert!(!sync_auto(&p, &[RepoKind::Code]), "decision 36: never a code repo, even switched on");
+        assert!(!sync_auto(&p, &[RepoKind::Reference]), "nor a reference repo");
+    }
+
+    /// Unset, sync follows the kind: only the knowledge base syncs. A code
+    /// repo, or one nobody has described yet, is never committed into.
+    #[test]
+    fn sync_auto_defaults_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Project::create(dir.path(), "X").unwrap();
+        assert!(!sync_auto(&p, &[]), "no kind: off");
+        assert!(!sync_auto(&p, &[RepoKind::Code]));
+        assert!(!sync_auto(&p, &[RepoKind::Reference]));
+        assert!(sync_auto(&p, &[RepoKind::Wiki]));
+        assert!(sync_auto(&p, &[RepoKind::Wiki, RepoKind::Code]), "a wiki that holds code syncs");
+        fs::create_dir_all(dir.path().join(crate::ingest::RAW)).unwrap();
+        assert!(sync_auto(&p, &[]), "a repo holding the inbox is the knowledge base");
+    }
+
+    /// Decision 36: a cycle commits only what Ken wrote. A person's other
+    /// work stays in the tree, uncommitted, and memory is never committed.
+    #[test]
+    fn commit_own_takes_only_kens_paths_and_never_memory() {
+        let (_d, _bare, _a, b) = fixture();
+        ensure_excludes(&b).unwrap();
+        fs::write(b.join("ken.md"), "Ken wrote this\n").unwrap();
+        fs::write(b.join("person.md"), "a person's work in progress\n").unwrap();
+        fs::write(b.join("notes.md"), "a person's edit\n").unwrap();
+        fs::create_dir_all(b.join(".ken/memory")).unwrap();
+        fs::write(b.join(".ken/memory/me.md"), "personal\n").unwrap();
+        assert!(commit_own(&b, &["ken.md".into(), ".ken/memory/me.md".into()]).unwrap());
+        let shown = run_git(&b, &["show", "--name-only", "--format=", "HEAD"]).unwrap().stdout;
+        assert_eq!(shown.trim(), "ken.md");
+        let status = run_git(&b, &["status", "--porcelain"]).unwrap().stdout;
+        assert!(status.contains("person.md") && status.contains("notes.md"), "{status}");
+        assert!(!status.contains(".ken/memory"), "memory is kept out of git: {status}");
+        assert!(personal(".ken/memory/me.md") && personal(".ken-workspace/journal/x.md") && !personal("Rules/x.md"));
+    }
+
+    /// "Commit my other changes" (Chris, 2026-10-14): sync lists what a
+    /// person changed outside Ken, and commits exactly the files they were
+    /// shown, named in the message, only when asked. Never in a code repo.
+    #[test]
+    fn other_changes_are_listed_and_committed_only_when_asked() {
+        let (_d, _bare, _a, b) = fixture();
+        ensure_excludes(&b).unwrap();
+        fs::create_dir_all(b.join(crate::ingest::RAW)).unwrap();
+        fs::write(b.join(crate::ingest::RAW).join(".keep"), "").unwrap();
+        git(&b, &["add", "-A"]);
+        git(&b, &["commit", "-m", "the inbox"]);
+        let head = || run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout;
+        let before = head();
+
+        fs::write(b.join("ken.md"), "Ken wrote this, waiting for the cycle\n").unwrap();
+        fs::write(b.join("person.md"), "a new page\n").unwrap();
+        fs::write(b.join("notes.md"), "a person's edit\n").unwrap();
+        fs::create_dir_all(b.join(".ken/memory")).unwrap();
+        fs::write(b.join(".ken/memory/me.md"), "personal\n").unwrap();
+        let shown = other_changes(&b, &["ken.md".into()]);
+        assert_eq!(shown, vec!["notes.md".to_string(), "person.md".to_string()], "Ken's own and memory are not a person's other changes");
+        assert_eq!(head(), before, "listing commits nothing");
+
+        let mut asked = shown.clone();
+        asked.push(".ken/memory/me.md".into());
+        asked.push("never-there.md".into());
+        let commit = commit_others(&b, &asked).unwrap();
+        assert!(commit.is_some());
+        let log = run_git(&b, &["show", "--name-only", "--format=%B", "HEAD"]).unwrap().stdout;
+        assert!(log.starts_with("Commit 2 changes made outside Ken\n\n- notes.md\n- person.md\n"), "{log}");
+        let files: Vec<&str> = log.lines().filter(|l| !l.is_empty() && !l.starts_with("- ") && !l.starts_with("Commit")).collect();
+        assert_eq!(files, vec!["notes.md", "person.md"], "exactly those files");
+        let status = run_git(&b, &["status", "--porcelain"]).unwrap().stdout;
+        assert!(status.contains("ken.md"), "Ken's pending write waits for its own cycle: {status}");
+        assert_eq!(commit_others(&b, &["notes.md".into()]).unwrap(), None, "nothing left to commit there");
+
+        // A code repo: refused, whatever it is asked to commit.
+        let code = _d.path().join("code");
+        fs::create_dir_all(&code).unwrap();
+        git(&code, &["init", "-q"]);
+        fs::write(code.join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(commit_others(&code, &["main.rs".into()]).is_err());
+    }
+
+    /// The `sync` block drives the engine's timers, and an absent block
+    /// means the defaults — notably a one-hour auto-commit debounce, not the
+    /// half-minute that used to commit work mid-edit.
+    #[test]
+    fn sync_config_reads_the_project_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(60 * 60));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(60));
+
+        p.config.extra.insert(
+            "sync".into(),
+            json!({"auto": true, "pushDebounceSecs": 300, "pullThrottleSecs": 15}),
+        );
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(300));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(15));
+    }
+
+    /// A zero or malformed interval must fall back to the default rather
+    /// than degenerate into committing on every change batch.
+    #[test]
+    fn sync_config_rejects_nonsense_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.extra.insert(
+            "sync".into(),
+            json!({"pushDebounceSecs": 0, "pullThrottleSecs": "soon"}),
+        );
+        let cfg = sync_config_for(&p);
+        assert_eq!(cfg.push_debounce, Duration::from_secs(60 * 60));
+        assert_eq!(cfg.pull_throttle, Duration::from_secs(60));
+    }
+
+    /// The watcher hot path must not re-spawn `git` per event. Primed with
+    /// an answer that contradicts reality (`true` for a folder that is not a
+    /// repo at all), an unforced call must return the cached value — proving
+    /// it never recomputed — while a forced call recomputes and corrects the
+    /// cache.
+    #[test]
+    fn sync_active_cached_reuses_its_answer_until_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut cache = Some((Instant::now(), true));
+        assert!(
+            sync_active_cached(root, &mut cache, false),
+            "an unforced call within the TTL must reuse the cached answer"
+        );
+
+        assert!(
+            !sync_active_cached(root, &mut cache, true),
+            "a forced call must recompute — this folder is not a git repo"
+        );
+        assert_eq!(
+            cache.map(|(_, active)| active),
+            Some(false),
+            "the recomputed answer must replace the stale cache"
+        );
+
+        // And the corrected answer is now itself cached.
+        assert!(!sync_active_cached(root, &mut cache, false));
+    }
+
+    /// An expired entry must be re-derived rather than trusted forever.
+    #[test]
+    fn sync_active_cached_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = Some((Instant::now() - SYNC_ACTIVE_TTL - Duration::from_secs(1), true));
+        assert!(
+            !sync_active_cached(dir.path(), &mut cache, false),
+            "past the TTL the stale `true` must not survive"
+        );
     }
 
     fn wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
@@ -1069,7 +1449,7 @@ mod tests {
     #[test]
     fn engine_pushes_local_changes() {
         let (_d, bare, _a, b) = fixture();
-        Project::create(&b, "B").unwrap();
+        sync_on(&b);
         let app = tempfile::tempdir().unwrap();
         let db_path = app.path().join("sync.db");
         drop(Db::open_at(&db_path).unwrap());
@@ -1091,7 +1471,9 @@ mod tests {
         .unwrap();
 
         fs::write(b.join("insight.md"), "a brand new insight\n").unwrap();
-        engine.changed(vec!["insight.md".into()]);
+        fs::write(b.join("theirs.md"), "a person's file Ken did not write\n").unwrap();
+        engine.changed(vec!["theirs.md".into()]);
+        engine.wrote(vec!["insight.md".into()]);
 
         assert!(
             wait_until(
@@ -1104,9 +1486,12 @@ mod tests {
             ),
             "debounced commit+push should land on the remote"
         );
+        // Only what Ken wrote was committed.
+        let pushed = run_git(&bare, &["log", "--name-only", "--format=", "-1", "main"]).unwrap().stdout;
+        assert!(pushed.contains("insight.md") && !pushed.contains("theirs.md"), "{pushed}");
         // Ken's transient files were excluded non-invasively.
         let exclude = fs::read_to_string(b.join(".git/info/exclude")).unwrap();
-        assert!(exclude.contains(".ken/.staging/"));
+        assert!(exclude.contains(".ken/.staging/") && exclude.contains(".ken/memory/"));
         // A synced notice arrived.
         let mut saw_synced = false;
         while let Ok(n) = notices.try_recv() {
@@ -1118,14 +1503,74 @@ mod tests {
         drop(engine);
     }
 
+    /// Decision 36, kept by Chris (2026-10-15): Ken may edit a code repo's
+    /// files and never commits there. The Files viewer's save tells sync it
+    /// wrote the file (`wrote`); a chat's accepted edit is written by
+    /// Claude Code and reaches sync as a change the watcher saw (`changed`).
+    /// In a repo that is not the knowledge base, even with a remote and sync
+    /// switched on, neither is committed or pushed, and Sync now does
+    /// nothing.
     #[test]
+    fn engine_never_commits_in_a_code_repo() {
+        let (_d, bare, _a, b) = fixture();
+        let mut p = Project::create(&b, "Game").unwrap();
+        p.config.extra.insert("sync".into(), json!({"auto": true}));
+        p.save().unwrap();
+        assert!(!sync_active(&b), "a code repo never syncs");
+        let head = run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout;
+        let pushed = run_git(&bare, &["rev-parse", "main"]).unwrap().stdout;
+
+        let app = tempfile::tempdir().unwrap();
+        let db_path = app.path().join("sync.db");
+        drop(Db::open_at(&db_path).unwrap());
+        let (ntx, notices) = std_channel::<SyncNotice>();
+        let engine = SyncEngine::start(
+            b.clone(),
+            db_path,
+            SyncConfig {
+                binary: None,
+                pull_throttle: Duration::from_millis(0),
+                push_debounce: Duration::from_millis(100),
+                draft_timeout: Duration::from_secs(5),
+            },
+            move |n| {
+                let _ = ntx.send(n);
+            },
+        )
+        .unwrap();
+
+        fs::write(b.join("main.py"), "print('saved in the Files viewer')\n").unwrap();
+        fs::write(b.join("notes.md"), "an edit accepted in a chat\n").unwrap();
+        engine.wrote(vec!["main.py".into()]);
+        engine.changed(vec!["notes.md".into()]);
+        engine.sync_now();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(engine.pending().is_empty(), "nothing waits to be committed");
+        drop(engine);
+
+        assert_eq!(run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout, head, "no commit");
+        assert_eq!(run_git(&bare, &["rev-parse", "main"]).unwrap().stdout, pushed, "no push");
+        let status = run_git(&b, &["status", "--porcelain"]).unwrap().stdout;
+        assert!(status.contains("main.py") && status.contains("notes.md"), "both edits stay in the tree: {status}");
+        let states: Vec<SyncState> = notices
+            .try_iter()
+            .filter_map(|n| match n {
+                SyncNotice::State { state, .. } => Some(state),
+                SyncNotice::ReviewChanged => None,
+            })
+            .collect();
+        assert!(states.iter().all(|s| *s == SyncState::Off), "{states:?}");
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn engine_files_conflict_item_with_draft() {
         let (_d, _bare, a, b) = fixture();
         // Both sides get the seed doc at the path the fake claude writes.
         fs::create_dir_all(a.join("knowledge")).unwrap();
         commit_push(&a, "knowledge/People.md", "base\n");
         git(&b, &["pull", "--no-rebase", "--no-edit"]);
-        Project::create(&b, "B").unwrap();
+        sync_on(&b);
 
         // Divergence: teammate pushes, we edit locally (uncommitted).
         commit_push(&a, "knowledge/People.md", "teammate version\n");
@@ -1151,7 +1596,7 @@ mod tests {
             },
         )
         .unwrap();
-        engine.changed(vec!["knowledge/People.md".into()]);
+        engine.wrote(vec!["knowledge/People.md".into()]);
 
         // The conflicted push→pull cycle files exactly one Review item…
         let db = Db::open_at(&db_path).unwrap();

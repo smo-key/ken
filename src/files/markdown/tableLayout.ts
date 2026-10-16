@@ -389,11 +389,6 @@ function layoutTableBlocks(blocks: readonly Element[]): HTMLElement[] {
   return done;
 }
 
-/** Measure and size every table under `root`. */
-export function layoutTables(root: ParentNode): void {
-  layoutTableBlocks(Array.from(root.querySelectorAll(".milkdown-table-block")));
-}
-
 /** The `.milkdown-table-block` a table node at `pos` is rendered into. */
 function blockOfNode(view: EditorView, pos: number): HTMLElement | undefined {
   const dom = view.nodeDOM(pos);

@@ -8,8 +8,11 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Link from "@lucide/svelte/icons/link";
   import { app } from "../lib/app.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { memberLeaf } from "../lib/api";
   import { imports } from "../lib/imports.svelte";
   import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
+  import { repoFor, sideOf, splitRepos, type FilesSide } from "./filesSplit";
   import { buildTree } from "../lib/tree";
   import {
     openContextMenu,
@@ -22,8 +25,36 @@
   import FileGlyph from "./FileGlyph.svelte";
   import InlineNameRow from "./InlineNameRow.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
 
   let { width }: { width: number } = $props();
+
+  // Files splits into Knowledge base and Sources (knowledge-core decision
+  // 32): the knowledge base under the first, the other repos under Sources,
+  // with a menu when there are several. Files opens on the wiki. A file
+  // opened from another repo (a search hit, a citation) shows that repo here.
+  // Choosing one stays on Files.
+  const repos = $derived.by(() => {
+    return app.members
+      .filter((m): m is typeof m & { id: string } => !!m.id && (m.status === "active" || m.status === "dormant"))
+      .sort((a, b) => (a.id === scope.wikiId ? -1 : b.id === scope.wikiId ? 1 : a.name.localeCompare(b.name)));
+  });
+
+  function showRepo(id: string | null) {
+    if (id && id !== app.focused) void app.focusMember(id, { stay: true });
+  }
+
+  const split = $derived(splitRepos(repos, scope.wikiId));
+  const side = $derived(sideOf(app.focused, scope.wikiId));
+  // The source last shown, so Sources opens where a person left it.
+  let lastSource = $state<string | null>(null);
+  $effect(() => {
+    if (side === "sources" && app.focused) lastSource = app.focused;
+  });
+  function showSide(to: FilesSide) {
+    showRepo(repoFor(to, split, lastSource));
+  }
 
   const unreadOnly = $derived(app.filesFilter === "unread");
   const markAllEnabled = $derived(isMarkAllEnabled(app.unread.length));
@@ -134,6 +165,88 @@
 </script>
 
 <div class="tree" style:width="{width}px">
+  <div class="files-head">
+    <ScreenHeader title="Files">
+      {#snippet actions()}
+        {#if showUnreadFilter(app.unread.length, app.filesFilter)}
+          <div class="filter" role="tablist" aria-label="Filter files">
+            <button
+              class="seg"
+              class:on={app.filesFilter === "all"}
+              role="tab"
+              aria-selected={app.filesFilter === "all"}
+              onclick={() => (app.filesFilter = "all")}
+            >All</button>
+            <button
+              class="seg"
+              class:on={app.filesFilter === "unread"}
+              role="tab"
+              aria-selected={app.filesFilter === "unread"}
+              onclick={() => (app.filesFilter = "unread")}
+            >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
+          </div>
+        {/if}
+        <!-- Always shown; disabled (not hidden) when there is nothing to mark.
+             Uses aria-disabled + a data-disabled styling hook rather than the
+             native `disabled` attribute: a natively disabled button swallows
+             pointer/hover events, so its :hover::after tooltip would never fire.
+             Keeping the element hoverable lets the "why" tooltip appear, and the
+             onclick guards against acting while disabled. -->
+        <button
+          class="icon-btn"
+          class:is-disabled={!markAllEnabled}
+          data-disabled={!markAllEnabled}
+          data-tooltip={markAllEnabled
+            ? "Mark every changed file as viewed"
+            : "No unread files"}
+          aria-label="Mark all as viewed"
+          aria-disabled={!markAllEnabled}
+          onclick={() => {
+            if (markAllEnabled) void app.markAllSeen();
+          }}
+        >
+          <CheckCheck size={15} strokeWidth={1.75} />
+        </button>
+        <button
+          class="icon-btn"
+          data-tooltip="Import file"
+          aria-label="Import file"
+          disabled={imports.importing}
+          onclick={() => void imports.startImport()}
+        >
+          <Upload size={15} strokeWidth={1.75} />
+        </button>
+      {/snippet}
+    </ScreenHeader>
+  </div>
+  {#if app.workspace && repos.length > 1}
+    <div class="split" role="tablist" aria-label="Knowledge base or sources">
+      <button class="side" class:on={side === "wiki"} role="tab" aria-selected={side === "wiki"} disabled={!split.wiki} onclick={() => showSide("wiki")}
+        >Knowledge base</button
+      >
+      <button
+        class="side"
+        class:on={side === "sources"}
+        role="tab"
+        aria-selected={side === "sources"}
+        disabled={split.sources.length === 0}
+        onclick={() => showSide("sources")}>Sources</button
+      >
+    </div>
+    {#if side === "sources" && split.sources.length > 1}
+      <div class="repo-pick">
+        <select
+          aria-label="Source shown in Files"
+          value={app.focused ?? ""}
+          onchange={(e) => showRepo((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#each split.sources as m (m.id)}
+            <option value={m.id}>{memberLeaf(m.name)}</option>
+          {/each}
+        </select>
+      </div>
+    {/if}
+  {/if}
   {#if app.favorites.length > 0}
     <div class="tree-head">Favorites</div>
     <div class="favorites">
@@ -150,60 +263,6 @@
       {/each}
     </div>
   {/if}
-
-  <div class="tree-head files-head">
-    <span class="ttl">Files</span>
-    <div class="head-actions">
-      {#if showUnreadFilter(app.unread.length, app.filesFilter)}
-        <div class="filter" role="tablist" aria-label="Filter files">
-          <button
-            class="seg"
-            class:on={app.filesFilter === "all"}
-            role="tab"
-            aria-selected={app.filesFilter === "all"}
-            onclick={() => (app.filesFilter = "all")}
-          >All</button>
-          <button
-            class="seg"
-            class:on={app.filesFilter === "unread"}
-            role="tab"
-            aria-selected={app.filesFilter === "unread"}
-            onclick={() => (app.filesFilter = "unread")}
-          >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
-        </div>
-      {/if}
-      <!-- Always shown; disabled (not hidden) when there is nothing to mark.
-           Uses aria-disabled + a data-disabled styling hook rather than the
-           native `disabled` attribute: a natively disabled button swallows
-           pointer/hover events, so its :hover::after tooltip would never fire.
-           Keeping the element hoverable lets the "why" tooltip appear, and the
-           onclick guards against acting while disabled. -->
-      <button
-        class="icon-btn"
-        class:is-disabled={!markAllEnabled}
-        data-disabled={!markAllEnabled}
-        data-tooltip={markAllEnabled
-          ? "Mark every changed file as viewed"
-          : "No unread files"}
-        aria-label="Mark all as viewed"
-        aria-disabled={!markAllEnabled}
-        onclick={() => {
-          if (markAllEnabled) void app.markAllSeen();
-        }}
-      >
-        <CheckCheck size={15} strokeWidth={1.75} />
-      </button>
-      <button
-        class="icon-btn"
-        data-tooltip="Import file"
-        aria-label="Import file"
-        disabled={imports.importing}
-        onclick={() => void imports.startImport()}
-      >
-        <Upload size={15} strokeWidth={1.75} />
-      </button>
-    </div>
-  </div>
 
   {#if drag.error}
     <div class="move-error">
@@ -231,13 +290,11 @@
       <TreeNodeRow {node} depth={0} expandAll={unreadOnly} />
     {/each}
     {#if tree.length === 0}
-      <div class="empty">
-        {#if unreadOnly}
-          Nothing new — every file is up to date.
-        {:else}
-          {app.scanning ? "Reading your folder…" : "This folder is empty."}
-        {/if}
-      </div>
+      {#if !unreadOnly && app.scanning}
+        <div class="empty">Reading your folder…</div>
+      {:else}
+        <div class="empty"><EmptyState /></div>
+      {/if}
     {/if}
   </div>
 </div>
@@ -246,7 +303,8 @@
   .tree {
     /* Width comes from the resizable, persisted sidebar preference. */
     flex: none;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     /* No top padding: sticky offsets resolve against this scroll container's
@@ -272,7 +330,7 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  /* The Files header stays visually pinned: sticky flush to the top of the
+  /* The screen's header stays pinned: sticky flush to the top of the
      scrolling .tree column (which carries no top padding, so there is nowhere
      for rows to show above it) so it never scrolls away with Favorites and the
      tree. A solid ground covers content sliding under it. */
@@ -280,24 +338,10 @@
     position: sticky;
     top: 0;
     z-index: 5;
-    background: var(--paper);
-    justify-content: space-between;
+    background: var(--rail);
     /* extend the ground to the column edges under the sticky row */
-    margin: 0 -8px;
-    padding-left: 18px;
-    padding-right: 12px;
-  }
-  .files-head .ttl {
-    flex: none;
-  }
-  .head-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    /* header uppercases its text; keep control labels normal-case */
-    text-transform: none;
-    letter-spacing: 0;
-    font-weight: 500;
+    margin: 0 -8px 4px;
+    padding: 12px 12px 8px 18px;
   }
   .filter {
     display: inline-flex;
@@ -440,5 +484,35 @@
     color: var(--danger);
     padding: 2px;
     flex: none;
+  }
+  .repo-pick {
+    margin: 0 8px 8px;
+  }
+  .split {
+    display: flex;
+    gap: 2px;
+    margin: 0 8px 8px;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+  }
+  .side {
+    flex: 1;
+    padding: 3px 8px;
+    border: none;
+    border-radius: var(--radius-control);
+    background: transparent;
+    color: var(--ink-secondary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .side.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
+  }
+  .repo-pick select {
+    width: 100%;
+    font-weight: 600;
   }
 </style>

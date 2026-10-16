@@ -8,12 +8,15 @@
     status,
     onInstalled,
     compact = false,
+    named = true,
   }: {
     status: ModelStatus;
     /** Called once the model is verified and installed on disk. */
     onInstalled?: () => void;
     /** Tighter layout for embedding in a Settings row. */
     compact?: boolean;
+    /** Show the model's name and badge; off where the row names it. */
+    named?: boolean;
   } = $props();
 
   type Phase = "idle" | "downloading" | "done" | "error";
@@ -85,8 +88,10 @@
 <div class="model" class:compact>
   <div class="head">
     <div class="meta">
-      <span class="name">{status.name}</span>
-      {#if status.recommended}<span class="badge">Recommended</span>{/if}
+      {#if named}
+        <span class="name">{status.name}</span>
+        {#if status.recommended}<span class="badge">Recommended</span>{/if}
+      {/if}
       <span class="size">
         {phase === "downloading" && total > 0
           ? `${fmtBytes(downloaded)} / ${fmtBytes(total)}`

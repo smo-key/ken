@@ -55,12 +55,19 @@ struct Client {
 
 impl Client {
     fn spawn(base: &Path, project: Option<&Path>) -> Client {
+        Client::spawn_with(base, project, &[])
+    }
+
+    fn spawn_with(base: &Path, project: Option<&Path>, flags: &[&str]) -> Client {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ken-mcp"));
         if let Some(p) = project {
             cmd.arg("--project").arg(p);
         }
+        cmd.args(flags);
         let mut child = cmd
             .env("KEN_DATA_DIR", base)
+            // open_in_ken is listed only when Ken's own chat started the server.
+            .env_remove("KEN_APP_URL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -136,13 +143,16 @@ fn scoped_server_full_session() {
     assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(reply["result"]["serverInfo"]["name"], "ken");
     assert!(reply["result"]["capabilities"]["tools"].is_object());
+    // The brief, as the server's instructions (knowledge-core decision 1).
+    let brief = reply["result"]["instructions"].as_str().unwrap();
+    assert!(brief.contains("The code is the truth"), "{brief}");
 
     // initialized notification gets no reply — proven by ping answering next.
     client.notify("notifications/initialized");
     let reply = client.request("ping", json!({}));
     assert_eq!(reply["result"], json!({}));
 
-    // tools/list → exactly our four tools.
+    // tools/list → exactly the knowledge server's tools (decision 22).
     let reply = client.request("tools/list", json!({}));
     let names: Vec<&str> = reply["result"]["tools"]
         .as_array()
@@ -152,18 +162,17 @@ fn scoped_server_full_session() {
         .collect();
     assert_eq!(
         names,
-        ["search_knowledge", "read_document", "list_documents", "list_projects"]
+        ["search", "read", "related", "code_definition", "code_usages", "code_outline", "code_imports", "history", "tickets", "propose_decision", "add_source", "repos"]
     );
 
-    // search finds seeded content, marks stripped to bold.
-    let (text, is_err) = client.tool("search_knowledge", json!({ "query": "billing cutover" }));
+    // search finds seeded content.
+    let (text, is_err) = client.tool("search", json!({ "query": "billing cutover" }));
     assert!(!is_err, "{text}");
     assert!(text.contains("notes/meeting.md"), "{text}");
-    assert!(text.contains("**billing**"), "{text}");
     assert!(!text.contains("<mark>"), "{text}");
 
-    // read_document round-trips the file content.
-    let (text, is_err) = client.tool("read_document", json!({ "path": "notes/meeting.md" }));
+    // read round-trips the file content.
+    let (text, is_err) = client.tool("read", json!({ "path": "notes/meeting.md" }));
     assert!(!is_err, "{text}");
     assert_eq!(
         text,
@@ -171,7 +180,7 @@ fn scoped_server_full_session() {
     );
 
     // Path escape fails safely — and the file is definitely not read.
-    let (text, is_err) = client.tool("read_document", json!({ "path": "../etc/passwt" }));
+    let (text, is_err) = client.tool("read", json!({ "path": "../etc/passwt" }));
     assert!(is_err, "{text}");
     assert!(text.contains("outside the project"), "{text}");
 
@@ -188,27 +197,56 @@ fn scoped_server_full_session() {
 }
 
 #[test]
-fn unscoped_server_requires_project() {
+fn unscoped_server_reads_a_path_in_its_project() {
     let fx = fixture();
     let mut client = Client::spawn(fx.base.path(), None);
     client.request("initialize", json!({ "protocolVersion": "2024-11-05" }));
     client.notify("notifications/initialized");
 
-    // Without a project → helpful error naming the registered projects.
-    let (text, is_err) = client.tool("search_knowledge", json!({ "query": "billing" }));
+    // Search needs no project: every repo.
+    let (text, is_err) = client.tool("search", json!({ "query": "billing" }));
+    assert!(!is_err, "{text}");
+    assert!(text.contains("notes/meeting.md"), "{text}");
+
+    // A project-relative path without its project → a helpful error naming
+    // the registered projects.
+    let (text, is_err) = client.tool("read", json!({ "path": "People.md" }));
     assert!(is_err, "{text}");
     assert!(text.contains("Available projects: Atlas"), "{text}");
 
-    // list_projects names the fixture.
-    let (text, is_err) = client.tool("list_projects", json!({}));
+    // repos names the fixture.
+    let (text, is_err) = client.tool("repos", json!({}));
     assert!(!is_err, "{text}");
     assert!(text.contains("Atlas"), "{text}");
     let root: PathBuf = fx.root.path().to_path_buf();
     assert!(text.contains(&root.to_string_lossy().to_string()), "{text}");
 
     // With the project named, the same call works.
-    let (text, is_err) =
-        client.tool("search_knowledge", json!({ "query": "billing", "project": "Atlas" }));
+    let (text, is_err) = client.tool("read", json!({ "path": "People.md", "project": "Atlas" }));
     assert!(!is_err, "{text}");
-    assert!(text.contains("notes/meeting.md"), "{text}");
+    assert!(text.contains("Priya Natarajan"), "{text}");
+}
+
+/// `--personal` serves the personal set only: tasks and memory, which Ken's
+/// own chat registers beside the knowledge server (decision 22).
+#[test]
+fn personal_server_serves_tasks_and_memory_only() {
+    let fx = fixture();
+    let mut client = Client::spawn_with(fx.base.path(), None, &["--personal"]);
+    let reply = client.request("initialize", json!({ "protocolVersion": "2024-11-05" }));
+    assert_eq!(reply["result"]["serverInfo"]["name"], "ken-personal");
+    client.notify("notifications/initialized");
+
+    let reply = client.request("tools/list", json!({}));
+    let names: Vec<&str> = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["task_list", "task_create", "task_update", "memory_write", "journal_append"]);
+
+    // The knowledge tools are not here.
+    let reply = client.request("tools/call", json!({ "name": "search", "arguments": { "query": "billing" } }));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
 }

@@ -25,6 +25,14 @@ describe("timeAgo", () => {
     expect(timeAgo(nowS - 3 * 3600, now)).toBe("3 hr ago");
     expect(timeAgo(nowS - 26 * 3600, now)).toBe("yesterday");
   });
+
+  it("says a minute's worth as just now, since it moves on a tick at a time", () => {
+    expect(timeAgo(nowS - 56, now)).toBe("just now");
+  });
+
+  it("reads the ticking clock when given no time", () => {
+    expect(timeAgo(Math.floor(Date.now() / 1000) - 180)).toBe("3 min ago");
+  });
 });
 
 describe("isEditable", () => {
